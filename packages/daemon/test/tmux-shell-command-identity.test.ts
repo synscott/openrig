@@ -75,6 +75,24 @@ async function fixture() {
 }
 
 describe("shell launch after cold pane reuse (#141)", () => {
+  it.each([false, true])("launches a fresh pane before any binding exists (callback=%s)", async callback => {
+    const f = await fixture();
+    f.sessionRegistry.clearBinding(f.nodes.old!.id);
+    let checks = 0;
+    const result = await f.guard.lifecycle([f.nodes.worker!.id], async () => {
+      f.sessionRegistry.clearBinding(f.nodes.worker!.id);
+      f.guard.rebindLifecycle(f.nodes.worker!.id);
+      expect(await f.tmux.createSession("worker@fixture", "/inert", { OPENRIG_NODE_ID: f.nodes.worker!.id })).toEqual({ ok: true });
+      expect(f.guard.maybeTarget("%0")).toBeNull();
+      return f.tmux.sendShellCommand("worker@fixture", "codex resume 'retained-thread'", callback ? () => { checks++; } : undefined);
+    });
+    expect(result).toEqual({ ok: true });
+    expect(f.commands.filter(c => c.includes("paste-buffer"))).toEqual(["tmux paste-buffer -t '%0' -b 'fixture' -d -r -p"]);
+    expect(f.commands.filter(c => c.includes("send-keys"))).toEqual(["tmux send-keys -t '%0' 'Enter'"]);
+    expect(checks).toBe(callback ? 2 : 0);
+    expect(f.sessionRegistry.getBindingForNode(f.nodes.worker!.id)).toBeNull();
+  });
+
   it.each([false, true])("preserves the named lifecycle target through paste and Enter (callback=%s)", async callback => {
     const f = await fixture(), before = f.retained();
     let checks = 0;
