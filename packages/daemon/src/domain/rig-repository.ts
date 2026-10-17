@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
 import type { ClaudeManagedBlockFile } from "./managed-blocks.js";
+import { mergeSeatEnv, parseStoredSeatEnv, type SeatEnv } from "./seat-env.js";
 import type {
   Rig,
   Node,
@@ -125,6 +126,8 @@ interface NodeOptions {
   codexConfigProfile?: string;
   /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF (builtin:<name> or spec-relative path). */
   permissionPolicy?: string;
+  /** The member's declared launch environment (spec `env:`); not merged with the rig's. */
+  env?: SeatEnv;
   cwd?: string;
   surfaceHint?: string;
   workspace?: string;
@@ -150,17 +153,27 @@ export class RigRepository {
     this.db = db;
   }
 
-  createRig(name: string): Rig {
+  createRig(name: string, installRoot?: string): Rig {
     const id = ulid();
-    this.db
-      .prepare("INSERT INTO rigs (id, name) VALUES (?, ?)")
-      .run(id, name);
+    if (installRoot !== undefined) {
+      this.db.prepare("INSERT INTO rigs (id, name, install_root) VALUES (?, ?, ?)")
+        .run(id, name, installRoot);
+    } else {
+      this.db.prepare("INSERT INTO rigs (id, name) VALUES (?, ?)").run(id, name);
+    }
 
     const rig = this.rowToRig(
       this.db.prepare("SELECT * FROM rigs WHERE id = ?").get(id) as RigRow
     );
     this.onRigCreated?.(rig);
     return rig;
+  }
+
+  /** Canonical bundle materialization folder, independent of seats' working directories. */
+  getRigInstallRoot(rigId: string): string | null {
+    const row = this.db.prepare("SELECT * FROM rigs WHERE id = ?").get(rigId) as
+      { install_root?: string | null } | undefined;
+    return row?.install_root ?? null;
   }
 
   /**
@@ -189,6 +202,43 @@ export class RigRepository {
     } catch {
       return null;
     }
+  }
+
+  setRigNonInterruptive(rigId: string, enabled: boolean): void {
+    if (!this.hasRigColumn("non_interruptive")) return;
+    this.db.prepare("UPDATE rigs SET non_interruptive = ?, updated_at = ? WHERE id = ?")
+      .run(enabled ? 1 : 0, new Date().toISOString(), rigId);
+  }
+
+  getRigNonInterruptive(rigId: string): boolean {
+    if (!this.hasRigColumn("non_interruptive")) return false;
+    const row = this.db.prepare("SELECT non_interruptive FROM rigs WHERE id = ?")
+      .get(rigId) as { non_interruptive: number } | undefined;
+    return row?.non_interruptive === 1;
+  }
+
+  /** Persist the rig-level `env:` block from the spec, or null to clear. */
+  setRigEnv(rigId: string, env: SeatEnv | null): void {
+    if (!this.hasRigColumn("env_json")) return;
+    this.db.prepare("UPDATE rigs SET env_json = ?, updated_at = ? WHERE id = ?")
+      .run(env ? JSON.stringify(env) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigEnv(rigId: string): SeatEnv | null {
+    if (!this.hasRigColumn("env_json")) return null;
+    const row = this.db.prepare("SELECT env_json FROM rigs WHERE id = ?")
+      .get(rigId) as { env_json: string | null } | undefined;
+    return parseStoredSeatEnv(row?.env_json);
+  }
+
+  /** What a seat's process gets: its rig's `env:` with the member's own `env:` over it. A launch,
+   *  a restore and a handover successor all read this, so they cannot disagree. */
+  getEffectiveSeatEnv(nodeId: string): SeatEnv {
+    if (!this.hasNodeColumn("env_json")) return {};
+    const row = this.db.prepare("SELECT rig_id, env_json FROM nodes WHERE id = ?")
+      .get(nodeId) as { rig_id: string; env_json: string | null } | undefined;
+    if (!row) return {};
+    return mergeSeatEnv(this.getRigEnv(row.rig_id), parseStoredSeatEnv(row.env_json));
   }
 
   /** OPR.0.4.8.3 Seam B — persist a rig's attached permission_policy REF (builtin:<name> or a
@@ -287,6 +337,16 @@ export class RigRepository {
     this.db.prepare(
       "UPDATE nodes SET policy_origin = ?, policy_resolved_target = ?, policy_declaring_dir = ?, policy_launch_posture = ? WHERE id = ?",
     ).run(provenance.origin, provenance.resolvedTarget, provenance.declaringDir, provenance.launchPosture, nodeId);
+  }
+
+  /** Re-point an EXISTING seat's own permission_policy REF (`rig policy apply --seat`); the caller
+   *  writes its resolved provenance through setNodePolicyProvenance in the same transaction. Restore,
+   *  resume and launches that read the stored seat use that provenance. A later launch from a spec that
+   *  declares a policy rewrites the provenance but not this ref, so the two can then differ: this ref
+   *  is what `rig export` emits, not necessarily the policy the seat launched with. */
+  setNodePermissionPolicy(nodeId: string, permissionPolicy: string): void {
+    if (!this.hasNodeColumn("permission_policy")) return;
+    this.db.prepare("UPDATE nodes SET permission_policy = ? WHERE id = ?").run(permissionPolicy, nodeId);
   }
 
   /** Seam B (R2) — read a node's persisted policy provenance; null when none attached
@@ -437,6 +497,11 @@ export class RigRepository {
         .run(opts.effort, id);
     }
 
+    if (opts?.env && this.hasNodeColumn("env_json")) {
+      this.db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?")
+        .run(JSON.stringify(opts.env), id);
+    }
+
     return this.rowToNode(
       this.db.prepare("SELECT * FROM nodes WHERE id = ?").get(id) as NodeRow
     );
@@ -458,6 +523,14 @@ export class RigRepository {
       .prepare("UPDATE nodes SET effort = ? WHERE id = ?")
       .run(effort, nodeId);
     return result.changes > 0;
+  }
+
+  /** OPR.0.7.0.7: write or clear (null) a seat's explicit effort choice. Returns false when
+   *  the column isn't available or no row matched, so a caller never reports a change from it. */
+  setNodeEffortChoice(nodeId: string, choice: string | null): boolean {
+    if (!this.hasNodeColumn("effort_choice")) return false;
+    return this.db.prepare("UPDATE nodes SET effort_choice = ? WHERE id = ?")
+      .run(choice, nodeId).changes > 0;
   }
 
   clearNodeEffort(nodeId: string): boolean {
@@ -619,9 +692,10 @@ export class RigRepository {
   setServicesRecord(rigId: string, record: RigServicesRecordInput): RigServicesRecord {
     const now = new Date().toISOString();
     const composeFile = resolve(record.rigRoot, record.composeFile);
-    const rig = this.db.prepare("SELECT name FROM rigs WHERE id = ?").get(rigId) as { name: string } | undefined;
+    const rig = this.db.prepare("SELECT 1 AS present FROM rigs WHERE id = ?").get(rigId);
     if (!rig) throw new Error(`Rig not found: ${rigId}`);
-    const projectName = record.projectName ?? deriveComposeProjectName(rig.name);
+    // Keep the fallback aligned with bootstrap's unique, stable rig-ID default.
+    const projectName = record.projectName ?? this.getServicesRecord(rigId)?.projectName ?? deriveComposeProjectName(rigId);
     this.db.prepare(`
       INSERT INTO rig_services (
         rig_id,
@@ -657,6 +731,19 @@ export class RigRepository {
     const stored = this.db.prepare("SELECT * FROM rig_services WHERE rig_id = ?").get(rigId) as RigServicesRow | undefined;
     if (!stored) throw new Error(`Failed to persist services record for rig ${rigId}`);
     return this.rowToServicesRecord(stored);
+  }
+
+  /** A retained generation must not tear down a live generation's project. */
+  getLiveServicesSuccessor(rigId: string, projectName: string): { id: string; name: string } | null {
+    if (!this.hasRigColumn("archived_at")) return null;
+    return this.db.prepare(`
+      SELECT r.id, r.name FROM rig_services s JOIN rigs r ON r.id = s.rig_id
+      JOIN rigs predecessor ON predecessor.id = ?
+      WHERE s.project_name = ? AND r.id != predecessor.id
+        AND predecessor.archived_at IS NOT NULL AND r.archived_at IS NULL
+        AND r.name = predecessor.name
+      ORDER BY r.created_at DESC LIMIT 1
+    `).get(rigId, projectName) as { id: string; name: string } | undefined ?? null;
   }
 
   getServicesRecord(rigId: string): RigServicesRecord | null {
@@ -696,8 +783,10 @@ export class RigRepository {
       runtime: row.runtime,
       model: row.model,
       effort: row.effort ?? null,
+      effortChoice: row.effort_choice ?? null,
       codexConfigProfile: row.codex_config_profile ?? null,
       permissionPolicy: row.permission_policy ?? null,
+      env: parseStoredSeatEnv(row.env_json),
       cwd: row.cwd,
       surfaceHint: row.surface_hint ?? null,
       workspace: row.workspace ?? null,
@@ -785,8 +874,10 @@ interface NodeRow {
   runtime: string | null;
   model: string | null;
   effort?: string | null;
+  effort_choice?: string | null;
   codex_config_profile?: string | null;
   permission_policy?: string | null;
+  env_json?: string | null;
   cwd: string | null;
   surface_hint: string | null;
   workspace: string | null;

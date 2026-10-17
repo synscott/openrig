@@ -31,6 +31,7 @@ describe("contained Claude restore activity resources", () => {
   let cwd: string;
   let settingsPath: string;
   let writes: Array<{ file: string; text: string }>;
+  let fsOps: ClaudeAdapterFsOps;
   let adapter: ClaudeCodeAdapter;
   let tmux: TmuxAdapter;
   let rigs: RigRepository;
@@ -52,7 +53,7 @@ describe("contained Claude restore activity resources", () => {
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
     fs.writeFileSync(settingsPath, JSON.stringify(originalSettings));
     writes = [];
-    const fsOps: ClaudeAdapterFsOps = {
+    fsOps = {
       exists: fs.existsSync, readFile: p => fs.readFileSync(p, "utf8"),
       writeFile: (p, text) => { writes.push({ file: p, text }); fs.writeFileSync(p, text); },
       mkdirp: p => { fs.mkdirSync(p, { recursive: true }); },
@@ -96,7 +97,7 @@ describe("contained Claude restore activity resources", () => {
   function settings() { return JSON.parse(fs.readFileSync(settingsPath, "utf8")); }
   function owned(s = settings()): string[] {
     return Object.values(s.hooks ?? {}).flatMap((groups: any) => groups.flatMap((g: any) => g.hooks ?? []))
-      .map((h: any) => h.command as string).filter(c => c.includes(".openrig/hooks/scripts/activity-relay.cjs"));
+      .map((h: any) => h.command as string).filter(c => c.includes("state/claude-activity-hooks/activity-relay.cjs"));
   }
   function seed(pod: boolean, selected = true, runtime = "claude-code") {
     const rig = rigs.createRig("restore");
@@ -150,10 +151,32 @@ describe("contained Claude restore activity resources", () => {
     if (pod) expect(adapter.launchHarness).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ resumeToken: token }));
     const beforePoll = owned(); const writeCount = writes.filter(w => w.file === settingsPath).length;
     const monitor = new ContextMonitor(db, new ContextUsageStore(db, { stateDir: path.join(root, "state"), codexHome: path.join(root, "codex") }), adapter);
+    // The collector's status line is already in place, so the poll writes nothing and the hooks stay as they are.
+    await monitor.pollOnce();
+    expect(writes.filter(w => w.file === settingsPath).length).toBe(writeCount);
+    expect(owned()).toEqual(beforePoll);
+    expect(settings().hooks.Stop).toContainEqual(userHook);
+    expect(settings().env).toEqual(originalSettings.env);
+    // A poll that does refresh the status line (here a stale collector command) keeps the selected hooks in its write.
+    fs.writeFileSync(settingsPath, JSON.stringify({ ...settings(), statusLine: { type: "command", command: "node /old/.openrig/context-collector.cjs /old/ctx /old/prov" } }));
     await monitor.pollOnce(); monitor.stop();
-    expect(writes.filter(w => w.file === settingsPath).length).toBeGreaterThan(writeCount);
+    expect(writes.filter(w => w.file === settingsPath).length).toBe(writeCount + 1);
     expect(owned()).toEqual(beforePoll);
     expect(writes.filter(w => w.file === settingsPath).every(w => owned(JSON.parse(w.text)).length > 0)).toBe(true);
+  });
+
+  it("#729: keeps startup warnings when the final joined restore proof needs attention", async () => {
+    const f = seed(true);
+    const { StartupOrchestrator } = await import("../src/domain/startup-orchestrator.js");
+    const warning = "Startup submission unverified: capture unavailable";
+    vi.spyOn(StartupOrchestrator.prototype, "startNode").mockResolvedValue({
+      ok: true, startupStatus: "ready", continuityOutcome: "resumed", warnings: [warning],
+    });
+    const result = await restore(f);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.nodes[0]).toMatchObject({ status: "attention_required" });
+    expect(result.result.warnings).toContain(warning);
   });
 
   it.each([false, true])("heals already stripped settings before native resume (pod=%s)", async pod => {
@@ -181,6 +204,32 @@ describe("contained Claude restore activity resources", () => {
     const result = await restore(seed(true, false));
     expect(result.ok).toBe(true);
     expect(settings().hooks).toEqual(before);
+  });
+
+  it.each(["relay", "manifest", "settings"] as const)("warns when restore activity hooks are skipped: %s", async unavailable => {
+    const f = seed(true);
+    if (unavailable === "settings") fs.writeFileSync(settingsPath, "{invalid settings");
+    else {
+      const missing = path.join(shipped, unavailable === "relay" ? "scripts/activity-relay.cjs" : "claude.json");
+      fsOps.exists = p => p !== missing && fs.existsSync(p);
+    }
+    const before = fs.readFileSync(settingsPath, "utf8");
+    const project = vi.spyOn(adapter, "project");
+    const result = await restore(f);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.nodes[0]).toMatchObject({
+      status: "attention_required", error: expect.stringContaining("joined restore proof is incomplete"),
+    });
+    expect(await project.mock.results[0]!.value).toMatchObject({ projected: [], skipped: ["activity"], failed: [] });
+    expect(result.result.warnings).toContain("Restore activity hooks: skipped activity; saved hooks could not be reapplied.");
+    // Startup may still provision its existing context collector in valid settings.
+    if (unavailable === "settings") expect(fs.readFileSync(settingsPath, "utf8")).toBe(before);
+    else {
+      expect(settings().hooks).toEqual(JSON.parse(before).hooks);
+      expect(settings().env).toEqual(JSON.parse(before).env);
+    }
+    expect(tmux.sendText).not.toHaveBeenCalled();
   });
 
   it("retains real fresh projection and deliberate resource removal", async () => {

@@ -165,7 +165,7 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     PATH: "/usr/bin", HOME: "/home/seat", TERM: "xterm",
     AWS_SECRET_ACCESS_KEY: "leak-me", OPENRIG_ACTIVITY_HOOK_TOKEN: "secret",
     GITHUB_TOKEN: "leak-me-too", ZAI_API_KEY: "zai-key", KIMI_API_KEY: "kimi-key",
-    OPENROUTER_API_KEY: "or-key",
+    OPENROUTER_API_KEY: "or-key", MINIMAX_API_KEY: "minimax-key",
   };
 
   it("preserves managed identity and instance/context provenance, not ambient OpenRig settings", () => {
@@ -186,6 +186,7 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     expect(env.OPENROUTER_API_KEY).toBe("or-key");
     for (const name of ["OPENRIG_UNREVIEWED_SETTING", "OPENRIG_TERMINAL_BEARER_TOKEN",
       "OPENRIG_ACTIVITY_HOOK_TOKEN", "OPENAI_API_KEY", "ZAI_API_KEY", "KIMI_API_KEY",
+      "MINIMAX_API_KEY",
       "BASH_ENV", "ENV", "NODE_OPTIONS", "TMUX", "TMUX_PANE", "RIGGED_SESSION_NAME"]) {
       expect(env).not.toHaveProperty(name);
     }
@@ -216,10 +217,18 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     expect(env.ZAI_API_KEY).toBe("zai-key");
     expect(env).not.toHaveProperty("KIMI_API_KEY");
     expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
+    expect(env).not.toHaveProperty("MINIMAX_API_KEY");
 
     const kimi = buildPiChildEnv(source, { agentDir: "/a", sessionsDir: "/s", model: "kimi-coding/k2p7" });
     expect(kimi.KIMI_API_KEY).toBe("kimi-key");
     expect(kimi).not.toHaveProperty("ZAI_API_KEY");
+    expect(kimi).not.toHaveProperty("MINIMAX_API_KEY");
+
+    const minimax = buildPiChildEnv(source, { agentDir: "/a", sessionsDir: "/s", model: "minimax/MiniMax-M3" });
+    expect(minimax.MINIMAX_API_KEY).toBe("minimax-key");
+    expect(minimax).not.toHaveProperty("ZAI_API_KEY");
+    expect(minimax).not.toHaveProperty("KIMI_API_KEY");
+    expect(minimax).not.toHaveProperty("OPENROUTER_API_KEY");
   });
 
   it("openrouter passes only OPENROUTER_API_KEY", () => {
@@ -227,6 +236,14 @@ describe("buildPiChildEnv — deny-by-default allowlist (BR-3)", () => {
     expect(env.OPENROUTER_API_KEY).toBe("or-key");
     expect(env).not.toHaveProperty("ZAI_API_KEY");
     expect(env).not.toHaveProperty("KIMI_API_KEY");
+  });
+
+  it("minimax passes only MINIMAX_API_KEY", () => {
+    const env = buildPiChildEnv(source, { agentDir: "/a", sessionsDir: "/s", model: "minimax/MiniMax-M3" });
+    expect(env.MINIMAX_API_KEY).toBe("minimax-key");
+    expect(env).not.toHaveProperty("ZAI_API_KEY");
+    expect(env).not.toHaveProperty("KIMI_API_KEY");
+    expect(env).not.toHaveProperty("OPENROUTER_API_KEY");
   });
 
   it("unknown/custom providers get no ambient key passthrough (models.json is their path)", () => {
@@ -258,6 +275,39 @@ describe("PiRuntimeAdapter.launchHarness", () => {
     // Seat isolation dirs were created.
     expect(fs.dirs.has(piSeatPaths(STATE_ROOT, SESSION).agentDir)).toBe(true);
     expect(fs.dirs.has(piSeatPaths(STATE_ROOT, SESSION).sessionsDir)).toBe(true);
+  });
+
+  it("OPR.0.7.0.2: --usage-facts only while usage.pi_cost_facts is on, read at each launch; off by default", async () => {
+    let enabled = false;
+    const commands: string[] = [];
+    for (const deps of [{}, { usageFactsEnabled: () => enabled }, { usageFactsEnabled: () => enabled }]) {
+      const fs = memFs();
+      const sendShellCommand = vi.fn(async (_t: string, text: string) => {
+        fs.files[piSeatPaths(STATE_ROOT, SESSION).runnerStatePath] = readyState(SESSION_FILE, launchIdFrom(text));
+        commands.push(text);
+        return { ok: true as const };
+      });
+      const adapter = new PiRuntimeAdapter({ tmux: mockTmux({ sendShellCommand }), fsOps: fs, stateRoot: STATE_ROOT, runnerEntryPath: RUNNER, sleep: async () => {}, ...deps });
+      expect((await adapter.launchHarness(binding, { name: SESSION })).ok).toBe(true);
+      enabled = commands.length >= 2; // switched on before the third launch, which reads it again
+    }
+    expect(commands.map((c) => c.includes("--usage-facts"))).toEqual([false, false, true]);
+  });
+
+  it("OPR.0.7.0.2 K4: --openrouter-charge only with usage facts on too, read at each launch; off by default", async () => {
+    const settings = [{ facts: false, charge: true }, { facts: true, charge: false }, { facts: true, charge: true }];
+    const commands: string[] = [];
+    for (const deps of [{}, ...settings.map((x) => ({ usageFactsEnabled: () => x.facts, openRouterChargeEnabled: () => x.charge }))]) {
+      const fs = memFs();
+      const sendShellCommand = vi.fn(async (_t: string, text: string) => {
+        fs.files[piSeatPaths(STATE_ROOT, SESSION).runnerStatePath] = readyState(SESSION_FILE, launchIdFrom(text));
+        commands.push(text);
+        return { ok: true as const };
+      });
+      const adapter = new PiRuntimeAdapter({ tmux: mockTmux({ sendShellCommand }), fsOps: fs, stateRoot: STATE_ROOT, runnerEntryPath: RUNNER, sleep: async () => {}, ...deps });
+      expect((await adapter.launchHarness(binding, { name: SESSION })).ok).toBe(true);
+    }
+    expect(commands.map((c) => c.includes("--openrouter-charge"))).toEqual([false, false, false, true]);
   });
 
   it("explicit approve posture is honored end-to-end", async () => {

@@ -155,6 +155,7 @@ export class ClaimService {
     nodeId: string,
     sessionName: string,
     observation: PaneBindingObservation,
+    sessionId: string,
     tmuxWindow?: string | null,
   ): void {
     this.sessionRegistry.updateBinding(nodeId, {
@@ -165,6 +166,7 @@ export class ClaimService {
     if (!observation.ok) {
       new SeatIdentityStore(this.db).upsert(paneObservationVerdict({
         nodeId,
+        sessionId,
         sessionName,
         observation,
       }));
@@ -280,7 +282,7 @@ export class ClaimService {
   private emitCaptureSkip(
     input: { rigId: string; nodeId: string; sessionId: string; sessionName: string },
     runtime: string,
-    reason: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "stale_sidecar",
+    reason: "missing_sidecar" | "parse_error" | "probe_timeout" | "process_unreadable" | "invalid_token" | "stale_sidecar",
   ): void {
     try {
       this.eventBus.emit({
@@ -334,14 +336,14 @@ export class ClaimService {
     );
 
     const bindTx = this.db.transaction(() => {
+      const session = this.sessionRegistry.registerClaimedSession(node.id, discovered.tmuxSession);
       this.persistPaneBinding(
         node.id,
         discovered.tmuxSession,
         paneObservation,
+        session.id,
         discovered.tmuxWindow,
       );
-
-      const session = this.sessionRegistry.registerClaimedSession(node.id, discovered.tmuxSession);
       this.discoveryRepo.markClaimed(discovered.id, node.id);
       this.eventBus.persistWithinTransaction({
         type: "node.claimed",
@@ -539,8 +541,8 @@ export class ClaimService {
         for (const row of stale) {
           this.sessionRegistry.markSuperseded(row.id);
         }
-        this.persistPaneBinding(nodeRow!.id, sessionName, paneObservation);
         const session = this.sessionRegistry.registerClaimedSession(nodeRow!.id, sessionName);
+        this.persistPaneBinding(nodeRow!.id, sessionName, paneObservation, session.id);
         sessionId = session.id;
         persistedEvent = this.eventBus.persistWithinTransaction({
           type: "node.reconciled",
@@ -679,14 +681,14 @@ export class ClaimService {
         podId: opts.podId,
       });
 
+      const session = this.sessionRegistry.registerClaimedSession(node.id, discovered.tmuxSession);
       this.persistPaneBinding(
         node.id,
         discovered.tmuxSession,
         paneObservation,
+        session.id,
         discovered.tmuxWindow,
       );
-
-      const session = this.sessionRegistry.registerClaimedSession(node.id, discovered.tmuxSession);
       this.discoveryRepo.markClaimed(discovered.id, node.id);
       this.eventBus.persistWithinTransaction({
         type: "node.claimed",

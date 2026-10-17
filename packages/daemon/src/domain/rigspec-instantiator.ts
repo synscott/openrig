@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { effortPrecedence, readSeatEffort } from "./seat-effort.js";
 import type Database from "better-sqlite3";
 import {
   resolvePermissionPolicyAttachment,
@@ -65,7 +66,7 @@ export class RigInstantiator {
     this.tmuxAdapter = deps.tmuxAdapter;
   }
 
-  async instantiate(spec: RigSpec): Promise<InstantiateOutcome> {
+  async instantiate(spec: RigSpec, opts?: { nonInterruptive?: boolean }): Promise<InstantiateOutcome> {
     // 1. Validate
     const raw = RigSpecCodec.parse(RigSpecCodec.serialize(spec));
     const validation = RigSpecSchema.validate(raw);
@@ -108,6 +109,7 @@ export class RigInstantiator {
       const txn = this.db.transaction(() => {
         const rig = this.rigRepo.createRig(spec.name);
         rigId = rig.id;
+        if (opts?.nonInterruptive !== undefined) this.rigRepo.setRigNonInterruptive(rig.id, opts.nonInterruptive);
 
         for (const specNode of spec.nodes) {
           const node = this.rigRepo.addNode(rig.id, specNode.id, {
@@ -320,8 +322,9 @@ import type {
   CompactionStrategy,
   ContinuityPolicyMaterializer,
 } from "./continuity-policy-materializer.js";
-import type { ReconcileSkillLoadoutResult, SkillLoadout, SkillRuntime } from "./skill-catalog.js";
+import { isKeptPluginSkill, type ReconcileSkillLoadoutResult, type SkillLoadout, type SkillRuntime } from "./skill-catalog.js";
 import type { SystemWorldResolution } from "./system-world.js";
+import type { SeatEnv } from "./seat-env.js";
 
 function defaultCultureStartupFile(): ResolvedStartupFile {
   const assetsRoot = nodePath.resolve(import.meta.dirname, "../../assets");
@@ -665,6 +668,7 @@ export class PodRigInstantiator {
         // Guard-F1: the RESOLVED rig attachment persists too (declaringDir = THIS rigRoot,
         // the original declaring RigSpec dir) — restart-complete for organic seats,
         // add-member under a different root, and successor continuity. STRICT (load-bearing).
+        if (rigSpec.env) this.deps.rigRepo.setRigEnv(materializedRigId, rigSpec.env);
         if (rigSpec.permissionPolicy) {
           this.deps.rigRepo.setRigPermissionPolicy(materializedRigId, rigSpec.permissionPolicy);
           const rigAttachment = resolvePermissionPolicyAttachment(rigSpec.permissionPolicy, rigRoot, {
@@ -1230,7 +1234,7 @@ export class PodRigInstantiator {
     return { ok: true, rigId, nodeId, logicalId: node.logicalId, status: "launched", sessionName: result.sessionName, warnings: result.warnings };
   }
 
-  async instantiate(rigSpecYaml: string, rigRoot: string, opts?: { cwdOverride?: string; force?: boolean; prelaunchHook?: (rigId: string) => Promise<{ ok: true } | { ok: false; code: string; message: string }> }): Promise<InstantiateOutcome> {
+  async instantiate(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
     // #141: while an import may archive a stopped same-name generation, allow one import per rig name at
     // a time on this daemon. Otherwise two imports could each replace it, or one could archive the other's
     // in-progress replacement. Unrelated names are unaffected; an adapter that cannot probe keeps today's
@@ -1256,7 +1260,7 @@ export class PodRigInstantiator {
     }
   }
 
-  private async instantiateOnce(rigSpecYaml: string, rigRoot: string, opts?: { cwdOverride?: string; force?: boolean; prelaunchHook?: (rigId: string) => Promise<{ ok: true } | { ok: false; code: string; message: string }> }): Promise<InstantiateOutcome> {
+  private async instantiateOnce(rigSpecYaml: string, rigRoot: string, opts?: { nonInterruptive?: boolean; cwdOverride?: string; env?: SeatEnv; installRoot?: string; force?: boolean; prelaunchHook?: (rigId: string, replacedRigIds: readonly string[]) => Promise<{ ok: true; rollback?: () => Promise<void> } | { ok: false; code: string; message: string; retainRig?: boolean }> }): Promise<InstantiateOutcome> {
     // 1. Parse + validate
     let rigSpec: PodRigSpec;
     try {
@@ -1336,11 +1340,13 @@ export class PodRigInstantiator {
             if (makeRunningSessionCounter(this.db)(id) > 0 || !this.deps.rigRepo.archiveRig(id)) throw new GenerationChanged(rigSpec.name);
           }
         }
-        return this.deps.rigRepo.createRig(rigSpec.name);
+        return this.deps.rigRepo.createRig(rigSpec.name, opts?.installRoot);
       });
       const rig = create();
       rigId = rig.id;
       createdRigId = rig.id;
+      const nonInterruptive = opts?.nonInterruptive ?? rigSpec.nonInterruptive;
+      if (nonInterruptive !== undefined) this.deps.rigRepo.setRigNonInterruptive(rigId, nonInterruptive);
       // PL-007: persist typed workspace block (when declared) on the rig
       // record. Whoami / node-inventory read it via getRigWorkspace().
       if (rigSpec.workspace) {
@@ -1353,6 +1359,7 @@ export class PodRigInstantiator {
       // OPR.0.4.8.3 Seam B: the SECOND rig-persist site (bootstrap instantiate path) —
       // both sites must write or the rig ref silently drops on one instantiate path.
       // Guard-F1: resolved rig attachment persists here too (declaringDir = rigRoot).
+      if (rigSpec.env) this.deps.rigRepo.setRigEnv(rigId, rigSpec.env);
       if (rigSpec.permissionPolicy) {
         this.deps.rigRepo.setRigPermissionPolicy(rigId, rigSpec.permissionPolicy);
         const rigAttachment = resolvePermissionPolicyAttachment(rigSpec.permissionPolicy, rigRoot, {
@@ -1438,13 +1445,17 @@ export class PodRigInstantiator {
     // OPR.0.3.2.22 Bug 2: if the hook fails, roll back the rig record so
     // the spec name is left free for a clean retry. Pods rely on rigs
     // via ON DELETE CASCADE so deleting the rig is sufficient.
+    let rollbackServices: (() => Promise<void>) | undefined;
     if (opts?.prelaunchHook) {
-      const hookResult = await opts.prelaunchHook(rigId);
+      const hookResult = await opts.prelaunchHook(rigId, archivedGenerations);
       if (!hookResult.ok) {
-        this.deps.rigRepo.deleteRig(rigId);
-        restoreArchived();
-        return { ok: false, code: "service_boot_failed", message: hookResult.message };
+        if (!hookResult.retainRig) {
+          this.deps.rigRepo.deleteRig(rigId);
+          restoreArchived();
+        }
+        return { ok: false, code: hookResult.code === "compose_project_conflict" ? "compose_project_conflict" : "service_boot_failed", message: hookResult.message };
       }
+      rollbackServices = hookResult.rollback;
     }
 
     // Phase 2: Process members in launch order
@@ -1453,7 +1464,7 @@ export class PodRigInstantiator {
         // Terminal fast-path: skip agent resolution and profile resolution
         if (member.agentRef === "builtin:terminal") {
           const termResult = await this.processTerminalMember(
-            rigId, rigSpec, rigRoot, pod, member, podId, qualifiedId, nodeIdMap, launchedSessionNames, podInstantiateWarnings, opts?.cwdOverride,
+            rigId, rigSpec, rigRoot, pod, member, podId, qualifiedId, nodeIdMap, launchedSessionNames, podInstantiateWarnings, opts?.cwdOverride, opts?.env,
           );
           nodeResults.push(termResult);
           continue;
@@ -1509,6 +1520,7 @@ export class PodRigInstantiator {
             // site (see the role wire note above) — same member-ref persistence as
             // createMemberNode or `rig up <spec>` seats lose their policy ref.
             permissionPolicy: member.permissionPolicy,
+            env: member.env,
             sessionSource: member.sessionSource,
             cwd: configResult.config.cwd,
             restorePolicy: configResult.config.restorePolicy,
@@ -1545,6 +1557,7 @@ export class PodRigInstantiator {
           rigSpec,
           rigRoot,
           cwdOverride: opts?.cwdOverride,
+          envOverride: opts?.env,
           force: opts?.force,
           pod,
           member,
@@ -1610,6 +1623,7 @@ export class PodRigInstantiator {
     const allTerminal = nodeResults.length > 0 && nodeResults.every((n) => n.status === "failed");
 
     if (allTerminal) {
+      let serviceCleanupError: string | undefined;
       const cleanup = async () => {
         if (this.deps.tmuxAdapter) {
           for (const sessionName of launchedSessionNames) {
@@ -1627,6 +1641,12 @@ export class PodRigInstantiator {
             if (!stopped.ok && (stopped.code !== "session_not_found" || /no server running/i.test(stopped.message ?? ""))) return;
           }
         }
+        try {
+          await rollbackServices?.();
+        } catch (error) {
+          serviceCleanupError = `Service cleanup failed; rig ${rigId} retained for recovery: ${String(error)}`;
+          return;
+        }
         this.deps.rigRepo.deleteRig(rigId);
         restoreArchived();
       };
@@ -1634,7 +1654,7 @@ export class PodRigInstantiator {
       if (guard) await guard.lifecycle(Object.values(nodeIdMap), cleanup);
       else await cleanup();
       const details = nodeResults.map((n) => `${n.logicalId}: ${n.error ?? "unknown"}`).join("; ");
-      return { ok: false, code: "instantiate_error", message: `all node launches/startups failed — ${details}` };
+      return { ok: false, code: "instantiate_error", message: `all node launches/startups failed — ${details}${serviceCleanupError ? `; ${serviceCleanupError}` : ""}` };
     }
 
     if (hasAttention && !hasLaunched) {
@@ -1775,6 +1795,7 @@ export class PodRigInstantiator {
     launchedSessionNames: string[],
     warnings: string[],
     cwdOverride?: string,
+    envOverride?: SeatEnv,
   ): Promise<{ logicalId: string; status: "launched" | "failed"; error?: string }> {
     const effectiveCwd = resolveLaunchCwd(member.cwd, rigRoot, cwdOverride);
     // Create node with sentinel values
@@ -1784,6 +1805,7 @@ export class PodRigInstantiator {
         runtime: member.runtime,
         model: member.model,
         effort: member.effort,
+        env: member.env,
         cwd: effectiveCwd,
         restorePolicy: "checkpoint_only",
         podId,
@@ -1802,6 +1824,7 @@ export class PodRigInstantiator {
       rigSpec,
       rigRoot,
       cwdOverride,
+      envOverride,
       pod,
       member,
       qualifiedId,
@@ -1858,6 +1881,7 @@ export class PodRigInstantiator {
       // OPR.0.4.8.3 Seam B: the member's OWN raw ref persists on the node (like role);
       // rig-level lives on the rig row; precedence applies at RESOLUTION, not storage.
       permissionPolicy: input.member.permissionPolicy,
+      env: input.member.env,
       sessionSource: input.member.sessionSource,
       cwd: effectiveCwd,
       restorePolicy: input.member.restorePolicy,
@@ -1893,6 +1917,7 @@ export class PodRigInstantiator {
     qualifiedId: string;
     nodeId: string;
     cwdOverride?: string;
+    envOverride?: SeatEnv;
   }): Promise<{ status: "launched" | "failed" | "attention_required"; error?: string; evidence?: string; sessionName?: string; warnings?: string[] }> {
     return input.member.agentRef === "builtin:terminal"
       ? this.launchExistingTerminalMember(input)
@@ -1947,6 +1972,8 @@ export class PodRigInstantiator {
     qualifiedId: string;
     nodeId: string;
     cwdOverride?: string;
+    /** One-off `rig up --env` values for this launch; not saved with the seat. */
+    envOverride?: SeatEnv;
     /** P20 atom-4 — operator override: overwrite operator-edited (operator_conflict)
      *  projection targets instead of protecting them. Absent = protect (safe default). */
     force?: boolean;
@@ -2008,24 +2035,39 @@ export class PodRigInstantiator {
     }
 
     const canonicalSessionName = deriveCanonicalSessionName(input.pod.id, input.member.id, input.rigSpec.name);
+    const keptSkillWarnings: string[] = [];
     if (
       configResult.config.skillLoadout
       && this.deps.skillReconciler
       && (configResult.config.runtime === "claude-code" || configResult.config.runtime === "codex")
     ) {
-      const projection = this.deps.skillReconciler({
-        loadout: configResult.config.skillLoadout,
-        runtime: configResult.config.runtime,
+      const reconcile = (selected: SkillLoadout) => this.deps.skillReconciler!({
+        loadout: selected,
+        runtime: configResult.config.runtime as SkillRuntime,
         cwd: configResult.config.cwd,
         apply: true,
         topologyOwner: canonicalSessionName,
       });
+      const loadout = configResult.config.skillLoadout;
+      let projection = reconcile(loadout);
+      // Plugin skills never stop a seat that launched before them: if they cannot be
+      // projected, the seat starts with the rest of its loadout and says why.
+      if (!projection.ok && loadout.entries.some((entry) => entry.pluginId)) {
+        const withoutPlugins = reconcile({ ...loadout, entries: loadout.entries.filter((entry) => !entry.pluginId) });
+        if (withoutPlugins.ok) {
+          keptSkillWarnings.push(`plugin_skills_not_projected: ${projection.errors.map((error) => `${error.code}: ${error.message}`).join("; ")}`);
+          projection = withoutPlugins;
+        }
+      }
       if (!projection.ok) {
         return {
           status: "failed",
           error: projection.errors.map((error) => `${error.code}: ${error.message}`).join("; "),
           sessionName: canonicalSessionName,
         };
+      }
+      for (const receipt of projection.receipts.filter(isKeptPluginSkill)) {
+        keptSkillWarnings.push(`plugin_skill_kept: ${receipt.id}: ${receipt.detail.slice("kept: ".length)} (${receipt.target})`);
       }
     }
     // Forward per-seat silenceWindowSeconds from the resolved profile.
@@ -2034,6 +2076,7 @@ export class PodRigInstantiator {
     const launchResult = await this.deps.nodeLauncher.launchNode(input.rigId, input.qualifiedId, {
       sessionName: canonicalSessionName,
       silenceWindowSeconds: configResult.config.activity?.silenceWindowSeconds,
+      env: input.envOverride,
     });
     if (!launchResult.ok) {
       return { status: "failed", error: launchResult.message };
@@ -2081,7 +2124,7 @@ export class PodRigInstantiator {
     // P17: a divergent target is never SILENT again — each conflict rides the
     // instantiate warnings surface with the file, reason, and consequence.
     (launchResult.warnings ??= []).push(
-      ...(configResult.config.skillWarnings ?? []).map(warning => `${canonicalSessionName}: ${warning}`),
+      ...[...(configResult.config.skillWarnings ?? []), ...keptSkillWarnings].map(warning => `${canonicalSessionName}: ${warning}`),
       ...projectionConflictWarnings(planResult.plan),
     );
 
@@ -2123,7 +2166,9 @@ export class PodRigInstantiator {
       updatedAt: "",
       cwd: configResult.config.cwd,
       model: configResult.config.model,
-      effort: configResult.config.effort,
+      // The seat's saved effort choice wins over the authored value just written by
+      // updateNodeResolvedConfig; a seat without one launches with exactly that authored value.
+      effort: (readSeatEffort(this.deps.rigRepo.db, input.nodeId) ?? { effective: configResult.config.effort ?? null }).effective ?? undefined,
       codexConfigProfile: input.member.codexConfigProfile,
       // OPR.0.4.8.3 Seam B: resolved launch posture (member > rig > persisted > FLOOR)
       // binds per-seat explicitly; adapters thread it into the yolo-mode helpers.
@@ -2315,6 +2360,7 @@ export class PodRigInstantiator {
     qualifiedId: string;
     nodeId: string;
     cwdOverride?: string;
+    envOverride?: SeatEnv;
   }): Promise<{ status: "launched" | "failed"; error?: string; sessionName?: string; warnings?: string[] }> {
     const guard = this.deps.tmuxAdapter?.deliveryGuard;
     if (guard && !guard.ownsLifecycle(input.nodeId)) {
@@ -2333,7 +2379,7 @@ export class PodRigInstantiator {
     }
 
     const canonicalSessionName = deriveCanonicalSessionName(input.pod.id, input.member.id, input.rigSpec.name);
-    const launchResult = await this.deps.nodeLauncher.launchNode(input.rigId, input.qualifiedId, { sessionName: canonicalSessionName });
+    const launchResult = await this.deps.nodeLauncher.launchNode(input.rigId, input.qualifiedId, { sessionName: canonicalSessionName, env: input.envOverride });
     if (!launchResult.ok) {
       return { status: "failed", error: launchResult.message };
     }
@@ -2433,6 +2479,14 @@ export class PodRigInstantiator {
       );
       // Always write the resolved effort — present value sets it, absent value
       // clears a previously-stored effort so spec changes take effect on next launch.
+      // OPR.0.7.0.7: a seat's saved effort choice is a separate value; whether a refresh keeps
+      // it is the founder's open precedence decision, asked of the one seam.
+      const before = readSeatEffort(this.deps.rigRepo.db, nodeId);
+      if (before?.choice && effortPrecedence.specRefreshChoice({
+        choice: before.choice, authoredBefore: before.authored, authoredAfter: config.effort?.trim() || null,
+      }) === "clear") {
+        this.deps.rigRepo.setNodeEffortChoice(nodeId, null);
+      }
       if (config.effort) {
         this.deps.rigRepo.setNodeEffort(nodeId, config.effort);
       } else {
@@ -2615,6 +2669,7 @@ export class PodRigInstantiator {
       "This is your startup identity hint. For durable identity recovery after compaction, run:",
       "  rig whoami --json",
       "That command returns your full topology context: rig, pod, peers, edges, and transcript path.",
+      "If its peersNote says some peers are not shown, rig whoami --json --all-peers lists them all.",
     ].filter((line): line is string => Boolean(line));
 
     return {

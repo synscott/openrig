@@ -122,6 +122,7 @@ export interface ActivityEvidence {
   observedAt: string;
   activity?: ActivityValue;
   needsInput?: NeedsInput;
+  permissionRequest?: { id: string };
 }
 
 /** A visible rung-health transition (AM-1): arbitration can never make a silently-dead
@@ -141,6 +142,10 @@ export interface ArbitratedSeatState {
   seatNodeId: string;
   activity: ActivityValue;
   needsInput: NeedsInput;
+  /** The authoritative needs-input evidence that supplied `needsInput`: its rung and when it
+   *  was observed. Null when no rung answered and `needsInput` is only the default zero — a
+   *  declared rung that never reported is not an observation that the seat is clear. */
+  needsInputEvidence: { rung: EvidenceRungId; observedAt: string } | null;
   /** Which rung decided `activity` — confidence made visible. */
   decidedBy: EvidenceRungId | null;
   /** Monotonic arbitrated-state sequence (wait-after-seq consumes it). */
@@ -176,6 +181,7 @@ export const CODEX_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
   runtime: "codex",
   rungs: [
     { rung: "lifecycle-hooks", lifecycleCoverage: "full", initialTrust: "trial" },
+    { rung: "needs-input-chrome", lifecycleCoverage: "full", initialTrust: "authoritative" },
     { rung: "window-sampling", lifecycleCoverage: "full", initialTrust: "authoritative" },
   ],
 };

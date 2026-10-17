@@ -8,6 +8,7 @@ import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { runWakeLadderTick, queueRecoveryOwnsWake, WAKE_SUSPEND_OVERRIDE_ENV } from "../src/domain/queue-wake-ladder.js";
 import { lastMeaningfulTransition } from "../src/domain/queue-waiting.js";
 import { recoveryTag } from "../src/domain/queue-recovery.js";
+import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
 
 describe("waiting face names the next action the existing ladder can actually take", () => {
   let db: Database.Database, queue: QueueRepository, sends: string[];
@@ -27,7 +28,11 @@ describe("waiting face names the next action the existing ladder can actually ta
   afterEach(() => { db.close(); vi.useRealTimers(); vi.unstubAllEnvs(); });
   async function handoff(target = "worker@rig") {
     const source = await queue.create({ sourceSession: "owner@rig", destinationSession: "owner@rig", body: "Prepare result", nudge: false });
-    return (await queue.handoff({ qitemId: source.qitemId, fromSession: "owner@rig", toSession: target, body: "Continue exact work", nudge: true })).created.qitemId;
+    const id = (await queue.handoff({ qitemId: source.qitemId, fromSession: "owner@rig", toSession: target, body: "Continue exact work", nudge: true })).created.qitemId;
+    // Backstop assertions describe a completed wake attempt, not the earlier persistence receipt.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(queue.getByIdOrThrow(id).lastNudgeResult).not.toBeNull();
+    return id;
   }
   const view = (id: string) => queue.getByIdOrThrow(id).waiting!;
   const tick = () => runWakeLadderTick({ db, queueRepo: queue, now: new Date(), resolveOrchestrator: () => null, log: () => {} });
@@ -184,5 +189,24 @@ describe("waiting face names the next action the existing ladder can actually ta
     expect(row.claimedAt).not.toBeNull();
     expect(queueRecoveryOwnsWake(db, row)).toBe(false);
     expect((await tick()).actions).not.toContainEqual({ qitemId: id, action: "retry", target: "worker@rig" });
+  });
+
+  it("projects a parked row's timer when the scheduler will fire it, not now or 1970 (#860)", async () => {
+    const row = await queue.create({ sourceSession: "owner@rig", destinationSession: "worker@rig", body: "Wait for the vendor", nudge: false });
+    const jobs = new WatchdogJobsRepository(db);
+    const job = jobs.register({
+      policy: "periodic-reminder",
+      specYaml: "policy: periodic-reminder\ntarget:\n  session: worker@rig\nmessage: resume\n",
+      targetSession: "worker@rig",
+      intervalSeconds: 600,
+      registeredBySession: "worker@rig",
+    });
+    await queue.update({ qitemId: row.qitemId, actorSession: "worker@rig", state: "blocked", blockedOn: "external:vendor",
+      transitionNote: "continuation: resume when the vendor answers", wakeWatchdogId: job.jobId } as never);
+    // Never evaluated: the reminder fires one interval after registration.
+    expect(view(row.qitemId).nextBackstop).toMatchObject({ mechanism: `watchdog:${job.jobId}`, dueAt: "2026-09-08T00:10:00.000Z" });
+    // A blocker change writes the epoch as a wake-now marker: due now.
+    jobs.updateSchedule(job.jobId, job.specYaml, 600, new Date(0).toISOString());
+    expect(view(row.qitemId).nextBackstop.dueAt).toBe("2026-09-08T00:00:00.000Z");
   });
 });

@@ -17,6 +17,12 @@ export interface NodeBinding extends Binding {
   launchPosture?: "floor" | "full_bypass" | "auto";
   /** Explicit Claude native mode; checked against the bound managed executable. */
   permissionMode?: string;
+  /** Persisted rig opt-in to per-launch warning acceptance, only at full_bypass. */
+  nonInterruptive?: boolean;
+  /** Launch-only operational default, derived from the persisted kernel rig and explicit selections. */
+  kernelAuthority?: boolean;
+  /** Derived at launch only when no authored policy, seat choice or native profile applies. */
+  teamPermissionDefault?: boolean;
   /** Reserved successor generation; current tenure remains the input fence until commit. */
   launchGeneration?: string;
   /** #25: the rig's `managed_blocks.claude-code` file. Absent = CLAUDE.md. Only the Claude adapter reads it. */
@@ -71,6 +77,7 @@ export const ATTENTION_REQUIRED_READINESS_CODES = new Set([
   "update_gate",
   "login_required",
   "mcp_gate",
+  "bypass_consent_gate",
   // Codex auth refusal (stored OAuth token can no longer be refreshed).
   // Defensive: row 6's verifyResumeLaunch patch propagates attention_required
   // through the launch path so the readiness fallback shouldn't see this code,
@@ -87,12 +94,19 @@ export function isAttentionRequiredReadinessCode(code: string | undefined): bool
 
 export type HarnessLaunchRecovery = "retry_fresh" | "attention_required";
 
+// `launchedProcess` (Claude resume launches): the first process the launch's own readiness check
+// pinned as the one it started, kept even when a later sample saw it replaced (#1077).
 export type HarnessLaunchResult =
-  | { ok: true; resumeToken?: string; resumeType?: string; appliedLaunch?: import("./permission-drift.js").AppliedLaunchObservation }
+  | { ok: true; resumeToken?: string; resumeType?: string; appliedLaunch?: import("./permission-drift.js").AppliedLaunchObservation;
+    launchedProcess?: import("./native-process-lineage.js").ClaudeLaunchedProcess }
   // `evidence` carries the last-N pane lines for `attention_required` outcomes
   // so the failure can flow honest evidence through to RestoreNodeResult's
   // attentionEvidence field. Omitted for non-attention recoveries.
-  | { ok: false; error: string; recovery?: HarnessLaunchRecovery; evidence?: string };
+  // `missingConversation` is set only when the runtime itself reported that the requested
+  // conversation doesn't exist; other `retry_fresh` failures (such as a pane back at its shell)
+  // leave it unset.
+  | { ok: false; error: string; recovery?: HarnessLaunchRecovery; evidence?: string; missingConversation?: true;
+    launchedProcess?: import("./native-process-lineage.js").ClaudeLaunchedProcess };
 
 // -- Shared concrete-hint resolver --
 
@@ -125,6 +139,10 @@ export function resolveConcreteHint(
 export interface ForkSource {
   kind: "native_id" | "artifact_path" | "name" | "last";
   value?: string;
+  /** Set only by a seat handover: a launch whose new id isn't captured yet still succeeds, with the id
+   *  pending, so the handover can commit the ready successor. Every other fork caller keeps the
+   *  refusal on a missed capture. */
+  pendingIdAllowed?: boolean;
 }
 
 /**
@@ -148,8 +166,9 @@ export interface RuntimeAdapter {
   /** Project resources from a projection plan to the runtime target locations. */
   project(plan: ProjectionPlan, binding: NodeBinding): Promise<ProjectionResult>;
 
-  /** Deliver startup files to the runtime. */
-  deliverStartup(files: ResolvedStartupFile[], binding: NodeBinding): Promise<StartupDeliveryResult>;
+  /** Deliver startup files. Claude's post-launch path can reuse the orchestrator's checked send.
+   * The adapter still owns file reads, ordering, provisioning and required/optional errors. */
+  deliverStartup(files: ResolvedStartupFile[], binding: NodeBinding, sendInteractiveText?: (text: string) => Promise<void>): Promise<StartupDeliveryResult>;
 
   /**
    * Launch the harness (claude/codex/terminal) inside the tmux session.

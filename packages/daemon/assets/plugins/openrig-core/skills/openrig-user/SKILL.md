@@ -301,7 +301,10 @@ OpenRig v0.3.0 adds `rig agent-image`, `rig context-pack`, `rig workspace`, and
 `rig config init-workspace`. *(0.5.0: the `rig context-pack` alias is retired — the store + compose library is the single `rig context` noun; see "Context packs and paced delivery (0.5.0)".)* It also shifts fresh-user starter guidance toward
 `product-team` for human-directed work and `conveyor` for workflow-oriented
 work. Treat `demo` as legacy/test content unless a task specifically asks for
-the old demo spec.
+the old demo spec. *(0.6.6: the built-in teams are `starter` and `factory`, plus the
+specialist teams `code-review`, `research` and `pm`. `product-team`, `conveyor` and
+`demo` are gone, and `first-project` is starter's old name. `workshop` is a rig
+bundle.)*
 
 OpenRig v0.3.1 adds public package/source surfaces for Plugin Primitive v0,
 Claude Auto-Compaction Policy, migration `040_workflow_specs_diagnostic`,
@@ -327,7 +330,9 @@ before relying on a policy or its default.
 
 Compatibility checks:
 - `rig down` accepts a rig name or id. An ambiguous name matching more than one
-  active rig is refused with matching ids; use the intended id.
+  active rig is refused with matching ids; use the intended id. It ends every
+  agent's session and any work in progress, so check `rig ps --nodes --rig <rig>`
+  and that the person asked; `rig up <rig> --existing` restores it.
 - For queue/view JSON or limit differences, compare the installed command's help,
   the running daemon version and the actual response. A wrapper mismatch is not
   by itself a daemon-health failure, and historical workarounds are not current
@@ -350,15 +355,19 @@ restore) into one call.
 
 ```bash
 rig start                    # interactive: daemon + kernel + pick-and-restore
-rig start --last             # headless: restore all rigs that were last running
+rig start --last             # headless: restore rigs that were last running; a rig stopped on purpose stays down
 rig start --all              # headless: restore all rigs with restore-usable snapshots
 rig start --rigs <name> [<name>...]   # headless: restore only the named rigs
 rig start --json             # JSON output for agents
 ```
 
+`rig start --last` keeps down a rig that was stopped on purpose (`rig down` or `rig seat stop`).
+Bring it back with `rig start --rigs <rig>`. A rig whose seat statuses can't be read is still
+attempted, with a warning (`seat_status_unreadable`).
+
 Framing: `rig start` is the RECOVERY entry point, not the getting-started
-hero. The fresh-user boot hero remains `rig up <starter>` (typically
-`rig up product-team`). Reach for `rig start` after a host reboot, daemon
+hero. The fresh-user boot hero remains `rig up <team>` (typically
+`rig up starter` for a first change, or `rig up factory`). Reach for `rig start` after a host reboot, daemon
 restart, or any "bring my rigs back" moment.
 
 ### `rig reconcile-session` — no-launch adopt of a hand-resumed session
@@ -495,11 +504,12 @@ rig ps --active             # opt-in active-state filter (does NOT change the al
 ```bash
 rig whoami                  # compact: identity + peers names + edges + transcript path
 rig whoami --json           # compact JSON
+rig whoami --json --all-peers  # compact JSON with every peer, when output.compact bounds the list
 rig whoami --full           # complete payload (v0.3.4 default shape)
 rig whoami --verbose        # alias of --full
 ```
 
-The first command every agent runs on boot AND every compaction-restore. The compact default keeps identity-recovery essentials (`identity`, `peers` names + sessionNames, `edges` directional `kind` + `to.sessionName`, `transcriptPath`). `--full` adds `contextUsage`, `commands`, `peersNote`, `runtimeContext`. The compact-default is an ALLOWLIST projection — future payload fields default to `--full` and cannot silently re-bloat the every-boot path.
+The first command every agent runs on boot AND every compaction-restore. The compact default keeps identity-recovery essentials (`identity`, `peers` names + sessionNames, `peersNote`, `edges` directional `kind` + `to.sessionName`, the transcript path). `--full` adds `contextUsage`, `commands`, `runtimeContext` and `workspace`. With `output.compact` on, compact JSON lists at most `output.whoami_peers` peers (default 8): edge peers first, then your pod, then roster order. `peersNote` and `peersOmitted` then say how many were left out, and `--all-peers` lists every one; `edges` stays complete. The compact-default is an ALLOWLIST projection — future payload fields default to `--full` and cannot silently re-bloat the every-boot path.
 
 ### `rig queue list` — active-frontier + docker/kubectl grammar
 
@@ -514,7 +524,7 @@ rig queue list --mine                # just the caller's items
 rig queue list --destination <s>     # destined to <s>
 rig queue list --source <s>          # sourced by <s>
 rig queue show <qitemId>             # bounded single-item body preview
-rig queue show <qitemId> --full      # complete body and chain fields
+rig queue show <qitemId> --full      # complete body and chain fields; a closed row adds closingTransition (the close's state, reason, target, actor, time and note)
 ```
 
 Four orthogonal axes (scope × history × field-breadth × encoding), all composable. **STOP using bare `rig queue list` as the cross-rig firehose.** Default is now active + compact + current-rig. Cross-rig history with full bodies is opt-in via `-A -a --full`; request only the breadth and fields needed for the question.
@@ -1275,8 +1285,8 @@ This lets ordinary agents ask the manager for OpenRig help instead of every agen
 ```bash
 rig grow <rig-id> <member...> [--pod <pod> | --new-pod <pod>] [--runtime <runtime>] [--cwd <path>] [--json]
 rig expand <rig-id> <pod-fragment-path> [--rig-root <path>] [--json]
-rig launch <rigId> <nodeRef> [--json]
-rig launch <rigId> --seats <a,b,c> [--hold-reason <text>] [--json]
+rig launch <rig> <nodeRef> [--json]
+rig launch <rig> --seats <a,b,c> [--hold-reason <text>] [--json]
 rig remove <rigId> <nodeRef> [--json]
 rig shrink <rigId> <podRef> [--json]
 rig unclaim <sessionRef> [--json]
@@ -1289,21 +1299,28 @@ or `rig add` (one member) when a seat needs an explicit model, a permission poli
 different agent spec or role profile, per-seat runtime or cwd, or startup files.
 
 Node-granular managed partial restore (v0.3.4+):
-- `rig launch <rigId> <nodeRef>` relaunches a single seat by logical id or node id through orchestration.
-- `rig launch <rigId> --seats <a,b,c>` relaunches a comma-separated subset of seats.
+- `rig launch <rig> <nodeRef>` relaunches a single seat by logical id or node id through orchestration. `<rig>` is the
+  rig's name or ID; a name shared by more than one active rig stops with the candidate IDs.
+- `rig launch <rig> --seats <a,b,c>` relaunches a comma-separated subset of seats.
 - `--hold-reason <text>` records a reason for holding non-target seats during the partial launch.
 - This is a SUPPORTED managed path. The prior `pod_aware_launch_unsupported` dead-end is retired; pod-aware narrow launch now goes through this surface rather than ad-hoc rebuilds.
 
 ### Add a member to an existing pod — v0.3.3+
 
 ```bash
-rig add <rig-id> <pod-namespace> <member-fragment-path> [--json]
+rig add <rig> <pod-namespace> <member-fragment-path> [--json]
 ```
 
 `rig add` is the top-level verb for the `add_member` converge op. It adds a
 single member to an existing pod from a YAML/JSON member fragment file. The
 daemon resolves the named pod, validates the member, runs preflight, and
 launches the member in place.
+
+`<rig>` is the rig id or its exact name (the `rigName` that `rig whoami --json`
+reports). A name shared by more than one rig is refused before anything is
+added, with the matching ids listed (`rig_ambiguous` under `--json`). `rig add`
+always targets the local daemon: while a remote host is selected it refuses to
+resolve a name (`remote_host_selected`); an exact local id still works.
 
 HTTP outcomes:
 - `201` — member added; per-node launch state included in the response.

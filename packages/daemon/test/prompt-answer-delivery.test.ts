@@ -62,7 +62,7 @@ describe("explicit prompt answer delivery", () => {
       : `────────────────────\n❯\u00a0${state.input}\n────────────────────\n\n  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
     const transport = new SessionTransport({ db, rigRepo, sessionRegistry: registry, eventBus,
       agentActivityStore: activity, tmuxAdapter: tmux, sleep: async () => {} });
-    return { name, state, tmux, transport, eventBus };
+    return { name, state, tmux, transport, eventBus, activity };
   }
 
   it("delivers the intended choice instead of the focused choice, with no Enter into the next prompt", async () => {
@@ -77,14 +77,39 @@ describe("explicit prompt answer delivery", () => {
     expect(db.prepare("SELECT count(*) AS n FROM events WHERE type = 'transport.prompt_override'").get()).toEqual({ n: 1 });
   });
 
-  it.each(["claude-code", "codex"] as const)("submits a complete still-staged text answer for %s", async runtime => {
+  it.each(["claude-code", "codex"] as const)("uses a pending permission to deliver an explicit still-staged text answer for %s", async runtime => {
     const f = fixture("text", runtime);
+    if (runtime === "codex") {
+      expect(f.activity.getLatestForNode({ sessionName: f.name })).toMatchObject({ state: "unknown", reason: "permission_request_pending" });
+    }
     const result = await f.transport.send(f.name, "green please", { dangerouslyInteract: true, reason: "answer the text field" });
     expect(result.ok).toBe(true);
     expect(f.state.submitted).toEqual(["green please"]);
     expect(result.promptInteraction).toBe("enter-sent");
     expect(f.state.commands.find(a => a[1] === "paste-buffer")).not.toContain("-p");
     expect(f.state.commands.filter(a => a[1] === "send-keys")).toEqual([["tmux", "send-keys", "-t", f.name, "Enter"]]);
+  });
+
+  it("presses Enter for a Codex `»` prompt holding exactly the answer", async () => {
+    const f = fixture("text", "codex");
+    // Codex 0.153 draws `»`; the shared runtime-scoped set has to recognize it.
+    f.state.capture = "» green please\n\n  test-model · ~/example";
+    const result = await f.transport.send(f.name, "green please", { dangerouslyInteract: true, reason: "Codex 0.153 prompt glyph" });
+    expect(result.ok).toBe(true);
+    expect(result.promptInteraction).toBe("enter-sent");
+    expect(f.state.submitted).toEqual(["green please"]);
+    expect(f.state.commands.filter(a => a[1] === "send-keys")).toEqual([["tmux", "send-keys", "-t", f.name, "Enter"]]);
+  });
+
+  it.each([".", ")"]) ("withholds Enter for a Codex `»` numbered choice (%s)", async separator => {
+    const f = fixture("choice", "codex");
+    // The choice body equals the answer, so only the numbered-choice exclusion
+    // stops the shared matcher from treating the menu selection as typed text.
+    f.state.capture = `Choose a harmless colour\n» 1${separator} Blue\n  2${separator} Green\n  3${separator} No`;
+    const result = await f.transport.send(f.name, "1. Blue", { dangerouslyInteract: true, reason: "Codex 0.153 numbered choice" });
+    expect(result).toMatchObject({ ok: true, sent: true, verified: false, outcome: "rendered-unconfirmed" });
+    expect(result.promptInteraction).toBe("unverified");
+    expect(f.state.commands.some(a => a[1] === "send-keys")).toBe(false);
   });
 
   it.each([null, "Working...", "❯ green\n────────────────────\nenter to submit",

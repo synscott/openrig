@@ -77,6 +77,9 @@ describe("archive-only bundle behaviour", () => {
     if (runtime === "claude-code" && (policy === "builtin:auto" || policy === "auto.md")) {
       expect(view.posture[0]?.selection).toContain("auto mode");
     }
+    const bypass = policy === "builtin:yolo" || policy === "bypass.md";
+    expect(view.posture[0]?.nonInterruptive).toBe(bypass && runtime !== "pi" ? "available" : undefined);
+    expect(view.posture[0]?.firstRunWarnings).toEqual(bypass && runtime === "claude-code" ? { claudeBypass: "harness_asks_once" } : undefined);
     expect(view.posture[0]?.nativeEffect).toBe("unknown");
   });
 
@@ -172,4 +175,19 @@ describe("archive-only bundle behaviour", () => {
     expect(view.identity.source).toBeNull();
     expect(view.identity.configurationId).toBeNull();
   });
+});
+
+
+it.each([true, false])("reports authored non-interruptive default %s separately from availability", declared => {
+  for (const runtime of ["claude-code", "codex", "pi"]) {
+    const files = fixture(runtime);
+    files.set("rig.yaml", files.get("rig.yaml")! + `\nnon_interruptive: ${declared}\n`);
+    const view = inspect(files);
+    expect(view.state).toBe("generated");
+    if (view.state !== "generated") throw new Error(view.reason);
+    expect(view.posture[0]?.nonInterruptiveDefault).toBe(runtime === "pi" ? undefined : declared);
+    expect(view.posture[0]?.permissionPrompts).toBe("off");
+    expect(view.posture[0]?.nativeEffect).toBe("unknown");
+    expect(view.posture[0]?.firstRunWarnings).toEqual(runtime === "claude-code" && !declared ? { claudeBypass: "harness_asks_once" } : undefined);
+  }
 });

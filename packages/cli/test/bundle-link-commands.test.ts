@@ -45,6 +45,15 @@ describe("bundle link command dispatch", () => {
     expect(f.post.mock.calls.find(c => c[0] === "/api/bundles/install")![1]).toMatchObject({ targetRoot: path.resolve("project"), cwdOverride: path.resolve("work"), plan: true });
   });
 
+  it.each(["up", "install"])("%s forwards opt-in, explicit opt-out and omission distinctly", async verb => {
+    for (const [flag, expected] of [["--non-interruptive", true], ["--no-non-interruptive", false], [undefined, undefined]] as const) {
+      f.post.mockClear();
+      const program = new Command().addCommand(verb === "up" ? upCommand(deps) : bundleCommand(deps));
+      await program.parseAsync([...(verb === "up" ? ["up", link] : ["bundle", "install", link]), ...(flag ? [flag] : []), "--json"], { from: "user" });
+      expect(f.post.mock.calls.find(c => c[0] === "/api/bundles/install")![1].nonInterruptive).toBe(expected);
+    }
+  });
+
   it("does not call install after create returns an error", async () => {
     f.imported.mockResolvedValueOnce({ res: { status: 400, data: { error: "invalid bundle" } } });
     await new Command().addCommand(upCommand(deps)).parseAsync(["up", link, "--json"], { from: "user" });
@@ -71,6 +80,31 @@ describe("bundle link command dispatch", () => {
   it("names GitHub links in the up source argument help", () => {
     const help = upCommand(deps).helpInformation();
     expect(help).toMatch(/source\s+[^\n]*GitHub/);
+  });
+
+  it.each(["up", "install"])("%s shows pending startup guidance without changing its JSON or exit", async verb => {
+    const attentionNodes = ["owner", "checker"].map(member => ({
+      logicalId: `dev.${member}`, sessionName: `dev-${member}@fixture`,
+      reason: `Permission consent needs attention; After resolving it in dev-${member}@fixture, run: rig seat continue 'dev-${member}@fixture'`,
+    }));
+    const data = { status: "partial", rigId: "fixture", stages: [{ stage: "import_rig", status: "blocked", detail: { attentionNodes } }] };
+    // An unavailable optional inspection keeps the install result unaugmented.
+    f.post.mockImplementation(async (url: string) => url === "/api/bundles/install"
+      ? { status: 200, data }
+      : { status: 500, data: { error: "view unavailable" } });
+    const argv = verb === "up" ? ["up", link] : ["bundle", "install", link];
+    const command = () => new Command().addCommand(verb === "up" ? upCommand(deps) : bundleCommand(deps));
+    await command().parseAsync(argv, { from: "user" });
+    const output = log.mock.calls.map(c => String(c[0]));
+    expect(output).toContain("Status: partial");
+    for (const node of attentionNodes) expect(output).toContain(`Startup attention (${node.sessionName}): ${node.reason}`);
+    expect(process.exitCode).toBe(2);
+    log.mockClear(); f.post.mockClear();
+    await command().parseAsync([...argv, "--json"], { from: "user" });
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(log.mock.calls[0]![0]))).toEqual({ ...data, ...identity });
+    expect(process.exitCode).toBe(2);
+    expect(f.post.mock.calls.map(c => c[0])).toEqual(["/api/bundles/inspect", "/api/bundles/install"]);
   });
 
   it("reports unknown install outcome, retains the path, and never retries", async () => {

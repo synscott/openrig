@@ -1,7 +1,9 @@
 import fs from "node:fs";
+import { readSeatEnvOverride } from "../domain/seat-env.js";
 import os from "node:os";
 import nodePath from "node:path";
 import { Hono } from "hono";
+import { bootstrapFailureResponse } from "./bootstrap-failure-response.js";
 import type { EventBus } from "../domain/event-bus.js";
 import type { BootstrapOrchestrator } from "../domain/bootstrap-orchestrator.js";
 import type { BootstrapRepository } from "../domain/bootstrap-repository.js";
@@ -21,8 +23,10 @@ import { RigSpecSchema } from "../domain/rigspec-schema.js";
 import { parseLegacyBundleManifest as parseBundleManifest, normalizeLegacyBundleManifest as normalizeBundleManifest, serializePodBundleManifest, parsePodBundleManifest, validatePodBundleManifest, validateLegacyBundleManifest, normalizeProvenanceBlock, normalizeBundleSource, normalizeCompatibilityBlock, isRelativeSafePath } from "../domain/bundle-types.js";
 import type { PodBundleManifest, BundleProvenance, BundleCompatibility, BundlePluginReference } from "../domain/bundle-types.js";
 import { detectBundleConflicts, type BundleConflict } from "../domain/bundle-conflict-detector.js";
+import { bundleInstallContext, bundleInstallContextLines } from "../domain/bundle-install-context.js";
 import type { RigRepository } from "../domain/rig-repository.js";
 import { BundleAuditReader, BundleAuditWriter, type BundleAuditFsOps, type BundleAuditRecord } from "../domain/bundle-audit.js";
+import { timeBoundAdvisory } from "../domain/time-bound-advisory.js";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import { routingFailureWarnings, type BundleContentRouting } from "../domain/bundle-content-routing.js";
 import { configurationId, packageDigest } from "../domain/bundle-identity.js";
@@ -1106,7 +1110,9 @@ bundleRoutes.get("/history", async (c) => {
     rig: typeof rig === "string" && rig.length > 0 ? rig : undefined,
     since: typeof since === "string" && since.length > 0 ? since : undefined,
   });
-  return c.json({ records, total: records.length }, 200);
+  // since is compared as text against installedAt; say so when it doesn't read as a date or time.
+  const advisory = timeBoundAdvisory("since", since, "installedAt");
+  return c.json({ records, total: records.length, ...(advisory ? { advisories: [advisory] } : {}) }, 200);
 });
 
 // POST /api/bundles/install — reuses full bootstrap lifecycle
@@ -1116,8 +1122,10 @@ bundleRoutes.post("/install", async (c) => {
   const bundlePath = typeof body["bundlePath"] === "string" ? body["bundlePath"] : "";
   const plan = body["plan"] === true;
   const autoApprove = body["autoApprove"] === true;
+  const nonInterruptive = typeof body["nonInterruptive"] === "boolean" ? body["nonInterruptive"] : undefined;
   const targetRoot = typeof body["targetRoot"] === "string" ? body["targetRoot"] : undefined;
   const cwdOverride = typeof body["cwdOverride"] === "string" ? body["cwdOverride"] : undefined;
+  const envOverride = readSeatEnvOverride(body["envOverride"]);
   // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check inputs
   const skipVersionCheck = body["skipVersionCheck"] === true;
   const clientCliVersion = typeof body["cliVersion"] === "string" ? body["cliVersion"] : undefined;
@@ -1134,29 +1142,25 @@ bundleRoutes.post("/install", async (c) => {
   }
 
   try {
-  // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check
-  // Runs AFTER the lock + BEFORE bootstrap delegation. Mismatch returns a
-  // 3-part error and exits the lifecycle (lock releases via the outer
-  // finally). Operator override via --skip-version-check (request body
-  // skipVersionCheck=true).
   // Item 2 + Item 3 / slice-05: single safe extract pass yields both the
   // bundle manifest (for compat check) and the rig name (for conflict check).
-  // Caller can skip the compat check via skipVersionCheck; the conflict check
-  // also runs from this same extract pass unless --force bypasses it.
-  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined } | null = null;
-  if (!skipVersionCheck || !force) {
-    try {
-      installMeta = await extractInstallTimeMetadata(bundlePath);
-    } catch (err) {
-      return c.json({
-        error: "Bundle install pre-check could not run (extraction failed)",
-        detail: (err as Error).message,
-        resolutions: [
-          "confirm the bundle path is correct and the archive is readable",
-          "pass --skip-version-check and --force to bypass both pre-checks (NOT recommended unless intentional)",
-        ],
-      }, 400);
-    }
+  // This pass also runs the manifest SAFETY validation — the first place
+  // rig_spec/project fields are validated on the install path; the bundle
+  // source resolver validates them again later — so it runs unconditionally:
+  // --skip-version-check and --force override the Item-2 compat check and
+  // the Item-3 conflict check, not the safety validation.
+  let installMeta: { bundleManifest: Record<string, unknown>; rigName: string | undefined };
+  try {
+    installMeta = await extractInstallTimeMetadata(bundlePath);
+  } catch (err) {
+    return c.json({
+      error: "Bundle install pre-check could not run (extraction failed)",
+      detail: (err as Error).message,
+      resolutions: [
+        "confirm the bundle path is correct and the archive is readable",
+        "--skip-version-check and --force skip the compatibility and conflict checks; the manifest safety check always runs",
+      ],
+    }, 400);
   }
 
   if (!skipVersionCheck && installMeta) {
@@ -1182,7 +1186,12 @@ bundleRoutes.post("/install", async (c) => {
   // The check fails CLOSED on extraction failure (handled above) and
   // fail-OPEN on missing rig name in the bundle (no rig name to compare).
   if (!force && installMeta && rigRepo) {
-    const runningRigs = rigRepo.listRigs().map((r) => ({ rigId: r.id, name: r.name }));
+    const context = bundleInstallContext(rigRepo.db, installMeta.rigName ?? "", {
+      name: String(installMeta.bundleManifest.name ?? installMeta.rigName ?? ""),
+      version: typeof installMeta.bundleManifest.version === "string" ? installMeta.bundleManifest.version : null,
+      source: bundlePath,
+    });
+    const runningRigs = context.existing.filter(rig => rig.state === "running");
     const report = detectBundleConflicts({
       bundleRigName: installMeta.rigName ?? "",
       runningRigs,
@@ -1190,11 +1199,11 @@ bundleRoutes.post("/install", async (c) => {
     if (report.hasConflicts) {
       return c.json({
         error: "Bundle install conflict check failed",
+        status: "not_attempted",
+        detail: bundleInstallContextLines(context).slice(0, context.existing.length + 1).join("\n"),
+        bundleInstall: context,
         conflicts: report.conflicts,
-        resolutions: [
-          "stop the conflicting running rig and re-attempt install",
-          "use --force to bypass for an operator-explicit override (NOT recommended for routine use; conflicts may produce partial install state)",
-        ],
+        resolutions: context.resolutions,
       }, 400);
     }
   }
@@ -1211,16 +1220,8 @@ bundleRoutes.post("/install", async (c) => {
       }
       // Plan failed — structured mapping (same as bootstrap plan route)
       eventBus.emit({ type: "bootstrap.failed", runId: result.runId, sourceRef: bundlePath, error: result.errors[0] ?? "plan failed" });
-      const failedStage = result.stages.find((s: { status: string; detail?: unknown }) => s.status === "failed" || s.status === "blocked");
-      let httpStatus: number = 500;
-      if (failedStage) {
-        if (failedStage.status === "blocked") httpStatus = 409;
-        else if (failedStage.stage === "resolve_spec") {
-          const detail = failedStage.detail as { code?: string } | undefined;
-          if (detail?.code === "file_not_found" || detail?.code === "parse_error" || detail?.code === "validation_failed" || detail?.code === "bundle_error") httpStatus = 400;
-        }
-      }
-      return c.json(result, httpStatus as 400 | 409 | 500);
+      const failure = bootstrapFailureResponse(result, "plan");
+      return c.json(failure.body, failure.status);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 500);
     }
@@ -1234,7 +1235,7 @@ bundleRoutes.post("/install", async (c) => {
   try {
     const result = await bootstrapOrchestrator.bootstrap({
       mode: "apply", sourceRef: bundlePath, sourceKind: "rig_bundle",
-      autoApprove, targetRoot, cwdOverride, runId: run.id,
+      autoApprove, nonInterruptive, targetRoot, cwdOverride, envOverride, runId: run.id,
     });
 
     if (result.status === "completed" || result.status === "partial") {
@@ -1273,8 +1274,8 @@ bundleRoutes.post("/install", async (c) => {
       bundleManifest: installMeta?.bundleManifest,
       routingFailures: result.bundleRouting?.routingFailures,
     });
-    const hasBlocked = result.stages.some((s: { status: string }) => s.status === "blocked");
-    return c.json(result, hasBlocked ? 409 : 500);
+    const failure = bootstrapFailureResponse(result, "apply");
+    return c.json(failure.body, failure.status);
   } catch (err) {
     bootstrapRepo.updateRunStatus(run.id, "failed");
     eventBus.emit({ type: "bootstrap.failed", runId: run.id, sourceRef: bundlePath, error: (err as Error).message });
