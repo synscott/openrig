@@ -1,0 +1,1047 @@
+--- /dev/null
++++ b/src/checked_stop.rs
+@@ -0,0 +1,203 @@
++//! Checked, own-session logical teardown. No registry identity or name fallback.
++//! OpenRig qualification candidate against psmux 20aa1d7, upstream MIT retained.
++use std::io::{self, Read, Write};
++use std::time::Duration;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Identity { pub sid: usize, pub pid: u32, pub birth: u64 }
++
++impl Identity {
++    pub fn parse(sid: &str, pid: &str, birth: &str) -> Option<Self> {
++        fn decimal(s: &str) -> bool { !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) }
++        if !decimal(sid) || !decimal(pid) || !decimal(birth) { return None; }
++        let value = Self { sid: sid.parse().ok()?, pid: pid.parse().ok()?, birth: birth.parse().ok()? };
++        (value.pid != 0 && value.birth != 0).then_some(value)
++    }
++    pub fn own(sid: usize) -> Option<Self> {
++        let pid = std::process::id();
++        let birth = crate::platform::process_kill::process_creation_time(pid)?;
++        (birth != 0).then_some(Self { sid, pid, birth })
++    }
++}
++
++/// Parse the original outer CLI tail, before routing strips/replaces -t.
++pub(crate) fn parse_cli(tail: &[&str]) -> Option<Identity> {
++    if tail.len() != 4 { return None; }
++    let mut sid = None; let mut guard = None;
++    for pair in tail.chunks_exact(2) {
++        match pair[0] {
++            "-t" if sid.is_none() => sid = pair[1].strip_prefix('$'),
++            "-G" if guard.is_none() => guard = Some(pair[1]),
++            _ => return None,
++        }
++    }
++    let (pid, birth) = guard?.split_once(':')?;
++    Identity::parse(sid?, pid, birth)
++}
++
++pub(crate) const PANE_FORMAT: &str = "#{session_name}|#{session_id}|#{server_pid}|#{server_birth}|#{pane_id}|#{pane_index}|#{pane_current_path}|#{pane_width}|#{pane_height}|#{pane_active}";
++
++pub(crate) fn read_observation(reader: &mut impl Read) -> io::Result<String> {
++    let mut bytes = Vec::new();
++    reader.take(crate::session::MAX_AUTHED_RESPONSE_BYTES + 1).read_to_end(&mut bytes)?;
++    if bytes.len() >= crate::session::MAX_AUTHED_RESPONSE_BYTES as usize {
++        return Err(io::Error::new(io::ErrorKind::InvalidData, "checked observation exceeds bound"));
++    }
++    let bytes = bytes.strip_prefix(b"OK\n")
++        .filter(|body| body.ends_with(b"\n") && !body.starts_with(b"ERROR:"))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "checked observation unknown"))?;
++    String::from_utf8(bytes.to_vec()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checked observation"))
++}
++
++pub(crate) fn observe(route: &str, pane: Option<&str>) -> io::Result<String> {
++    let port = std::fs::read_to_string(crate::paths::port_file(route))?.trim().parse::<u16>()
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checked observation route"))?;
++    let key = crate::session::read_session_key(route)?;
++    let mut stream = crate::session::open_authed_checked(&format!("127.0.0.1:{}", port), &key,
++        b"list-panes-checked\n", Duration::from_secs(1), Duration::from_secs(3))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "checked observation transport unknown"))?;
++    let observation = read_observation(&mut stream)?;
++    // A scoped local pane remains an existence requirement, never a global
++    // selector. Return all own panes so the sole-pane guard stays conservative.
++    if let Some(pane) = pane {
++        if !observation.lines().any(|line| line.split('|').nth(4) == Some(pane)) {
++            return Err(io::Error::new(io::ErrorKind::NotFound, "checked observation pane unavailable"));
++        }
++    }
++    Ok(observation)
++}
++
++pub(crate) const COMPLETE: &[u8] = b"CHECKED-STOP COMPLETE\n";
++pub(crate) const REJECTED: &[u8] = b"CHECKED-STOP REJECTED\n";
++
++// Runs in the main actor. Teardown is called directly here, never enqueued.
++// The injected effect is the existing own teardown in production; tests observe
++// zero effects on every rejection and completion only AFTER that effect returns.
++pub(crate) fn perform<W: Write>(expected: Identity, actual: Option<Identity>, writer: &mut W,
++    teardown: impl FnOnce()) -> io::Result<bool>
++{
++    if actual != Some(expected) {
++        writer.write_all(REJECTED)?;
++        writer.flush()?;
++        return Ok(false);
++    }
++    teardown();
++    writer.write_all(COMPLETE)?;
++    writer.flush()?;
++    Ok(true)
++}
++
++pub(crate) fn read_result(reader: &mut impl Read) -> io::Result<()> {
++    let mut bytes = Vec::new();
++    // Require AUTH + exact result + EOF. Propagate ALL read errors, including
++    // reset after partial data; an enqueue ACK/auth ACK can never be success.
++    reader.take(65).read_to_end(&mut bytes)?;
++    if bytes == [b"OK\n".as_slice(), COMPLETE].concat() { return Ok(()); }
++    if bytes == [b"OK\n".as_slice(), REJECTED].concat() {
++        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "checked stop identity rejected"));
++    }
++    Err(io::Error::new(io::ErrorKind::InvalidData, "checked stop completion unknown"))
++}
++
++pub(crate) fn send(route: &str, expected: Identity) -> io::Result<()> {
++    // Route is a hint resolved ONCE. No warm/default resolution, retry, probe,
++    // stale registry removal, TARGET forwarding, or second connection.
++    let port = std::fs::read_to_string(crate::paths::port_file(route))?.trim().parse::<u16>()
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid checked stop route"))?;
++    let key = crate::session::read_session_key(route)?;
++    let command = format!("kill-session-checked {} {} {}\n", expected.sid, expected.pid, expected.birth);
++    let mut stream = crate::session::open_authed_checked(&format!("127.0.0.1:{}", port),
++        &key, command.as_bytes(), Duration::from_secs(1), Duration::from_secs(3))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "checked stop transport unknown"))?;
++    read_result(&mut stream)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::cell::Cell;
++    fn original() -> Identity { Identity { sid: 7, pid: 10, birth: 11 } }
++    #[test]
++    fn observation_requires_complete_authenticated_payload() {
++        for bytes in [b"".as_slice(), b"OK\n", b"OK\npartial", b"OK\nERROR: refused\n"] {
++            assert!(read_observation(&mut &bytes[..]).is_err());
++        }
++        assert_eq!(read_observation(&mut &b"OK\nown|$7|10|11|%1|0|/inert|80|24|1\n"[..]).unwrap(),
++            "own|$7|10|11|%1|0|/inert|80|24|1\n");
++    }
++    #[test]
++    fn own_birth_format_uses_the_answering_app_not_registry_identity() {
++        let mut app = crate::types::AppState::new("inert".into()); app.session_id = 7;
++        let expected = Identity::own(7).map(|i| i.birth.to_string()).unwrap_or_default();
++        assert_eq!(crate::format::expand_format("#{session_id}|#{server_pid}|#{server_birth}", &app),
++            format!("$7|{}|{}", std::process::id(), expected));
++    }
++    #[test]
++    fn cli_preserves_expected_sid_and_rejects_name_or_combined_modes() {
++        assert_eq!(parse_cli(&["-t", "$7", "-G", "10:11"]), Some(original()));
++        assert_eq!(parse_cli(&["-G", "10:11", "-t", "$7"]), Some(original()));
++        for tail in [vec!["-t", "replacement", "-G", "10:11"],
++            vec!["-t", "$7", "-G10:11"], vec!["-t", "$7", "-G", "10:11", "-a"],
++            vec!["-G", "10:11", "-G", "10:11"]] { assert!(parse_cli(&tail).is_none()); }
++    }
++    #[test]
++    fn rejected_incarnations_have_zero_effects() {
++        for actual in [None, Some(Identity { sid: 8, ..original() }),
++            Some(Identity { pid: 12, ..original() }), Some(Identity { birth: 12, ..original() })] {
++            let effects = Cell::new(0); let mut out = Vec::new();
++            assert!(!perform(original(), actual, &mut out, || effects.set(1)).unwrap());
++            assert_eq!(effects.get(), 0); assert_eq!(out, REJECTED);
++        }
++    }
++    #[test]
++    fn completion_is_written_and_flushed_after_effect() {
++        struct Writer<'a>(&'a Cell<u8>, Vec<u8>);
++        impl Write for Writer<'_> {
++            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++                assert_eq!(self.0.get(), 1); self.1.extend(bytes); Ok(bytes.len())
++            }
++            fn flush(&mut self) -> io::Result<()> { assert_eq!(self.1, COMPLETE); self.0.set(2); Ok(()) }
++        }
++        let phase = Cell::new(0); let mut out = Writer(&phase, Vec::new());
++        assert!(perform(original(), Some(original()), &mut out, || phase.set(1)).unwrap());
++        assert_eq!(phase.get(), 2);
++    }
++    #[test]
++    fn fixed_numeric_identity_refuses_zero_birth_and_invalid_types() {
++        for (sid, pid, birth) in [("7", "0", "11"), ("7", "10", "0"),
++            ("$7", "10", "11"), ("7", "+10", "11"), ("7", "10", ""), ("7", "10", "18446744073709551616")] {
++            assert!(Identity::parse(sid, pid, birth).is_none());
++        }
++        assert_eq!(Identity::parse("7", "10", "11"), Some(original()));
++    }
++    #[test]
++    fn only_exact_complete_reply_is_success() {
++        for bytes in [b"".as_slice(), b"OK\n", COMPLETE, b"OK\nCHECKED-STOP COMPLE", b"OK\nCHECKED-STOP COMPLETE\nextra", b"OK\nCHECKED-STOP REJECTED\n"] {
++            assert!(read_result(&mut &bytes[..]).is_err());
++        }
++        assert!(read_result(&mut &b"OK\nCHECKED-STOP COMPLETE\n"[..]).is_ok());
++    }
++    #[test]
++    fn read_failure_after_complete_bytes_is_unknown() {
++        struct Broken(bool, io::ErrorKind);
++        impl Read for Broken {
++            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
++                if self.0 { return Err(self.1.into()); }
++                self.0 = true; let bytes = b"OK\nCHECKED-STOP COMPLETE\n";
++                out[..bytes.len()].copy_from_slice(bytes); Ok(bytes.len())
++            }
++        }
++        for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
++            assert!(read_result(&mut Broken(false, kind)).is_err());
++        }
++    }
++    #[test]
++    fn failed_flush_never_reports_completed() {
++        struct Broken;
++        impl Write for Broken {
++            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
++            fn flush(&mut self) -> io::Result<()> { Err(io::ErrorKind::BrokenPipe.into()) }
++        }
++        assert!(perform(original(), Some(original()), &mut Broken, || {}).is_err());
++    }
++}
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -56,7 +56,7 @@
+     ("join-pane",             "joinp",      "bdfhvp:l:s:t:"),
+     ("kill-pane",             "killp",      "af:t:"),
+     ("kill-server",           "",           ""),
+-    ("kill-session",          "",           "aCgf:t:"),
++    ("kill-session",          "",           "aCgf:t:G:"),
+     ("kill-window",           "killw",      "af:t:"),
+     ("last-pane",             "lastp",      "det:Z"),
+     ("last-window",           "last",       "t:"),
+@@ -65,7 +65,7 @@
+     ("list-clients",          "lsc",        "F:f:O:rt:"),
+     ("list-commands",         "lscm",       "F:"),
+     ("list-keys",             "lsk",        "1aF:NO:P:rT:"),
+-    ("list-panes",            "lsp",        "aF:f:O:rst:"),
++    ("list-panes",            "lsp",        "aGF:f:O:rst:"),
+     ("list-sessions",         "ls",         "F:f:O:r"),
+     ("list-windows",          "lsw",        "aF:f:O:rt:"),
+     ("load-buffer",           "loadb",      "b:t:w"),
+--- a/src/format.rs
++++ b/src/format.rs
+@@ -1606,6 +1606,8 @@
+                     .map(|d| d.to_string_lossy().into_owned())
+                     .unwrap_or_default(),
+                 "pid" | "server_pid" => std::process::id().to_string(),
++        "server_birth" => crate::checked_stop::Identity::own(app.session_id)
++            .map(|identity| identity.birth.to_string()).unwrap_or_default(),
+                 "server_instance" => {
+                     crate::session::read_namespace_instance(app.socket_name.as_deref())
+                         .unwrap_or_default()
+@@ -2416,6 +2418,8 @@
+         // per session, so this is the pid of whichever session's server answered
+         // the request. Use `#{server_instance}` to identify the namespace.
+         "pid" | "server_pid" => std::process::id().to_string(),
++        "server_birth" => crate::checked_stop::Identity::own(app.session_id)
++            .map(|identity| identity.birth.to_string()).unwrap_or_default(),
+         // Namespace-scoped identity (issue #509): constant for the life of this
+         // `-L` namespace's server set, and different after a genuine restart.
+         // Every server in the namespace reads the same token, so the value does
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,6 +3,7 @@
+ #![allow(dead_code)]
+ 
+ mod types;
++mod checked_stop;
+ mod platform;
+ mod cli;
+ mod session;
+@@ -865,7 +866,6 @@
+ }
+ 
+ fn main() {
+-    crate::startup_trace::mark("cli.entry");
+     if let Err(e) = run_main() {
+         // Print a user-friendly error message instead of Rust's Debug format
+         // which shows "Error: Custom { kind: Other, error: \"...\" }"  (fixes #47)
+@@ -941,6 +941,18 @@
+         let args = strings(&["psmux", "bind-key", "x", "kill-window", "-t", "child"]);
+         let command = process_command_index(&args).unwrap();
+         assert_eq!(process_target_position(&args, command), None);
++    }
++
++    #[test]
++    fn conditional_branch_target_does_not_replace_top_level_route() {
++        let args = strings(&["psmux", "-L", "ns", "-t", "=same", "if-shell", "-F",
++            "#{==:#{session_id},$7}", "kill-session", "display-message -p kept"]);
++        let command = process_command_index(&args).unwrap();
++        assert_eq!(command, 5);
++        assert_eq!(process_target_position(&args, command), Some(3));
++        let nested = strings(&["psmux", "if-shell", "-F", "1", "kill-session -t other"]);
++        let command = process_command_index(&nested).unwrap();
++        assert_eq!(process_target_position(&nested, command), None);
+     }
+ 
+     #[test]
+@@ -1122,6 +1134,93 @@
+     std::process::exit(1);
+ }
+ 
++#[derive(Debug, PartialEq, Eq)]
++enum CheckedEntry {
++    Stop { expected: crate::checked_stop::Identity, namespace: Option<String> },
++    Observe { route: String, pane: Option<String> },
++}
++
++fn checked_entry(args: &[String]) -> io::Result<Option<CheckedEntry>> {
++    let Some(index) = process_command_index(args) else { return Ok(None) };
++    // Inspect ORIGINAL argv separators even for legacy commands that normally
++    // retain their whole line (start-server, bind-key, etc.). A checked member
++    // may never lose its list context by spawning as a child invocation.
++    let separator = |arg: &String| arg == ";" || arg == "\\;";
++    let chained = args[index..].iter().any(separator);
++    let commands: Vec<Vec<String>> = args[index..].split(separator)
++        .filter(|group| !group.is_empty()).map(|group| group.to_vec()).collect();
++    let has_check = |command: &[String]| matches!(command.first().map(String::as_str),
++        Some("kill-session" | "kill-ses" | "list-panes" | "lsp"))
++        && command.iter().skip(1).any(|a| a.starts_with('-') && a[1..].contains('G'));
++    if !commands.iter().any(|command| has_check(command)) { return Ok(None); }
++    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "checked invocation must be one explicit supported command");
++    if chained || commands.len() != 1 { return Err(invalid()); }
++    let mut namespace = None; let mut outer_target = None; let mut i = 1;
++    while i < index {
++        if i + 1 >= index { return Err(invalid()); }
++        match args[i].as_str() {
++            "-L" if namespace.is_none() => namespace = Some(args[i + 1].clone()),
++            "-t" if outer_target.is_none() => outer_target = Some(args[i + 1].clone()),
++            _ => return Err(invalid()),
++        }
++        i += 2;
++    }
++    let command = &commands[0];
++    let tail: Vec<&str> = command.iter().skip(1).map(String::as_str).collect();
++    if matches!(command[0].as_str(), "kill-session" | "kill-ses") {
++        if outer_target.is_some() { return Err(invalid()); }
++        let expected = crate::checked_stop::parse_cli(&tail).ok_or_else(invalid)?;
++        return Ok(Some(CheckedEntry::Stop { expected, namespace }));
++    }
++    // -G observation is fixed-format, one named server, no filters/shell/
++    // all-session enumeration or arbitrary global/config/socket options.
++    let mut guarded = false; let mut target = None; let mut i = 0;
++    while i < tail.len() {
++        match tail[i] {
++            "-G" if !guarded => guarded = true,
++            "-t" if target.is_none() && i + 1 < tail.len() => { i += 1; target = Some(tail[i]); },
++            _ => return Err(invalid()),
++        }
++        i += 1;
++    }
++    if !guarded { return Err(invalid()); }
++    let target = target.ok_or_else(invalid)?;
++    let named = if let Some(outer) = outer_target.as_deref() {
++        let local = target.strip_prefix('%').ok_or_else(invalid)?;
++        if local.is_empty() || !local.bytes().all(|b| b.is_ascii_digit()) { return Err(invalid()); }
++        outer
++    } else { target };
++    let name = named.strip_prefix('=').ok_or_else(invalid)?;
++    let name = name.strip_suffix(':').unwrap_or(name);
++    if name.is_empty() || name.chars().any(|c| matches!(c, ':' | '\n' | '\r' | '\0')) { return Err(invalid()); }
++    Ok(Some(CheckedEntry::Observe {
++        route: crate::session::namespaced_session_base(namespace.as_deref(), name),
++        pane: outer_target.as_ref().map(|_| target.to_string()),
++    }))
++}
++
++// Both real CLI entry and source regression tests pass through this decision.
++// The legacy continuation owns ALL old child-list/maintenance/routing effects.
++fn dispatch_cli_entry(args: &[String], checked: impl FnOnce(CheckedEntry) -> io::Result<()>,
++    legacy: impl FnOnce() -> io::Result<()>) -> io::Result<()>
++{
++    match checked_entry(args)? { Some(plan) => checked(plan), None => legacy() }
++}
++
++fn execute_checked_entry(plan: CheckedEntry) -> io::Result<()> {
++    match plan {
++        CheckedEntry::Stop { expected, namespace } => {
++            let resolved = crate::session::resolve_session_by_id(expected.sid)
++                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "checked stop route unavailable"))?;
++            let route = crate::session::namespaced_session_base(namespace.as_deref(), &resolved);
++            crate::checked_stop::send(&route, expected)?;
++            println!("CHECKED-STOP COMPLETE");
++        }
++        CheckedEntry::Observe { route, pane } => print!("{}", crate::checked_stop::observe(&route, pane.as_deref())?),
++    }
++    Ok(())
++}
++
+ fn run_main() -> io::Result<()> {
+     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
+     // command-level `-tname` (attached target): running attached passes
+@@ -1131,6 +1230,14 @@
+             crate::cli::normalize_flag_equals(env::args().collect()),
+         ),
+     );
++    // Checked calls are classified/validated before the legacy list launcher,
++    // console setup, routing fallback, registry cleanup or process reaper.
++    dispatch_cli_entry(&args, execute_checked_entry, || run_legacy_main(args.clone()))
++}
++
++fn run_legacy_main(args: Vec<String>) -> io::Result<()> {
++    // Checked read-only/stop invocations do not open env-gated trace files.
++    crate::startup_trace::mark("cli.entry");
+     // `psmux a \; b`: from here on `args` is the first command alone, which
+     // decides routing and the client side target check; the whole list goes
+     // to the server as one line just before dispatch (run_command_list).
+@@ -6751,3 +6858,61 @@
+ #[cfg(test)]
+ #[path = "../tests-rs/test_ready_poll_backoff.rs"]
+ mod tests_ready_poll_backoff;
++
++#[cfg(test)]
++#[path = "../tests-rs/test_checked_stop_handler.rs"]
++mod tests_checked_stop_handler;
++
++#[cfg(test)]
++mod checked_cli_entry_tests {
++    use super::*;
++    use std::cell::Cell;
++    fn args(values: &[&str]) -> Vec<String> { values.iter().map(|value| value.to_string()).collect() }
++    fn dispatch(values: &[&str]) -> (bool, usize, usize) {
++        let checked = Cell::new(0); let maintenance_or_children = Cell::new(0);
++        let result = dispatch_cli_entry(&args(values), |_| { checked.set(checked.get() + 1); Ok(()) },
++            || { maintenance_or_children.set(maintenance_or_children.get() + 1); Ok(()) });
++        (result.is_ok(), checked.get(), maintenance_or_children.get())
++    }
++    #[test]
++    fn actual_entry_checked_stop_and_observation_bypass_all_legacy_maintenance() {
++        assert_eq!(dispatch(&["psmux", "kill-session", "-t", "$7", "-G", "10:11"]), (true, 1, 0));
++        assert_eq!(dispatch(&["psmux", "list-panes", "-G", "-t", "=own:"]), (true, 1, 0));
++    }
++    #[test]
++    fn actual_entry_invalid_checked_stop_has_zero_dispatch_or_maintenance() {
++        for tail in [vec!["-t", "$7", "-G", "10:0"], vec!["-t", "name", "-G", "10:11"],
++            vec!["-t", "$7", "-aG", "10:11"], vec!["-t", "$7", "-G"]] {
++            let mut input = vec!["psmux", "kill-session"]; input.extend(tail);
++            assert_eq!(dispatch(&input), (false, 0, 0));
++        }
++    }
++    #[test]
++    fn actual_entry_rejects_checked_member_before_any_legacy_list_child() {
++        for first in [vec!["kill-session", "-t", "=sibling"], vec!["start-server"], vec!["list-sessions"]] {
++            let checked = ["kill-session", "-t", "$7", "-G", "10:11"];
++            for reversed in [false, true] {
++                let mut input = vec!["psmux"];
++                if reversed { input.extend(checked); input.push(";"); input.extend(first.iter().copied()); }
++                else { input.extend(first.iter().copied()); input.push("\\;"); input.extend(checked); }
++                assert_eq!(dispatch(&input), (false, 0, 0));
++            }
++        }
++    }
++    #[test]
++    fn actual_entry_preserves_ordinary_legacy_continuation() {
++        assert_eq!(dispatch(&["psmux", "list-panes", "-t", "=own:"]), (true, 0, 1));
++        assert_eq!(dispatch(&["psmux", "list-sessions", ";", "display-message", "-p", "kept"]), (true, 0, 1));
++    }
++    #[test]
++    fn observation_is_scoped_fixed_format_and_rejects_global_mutation_options() {
++        assert_eq!(checked_entry(&args(&["psmux", "-L", "ns", "-t", "=own", "list-panes", "-G", "-t", "%1"])).unwrap(),
++            Some(CheckedEntry::Observe { route: "ns__own".into(), pane: Some("%1".into()) }));
++        for input in [vec!["psmux", "list-panes", "-G", "-a"],
++            vec!["psmux", "-S", "path", "list-panes", "-G", "-t", "=own:"],
++            vec!["psmux", "-f", "config", "list-panes", "-G", "-t", "=own:"],
++            vec!["psmux", "list-panes", "-G", "-t", "=own:", "-F", "#(shell)"]] {
++            assert_eq!(dispatch(&input), (false, 0, 0));
++        }
++    }
++}
+--- a/src/server/connection.rs
++++ b/src/server/connection.rs
+@@ -1994,6 +1994,49 @@
+     }
+     let parsed = crate::cli::normalize_flag_equals(parse_command_line(&effective_line));
+     let raw_cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
++// Fixed read-only epoch observation: bypass aliases, target focus, forwarding
++// and arbitrary format execution. List ALL panes of this one answering actor;
++// callers requiring a sole managed pane refuse additional panes/windows.
++if raw_cmd == "list-panes-checked" {
++    if !persistent && !in_command_list && parsed.len() == 1 {
++        if write_stream.set_write_timeout(Some(Duration::from_secs(2))).is_err() { break; }
++        let (rtx, rrx) = mpsc::channel();
++        if tx.send(CtrlReq::ListAllPanesFormat(rtx, crate::checked_stop::PANE_FORMAT.to_string())).is_ok() {
++            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(3)) {
++                let _ = writeln!(write_stream, "{}", text);
++                let _ = write_stream.flush();
++            }
++        }
++    } else {
++        let _ = write_stream.write_all(b"ERROR: checked observation requires one-shot request\n");
++        let _ = write_stream.flush();
++    }
++    break;
++}
++
++// A checked stop is a single authenticated one-shot request. Transfer its
++// reply socket to the main actor and RETURN (not the ordinary EOF path, which
++// would shutdown the shared socket before the actor can write its result).
++// No TARGET processing, focus, forwarding, alias chaining or enqueue ACK.
++if raw_cmd == "kill-session-checked" {
++    let args: Vec<&str> = parsed.iter().skip(1).map(String::as_str).collect();
++    let expected = if !persistent && !in_command_list && args.len() == 3 {
++        crate::checked_stop::Identity::parse(args[0], args[1], args[2])
++    } else { None };
++    if let Some(expected) = expected {
++        if let Ok(reply) = write_stream.socket().try_clone() {
++            clear_inherit(&reply);
++            if reply.set_write_timeout(Some(Duration::from_secs(2))).is_ok() {
++                let _ = tx.send(CtrlReq::CheckedKillSession(expected, reply));
++            }
++        }
++    } else {
++        let _ = write_stream.write_all(crate::checked_stop::REJECTED);
++        let _ = write_stream.flush();
++    }
++    return;
++}
++
+     // Check command aliases before normal dispatch
+     let alias_expanded = if let Ok(map) = aliases.read() {
+         map.get(raw_cmd).cloned()
+@@ -2051,6 +2094,8 @@
+ // Save raw -t value for relative pane targets like :.+ or :.-
+ // Falls back to global_raw_target from TARGET protocol line
+ let mut raw_target: Option<String> = global_raw_target.clone();
++// Routing TARGET selects this connection; only a current-command -t may forward a kill.
++let mut command_raw_target: Option<String> = None;
+ let set_option_command = matches!(
+     cmd,
+     "set-option" | "set" | "set-window-option" | "setw"
+@@ -2081,6 +2126,7 @@
+             if let Some(v) = args.get(i+1) {
+             // Issue #558: drop the '=' exact-match marker (see TARGET capture).
+                 raw_target = Some(crate::cli::strip_exact_match_prefix(v).to_string());
++                command_raw_target = raw_target.clone();
+                 // Issue #692: a window command's bare `-t 0` is a window index
+                 // in the current session (tmux cmd-find.c:443), not a session
+                 // name, so put the colon back before the generic parse.
+@@ -2982,12 +3028,20 @@
+         }
+     }
+     "kill-session" | "kill-ses" => {
+-        // If -t <target> is given, kill that session instead of self.
++        // Checked CLI mode has a separate fixed one-shot wire command.
++        // Never ignore a check option and execute an unchecked legacy kill.
++        if args.iter().any(|arg| arg.starts_with('-') && arg[1..].contains('G')) {
++            let _ = write_stream.write_all(crate::checked_stop::REJECTED);
++            let _ = write_stream.flush();
++            return;
++        }
++        // Only a -t on THIS command selects another session. An inherited
++        // routing TARGET must not redirect a targetless conditional branch.
+         // The target may be specified without the -L socket-name namespace
+         // prefix (e.g. "worker1" instead of "ns1__worker1"), so if the raw
+         // path is missing we ask our own server for its session name and
+         // fall through to KillSession when raw_target matches us.
+-        if let Some(ref tgt) = raw_target {
++        if let Some(ref tgt) = command_raw_target {
+             let port_path = crate::paths::port_file(tgt);
+             let mut handled = false;
+             // A differently spelled registry entry is another session: never
+@@ -6423,6 +6477,10 @@
+             true
+         }
+         "kill-session" => {
++            if args.iter().any(|arg| arg.starts_with('-') && arg[1..].contains('G')) {
++                let _ = resp_tx.send("\u{0001}ERR\u{0001}checked stop requires one-shot transport".to_string());
++                return true;
++            }
+             let _ = tx.send(CtrlReq::KillSession);
+             let _ = resp_tx.send(String::new());
+             true
+@@ -7005,3 +7063,7 @@
+ #[cfg(test)]
+ #[path = "../../tests-rs/test_issue734_followup_new_session_reply.rs"]
+ mod tests_issue734_followup_new_session_reply;
++
++#[cfg(test)]
++#[path = "../../tests-rs/test_targetless_kill_session_self.rs"]
++mod tests_targetless_kill_session_self;
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1512,6 +1512,50 @@
+         Some(w) if w + 2 >= since_epoch => lines.map(|l| l.to_string()).filter(|l| !l.is_empty()).collect(),
+         _ => Vec::new(),
+     }
++}
++
++// Main-owner dispatch seam. Test injection replaces ONLY the OS birth query
++// and destructive effects; the actual AppState SID, own PID and decision/order
++// are exercised. Production enters own teardown directly in the same turn.
++fn apply_checked_session_stop<W: std::io::Write>(app: &mut AppState,
++    expected: crate::checked_stop::Identity, reply: &mut W,
++    birth: impl FnOnce(u32) -> Option<u64>, teardown: impl FnOnce(&mut AppState)) -> bool
++{
++    let pid = std::process::id();
++    let actual = birth(pid).filter(|time| *time != 0).map(|birth|
++        crate::checked_stop::Identity { sid: app.session_id, pid, birth });
++    let matches = actual == Some(expected);
++    let _ = crate::checked_stop::perform(expected, actual, reply, || teardown(app));
++    matches
++}
++
++// Existing own teardown shared by legacy and checked paths. This returns
++// after logical teardown, not after proof of all descendant process death.
++fn teardown_own_session(app: &mut AppState) {
++    // Fire session-closed hook before cleanup
++    if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(app, cmd); } }
++    // Remove port/key/sid files FIRST so clients see the session
++    // as gone immediately, then kill processes.
++    let regpath = crate::paths::port_file(&app.port_file_base());
++    let keypath = crate::paths::key_file(&app.port_file_base());
++    let _ = std::fs::remove_file(&regpath);
++    let _ = std::fs::remove_file(&keypath);
++    crate::session::remove_session_id_file(&app.port_file_base());
++    crate::types::send_directive_to_all_clients("DETACH");
++    std::thread::sleep(Duration::from_millis(50));
++    crate::types::shutdown_persistent_streams();
++    // Kill all child processes using a single process snapshot
++    tree::kill_all_children_batch(&mut app.windows);
++    // Kill warm pane's child (process::exit skips Drop)
++    app.warm_pane.kill_all();
++    // ...and the spares whose spawn is still in flight, which the pool
++    // cannot see because they have not reached AppState yet. Without this,
++    // a teardown during a surge left the shells born a few milliseconds
++    // later parented to a dead psmux, idle at a prompt forever (#686).
++    crate::warm_pane_sync::reap_inflight_spares();
++    // Preserve the historical handle-cleanup delay; this does
++    // not prove descendant death or synchronous TerminateProcess.
++    std::thread::sleep(std::time::Duration::from_millis(10));
+ }
+ 
+ /// Move the single-server-per-name guard (issue #2) onto `new_base` after this
+@@ -4907,31 +4951,17 @@
+                     }
+                 }
+                 CtrlReq::KillSession => {
+-                    // Fire session-closed hook before cleanup
+-                    if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
+-                    // Remove port/key/sid files FIRST so clients see the session
+-                    // as gone immediately, then kill processes.
+-                    let regpath = crate::paths::port_file(&app.port_file_base());
+-                    let keypath = crate::paths::key_file(&app.port_file_base());
+-                    let _ = std::fs::remove_file(&regpath);
+-                    let _ = std::fs::remove_file(&keypath);
+-                    crate::session::remove_session_id_file(&app.port_file_base());
+-                    crate::types::send_directive_to_all_clients("DETACH");
+-                    std::thread::sleep(Duration::from_millis(50));
+-                    crate::types::shutdown_persistent_streams();
+-                    // Kill all child processes using a single process snapshot
+-                    tree::kill_all_children_batch(&mut app.windows);
+-                    // Kill warm pane's child (process::exit skips Drop)
+-                    app.warm_pane.kill_all();
+-                    // ...and the spares whose spawn is still in flight, which the pool
+-                    // cannot see because they have not reached AppState yet. Without this,
+-                    // a teardown during a surge left the shells born a few milliseconds
+-                    // later parented to a dead psmux, idle at a prompt forever (#686).
+-                    crate::warm_pane_sync::reap_inflight_spares();
+-                    // TerminateProcess is synchronous on Windows — processes
+-                    // are already dead.  Minimal delay for OS handle cleanup.
+-                    std::thread::sleep(std::time::Duration::from_millis(10));
++                    teardown_own_session(&mut app);
+                     std::process::exit(0);
++                }
++                CtrlReq::CheckedKillSession(expected, mut reply) => {
++                    let matched = apply_checked_session_stop(&mut app, expected, &mut reply,
++                        crate::platform::process_kill::process_creation_time,
++                        teardown_own_session);
++                    // The actor's bounded writer has flushed before this EOF
++                    // and exit. A write/flush failure remains unknown to client.
++                    let _ = reply.shutdown(std::net::Shutdown::Write);
++                    if matched { std::process::exit(0); }
+                 }
+                 CtrlReq::HasSession(resp) => {
+                     let _ = resp.send(true);
+@@ -8875,3 +8905,32 @@
+ #[cfg(test)]
+ #[path = "../../tests-rs/test_select_pane_input_off.rs"]
+ mod tests_select_pane_input_off;
++
++#[cfg(test)]
++mod checked_stop_actor_tests {
++    use super::*;
++    #[test]
++    fn actual_owner_rejects_all_changed_or_unknown_incarnations_without_effects() {
++        let mut app = AppState::new("inert".into()); app.session_id = 7;
++        let current = crate::checked_stop::Identity { sid: 7, pid: std::process::id(), birth: 11 };
++        for (expected, birth) in [(current, None), (current, Some(0)),
++            (crate::checked_stop::Identity { sid: 8, ..current }, Some(11)),
++            (crate::checked_stop::Identity { pid: current.pid + 1, ..current }, Some(11)),
++            (crate::checked_stop::Identity { birth: 12, ..current }, Some(11))] {
++            let mut out = Vec::new();
++            assert!(!apply_checked_session_stop(&mut app, expected, &mut out, |_| birth,
++                |_| panic!("rejected actor entered teardown")));
++            assert_eq!(out, crate::checked_stop::REJECTED);
++        }
++    }
++    #[test]
++    fn actual_owner_enters_direct_effect_for_match_even_after_rename() {
++        let mut app = AppState::new("renamed".into()); app.session_id = 7;
++        let current = crate::checked_stop::Identity { sid: 7, pid: std::process::id(), birth: 11 };
++        let mut out = Vec::new();
++        assert!(apply_checked_session_stop(&mut app, current, &mut out, |_| Some(11),
++            |owner| { assert_eq!(owner.session_id, 7); owner.session_name = "effect-ran".into(); }));
++        assert_eq!(app.session_name, "effect-ran");
++        assert_eq!(out, crate::checked_stop::COMPLETE);
++    }
++}
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -2198,17 +2198,39 @@
+     connect_timeout: Duration,
+     read_timeout: Duration,
+ ) -> Option<std::io::BufReader<std::io::Take<std::net::TcpStream>>> {
++    open_authed_inner(addr, key, cmd, connect_timeout, read_timeout, false)
++}
++
++/// Same existing bounded AUTH transport with strict write/half-close semantics
++/// for a checked command. Legacy picker callers retain their previous behavior.
++pub(crate) fn open_authed_checked(addr: &str, key: &str, cmd: &[u8],
++    connect_timeout: Duration, read_timeout: Duration)
++    -> Option<std::io::BufReader<std::io::Take<std::net::TcpStream>>>
++{
++    open_authed_inner(addr, key, cmd, connect_timeout, read_timeout, true)
++}
++
++fn open_authed_inner(addr: &str, key: &str, cmd: &[u8],
++    connect_timeout: Duration, read_timeout: Duration, checked: bool)
++    -> Option<std::io::BufReader<std::io::Take<std::net::TcpStream>>>
++{
+     let key = validate_auth_key(key)?;
+     let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
+     let mut s = std::net::TcpStream::connect_timeout(&sock_addr, connect_timeout).ok()?;
+     s.set_read_timeout(Some(read_timeout)).ok()?;
++    if checked { s.set_write_timeout(Some(read_timeout)).ok()?; }
+     let _ = s.set_nodelay(true);
+     write!(s, "AUTH {}\n", key).ok()?;
+     s.write_all(cmd).ok()?;
+     if !cmd.ends_with(b"\n") {
+         s.write_all(b"\n").ok()?;
+     }
+-    let _ = s.flush();
++    if checked {
++        s.flush().ok()?;
++        s.shutdown(std::net::Shutdown::Write).ok()?;
++    } else {
++        let _ = s.flush();
++    }
+     Some(std::io::BufReader::new(std::io::Read::take(s, MAX_AUTHED_RESPONSE_BYTES)))
+ }
+ 
+--- a/src/startup_trace.rs
++++ b/src/startup_trace.rs
+@@ -17,13 +17,13 @@
+ //!
+ //! THREE PROCESSES WRITE, AND THEIR FILES MUST NOT BE MERGED BY LABEL: the
+ //! foreground CLI, the session server, and the warm standby server the session
+-//! server spawns just before its loop. All three run `main`, so all three write
+-//! `cli.entry`, and merging by label produces a timeline that runs backwards.
++//! server spawns just before its loop. Their legacy startup writes `cli.entry`;
++//! checked one-shot calls bypass tracing. Merging by label runs time backwards.
+ //! The client is the pid the launcher started; the session server is the one
+ //! that writes `srv.child.spawned`; anything else is the standby.
+ //!
+ //! Labels, in path order (`cli.` is the foreground CLI, `srv.` the server):
+-//!   `cli.entry`        first line of `main`
++//!   `cli.entry`        legacy startup entry, after pure argv classification
+ //!   `cli.dispatch`     argv parsed, about to act on the subcommand
+ //!   `cli.warm.claimed` a warm standby server was claimed (fast path)
+ //!   `cli.server.spawn` `spawn_server_hidden` returned (cold path)
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -3303,6 +3303,9 @@
+         resp: mpsc::Sender<Result<(), String>>,
+     },
+     KillSession,
++    /// One-shot checked stop: the main owner owns this reply socket, so it
++    /// flushes the actual result before exiting, without an enqueue ACK.
++    CheckedKillSession(crate::checked_stop::Identity, std::net::TcpStream),
+     HasSession(mpsc::Sender<bool>),
+     RenameSession(String),
+     /// Claim a warm server: rename session + send response so CLI knows it's done.
+--- a/src/util.rs
++++ b/src/util.rs
+@@ -53,6 +53,19 @@
+     fn take_writer(&self) -> Result<Box<dyn io::Write + Send>, anyhow::Error> {
+         Ok(Box::new(io::sink()))
+     }
++    #[cfg(unix)]
++    // Pinned libc 0.2.190 uses i32 for pid_t on this Linux qualification target.
++    fn process_group_leader(&self) -> Option<i32> {
++        None
++    }
++    #[cfg(unix)]
++    fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
++        None
++    }
++    #[cfg(unix)]
++    fn tty_name(&self) -> Option<std::path::PathBuf> {
++        None
++    }
+ }
+ 
+ /// The master and the writer for a pane fixture, without a pseudo console.
+@@ -115,6 +128,7 @@
+     fn process_id(&self) -> Option<u32> {
+         None
+     }
++    #[cfg(windows)]
+     fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+         None
+     }
+--- /dev/null
++++ b/tests-rs/test_checked_stop_handler.rs
+@@ -0,0 +1,71 @@
++// Real authenticated one-shot connection handler. No server/provider process,
++// registry files or lifecycle effects; the actor request and socket are observed.
++use super::*;
++use std::io::{Read, Write};
++use std::net::{Shutdown, TcpListener, TcpStream};
++use std::sync::{mpsc, Arc, RwLock};
++use crate::types::CtrlReq;
++
++fn exchange(line: &str, accept: bool, alias: bool) -> (usize, String) {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
++    let (server, _) = listener.accept().unwrap();
++    let (tx, rx) = mpsc::channel();
++    let mut aliases = std::collections::HashMap::new();
++    if alias {
++        aliases.insert("kill-session-checked".into(), "kill-session".into());
++        aliases.insert("list-panes-checked".into(), "kill-session".into());
++    }
++    let handler = std::thread::spawn(move || crate::server::connection::handle_connection(
++        server, tx, "public-synthetic-key", Arc::new(RwLock::new(aliases))));
++    write!(client, "AUTH public-synthetic-key\nTARGET =sibling\n{}\n", line).unwrap();
++    client.flush().unwrap(); client.shutdown(Shutdown::Write).unwrap();
++    let mut requests = 0;
++    while let Ok(req) = rx.recv_timeout(Duration::from_millis(200)) {
++        match req {
++            CtrlReq::CheckedKillSession(expected, mut reply) => {
++                requests += 1;
++                assert_eq!(expected, crate::checked_stop::Identity { sid: 7, pid: 10, birth: 11 });
++                // Exercise the exact actor result writer/order, with synthetic
++                // identity/effect. Separate AppState tests cover actor dispatch.
++                let actual = accept.then_some(expected);
++                crate::checked_stop::perform(expected, actual, &mut reply, || {}).unwrap();
++                reply.shutdown(Shutdown::Write).unwrap();
++            }
++            CtrlReq::ListAllPanesFormat(reply, fmt) => {
++                requests += 1; assert_eq!(fmt, crate::checked_stop::PANE_FORMAT);
++                reply.send("own|$7|10|11|%1|0|/inert|80|24|1".into()).unwrap();
++            }
++            CtrlReq::ClientActivity(_) => {},
++            _ => panic!("checked command forwarded, focused or enqueued an unchecked effect"),
++        }
++    }
++    handler.join().unwrap();
++    let mut output = String::new(); client.read_to_string(&mut output).unwrap();
++    (requests, output)
++}
++#[test]
++fn checked_handler_preserves_expectation_ignores_alias_and_never_forwards_target() {
++    let (count, result) = exchange("kill-session-checked 7 10 11", true, true);
++    assert_eq!(count, 1); assert_eq!(result, "OK\nCHECKED-STOP COMPLETE\n");
++}
++#[test]
++fn checked_handler_propagates_actor_rejection_not_enqueue_ack() {
++    let (count, result) = exchange("kill-session-checked 7 10 11", false, false);
++    assert_eq!(count, 1); assert_eq!(result, "OK\nCHECKED-STOP REJECTED\n");
++}
++#[test]
++fn malformed_checked_handler_dispatches_nothing() {
++    for line in ["kill-session-checked 7 10 0", "kill-session-checked 7 10", "kill-session-checked 7 10 11 extra",
++        "kill-session-checked 7 10 11 ; kill-session"] {
++        let (count, result) = exchange(line, true, false);
++        assert_eq!(count, 0); assert_eq!(result, "OK\nCHECKED-STOP REJECTED\n");
++    }
++}
++
++#[test]
++fn checked_observation_ignores_alias_and_sibling_target_without_mutation() {
++    let (count, result) = exchange("list-panes-checked", true, true);
++    assert_eq!(count, 1); assert_eq!(result, "OK\nown|$7|10|11|%1|0|/inert|80|24|1\n");
++}
+--- /dev/null
++++ b/tests-rs/test_targetless_kill_session_self.rs
+@@ -0,0 +1,173 @@
++// OpenRig Windows qualification regression source, based on psmux3.4.0
++// 20aa1d7254ee93f64dafa059ef89341d9767470a. Not yet compiled or executed.
++// Raw-target registry-decoy handler fixture, not ordinary default-namespace discovery.
++// Delimiter labels preserve exact spelling through the pinned Unix path comparator.
++// Exercises the real one-shot handler; CtrlReq replies emulate the selected server.
++// Only synthetic loopback peers/private registry files, no psmux/provider process.
++use super::*;
++use std::net::{Shutdown, TcpListener, TcpStream};
++use std::io::{Read, Write};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, RwLock};
++
++struct Registry {
++    root: std::path::PathBuf,
++    previous: Option<std::ffi::OsString>,
++}
++impl Registry {
++    fn new() -> Self {
++        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
++        let root = std::env::temp_dir().join(format!("psmux-self-test-{}-{suffix}", std::process::id()));
++        std::fs::create_dir(&root).unwrap();
++        // The vendor's Windows path helpers use backslashes even on Linux.
++        // Nest the data root so either separator interpretation stays under
++        // our owned outer root; always publish via the actual vendor helpers.
++        let data = root.join("registry");
++        std::fs::create_dir(&data).unwrap();
++        let previous = std::env::var_os("PSMUX_DATA_DIR");
++        std::env::set_var("PSMUX_DATA_DIR", &data);
++        for name in ["ns__case__same", "case__same", "case__other", "case__missing"] {
++            assert_registry_absent(name);
++        }
++        Self { root, previous }
++    }
++    fn publish(&self, name: &str, listener: &TcpListener) {
++        publish_registry(name, listener.local_addr().unwrap().port());
++    }
++}
++impl Drop for Registry {
++    fn drop(&mut self) {
++        if let Some(value) = &self.previous { std::env::set_var("PSMUX_DATA_DIR", value); }
++        else { std::env::remove_var("PSMUX_DATA_DIR"); }
++        let _ = std::fs::remove_dir_all(&self.root);
++    }
++}
++
++fn assert_registry_absent(name: &str) {
++    assert!(!std::path::Path::new(&crate::paths::port_file(name)).exists());
++    assert!(!std::path::Path::new(&crate::paths::key_file(name)).exists());
++}
++fn publish_registry(name: &str, port: u16) {
++    let port_file = crate::paths::port_file(name);
++    let key_file = crate::paths::key_file(name);
++    let port_bytes = port.to_string();
++    std::fs::write(&port_file, &port_bytes).unwrap();
++    std::fs::write(&key_file, "synthetic-public-test-key").unwrap();
++    assert_eq!(std::fs::read_to_string(&port_file).unwrap(), port_bytes);
++    assert_eq!(std::fs::read_to_string(&key_file).unwrap(), "synthetic-public-test-key");
++    assert_eq!(crate::session::registry_case_variant(name), None);
++}
++
++// after_predicate executes while replying to the handler's actual -F query,
++// so a registry replacement really occurs between predicate and kill dispatch.
++fn exchange(command: &str, condition: Option<bool>, after_predicate: impl FnOnce() + Send + 'static)
++    -> (usize, usize, String)
++{
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    publish_registry("ns__case__same", listener.local_addr().unwrap().port());
++    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
++    let (server, _) = listener.accept().unwrap();
++    let (sender, receiver) = mpsc::channel();
++    let kills = Arc::new(AtomicUsize::new(0));
++    let name_queries = Arc::new(AtomicUsize::new(0));
++    let kill_count = kills.clone(); let query_count = name_queries.clone();
++    let replies = std::thread::spawn(move || {
++        let mut hook = Some(after_predicate);
++        while let Ok(request) = receiver.recv_timeout(Duration::from_secs(3)) {
++            match request {
++                CtrlReq::DisplayMessage(reply, format, ..) => {
++                    let value = if format.starts_with("#{==:") {
++                        if let Some(action) = hook.take() { action(); }
++                        match condition {
++                            Some(true) => "1".to_string(), Some(false) => "0".to_string(),
++                            None => continue, // dropped expansion reply is unknown, never true
++                        }
++                    } else { format };
++                    let _ = reply.send(value);
++                }
++                CtrlReq::SessionInfo(reply) => {
++                    query_count.fetch_add(1, Ordering::SeqCst);
++                    let _ = reply.send("case__same:1".to_string());
++                }
++                CtrlReq::KillSession => { kill_count.fetch_add(1, Ordering::SeqCst); }
++                _ => panic!("Unexpected request; extend fixture explicitly, never report success"),
++            }
++        }
++    });
++    let aliases = Arc::new(RwLock::new(std::collections::HashMap::new()));
++    let handler = std::thread::spawn(move || handle_connection(server, sender, "synthetic-public-test-key", aliases));
++    write!(client, "AUTH synthetic-public-test-key\nTARGET =case__same\n{command}\n").unwrap();
++    client.shutdown(Shutdown::Write).unwrap();
++    let mut output = String::new(); client.read_to_string(&mut output).unwrap();
++    handler.join().unwrap(); replies.join().unwrap();
++    (kills.load(Ordering::SeqCst), name_queries.load(Ordering::SeqCst), output)
++}
++fn forwarded(listener: &TcpListener) -> bool {
++    listener.set_nonblocking(true).unwrap();
++    match listener.accept() {
++        Ok((mut peer, _)) => {
++            peer.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
++            let mut bytes = String::new(); peer.read_to_string(&mut bytes).unwrap();
++            assert_eq!(bytes, "AUTH synthetic-public-test-key\nkill-session\n");
++            true
++        }
++        Err(error) if error.kind() == io::ErrorKind::WouldBlock => false,
++        Err(error) => panic!("Synthetic peer failed: {error}"),
++    }
++}
++
++#[test]
++fn inherited_target_cannot_forward_to_same_default_name() {
++    let _lock = crate::util::lock_test_env(); let registry = Registry::new();
++    let decoy = TcpListener::bind("127.0.0.1:0").unwrap(); registry.publish("case__same", &decoy);
++    let (kills, queries, _) = exchange("if-shell -F '#{==:#{session_id},$7}' 'kill-session' 'display-message -p kept'", Some(true), || {});
++    assert_eq!((kills, queries), (1, 0)); assert!(!forwarded(&decoy));
++}
++#[test]
++fn registry_replacement_after_predicate_cannot_redirect_kill() {
++    let _lock = crate::util::lock_test_env(); let registry = Registry::new();
++    let replacement = TcpListener::bind("127.0.0.1:0").unwrap();
++    assert_registry_absent("case__same");
++    let port = replacement.local_addr().unwrap().port();
++    let (kills, queries, _) = exchange("if-shell -F '#{==:#{session_id},$7}' 'kill-session' 'display-message -p kept'", Some(true), move || {
++        publish_registry("case__same", port);
++    });
++    assert_eq!((kills, queries), (1, 0)); assert!(!forwarded(&replacement));
++}
++#[test]
++fn explicit_other_target_still_forwards() {
++    let _lock = crate::util::lock_test_env(); let registry = Registry::new();
++    let other = TcpListener::bind("127.0.0.1:0").unwrap(); registry.publish("case__other", &other);
++    let (kills, _, _) = exchange("kill-session -t =case__other", Some(true), || {});
++    assert_eq!(kills, 0); assert!(forwarded(&other));
++}
++#[test]
++fn stripped_top_level_target_kills_selected_connection() {
++    // CLI selection/stripping is covered by the paired main.rs regression.
++    let _lock = crate::util::lock_test_env(); let _registry = Registry::new();
++    let (kills, queries, _) = exchange("kill-session", Some(true), || {});
++    assert_eq!((kills, queries), (1, 0));
++}
++#[test]
++fn false_condition_never_kills() {
++    let _lock = crate::util::lock_test_env(); let _registry = Registry::new();
++    assert_eq!(exchange("if-shell -F '#{==:#{session_id},$7}' 'kill-session' 'display-message -p kept'", Some(false), || {}).0, 0);
++}
++#[test]
++fn missing_explicit_target_fails_before_destruction() {
++    let _lock = crate::util::lock_test_env(); let _registry = Registry::new();
++    let (kills, _, output) = exchange("kill-session -t", Some(true), || {});
++    assert_eq!(kills, 0); assert!(output.contains("ERROR:"));
++}
++
++#[test]
++fn dropped_predicate_reply_never_kills() {
++    let _lock = crate::util::lock_test_env(); let _registry = Registry::new();
++    assert_eq!(exchange("if-shell -F '#{==:#{session_id},$7}' 'kill-session' 'display-message -p kept'", None, || {}).0, 0);
++}
++#[test]
++fn unresolved_explicit_other_target_never_kills_self() {
++    let _lock = crate::util::lock_test_env(); let _registry = Registry::new();
++    assert_eq!(exchange("kill-session -t =case__missing", Some(true), || {}).0, 0);
++}

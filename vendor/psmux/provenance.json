@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "name": "OpenRig patched psmux",
+  "version": "3.4.0",
+  "upstream": {
+    "repository": "https://github.com/psmux/psmux.git",
+    "commit": "20aa1d7254ee93f64dafa059ef89341d9767470a"
+  },
+  "patch": {
+    "file": "upstream.patch",
+    "sha256": "b4cf990fb8af8a4563bb000d632129bbf6ffd4edbe38222037955a1ade5841d8"
+  },
+  "sourceManifest": {
+    "file": "source-manifest.json",
+    "sha256": "fceabcee4d169a92a71cd6506a1392f4440f3383b09c97952656addf492298bb",
+    "files": 1607
+  },
+  "license": {
+    "spdx": "MIT",
+    "copyright": "Copyright (c) 2025 Godwin Sam Josh",
+    "file": "LICENSE",
+    "sha256": "08da43448469783a5b56d903e29c071383d7c201b9644287f98531e76083b959"
+  },
+  "cargoLockSHA256": "36d4f0b7c3a141c1baab7b9d1a1810a654d2438a7d084e4ff28a9657a97b6164",
+  "toolchain": "1.98.0",
+  "target": "x86_64-pc-windows-msvc",
+  "acceptedArtifact": {
+    "bytes": 9957888,
+    "sha256": "d7f88c4f47522e48c439415fcf6ad84241e9c472cd11be6468348d079d06391b",
+    "format": "PE AMD64",
+    "qualification": "Vendor compiler artifact only; residual unknown. No native OpenRig app, lifecycle or QA qualification; not distributed by this repository."
+  },
+  "buildArgv": [
+    "rustup",
+    "run",
+    "1.98.0",
+    "cargo",
+    "build",
+    "--frozen",
+    "--offline",
+    "--release",
+    "--jobs",
+    "1",
+    "--target",
+    "x86_64-pc-windows-msvc",
+    "--bin",
+    "psmux"
+  ],
+  "reproducibility": "Exact source reconstruction, not a promise of byte-identical binaries across toolchains/environments."
+}

@@ -1,88 +1,160 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import os from "node:os";
+import { randomUUID } from "node:crypto";
+import { writeFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { TmuxAdapter } from "../src/adapters/tmux.js";
+import { TmuxAdapter, defaultTmuxFileOps } from "../src/adapters/tmux.js";
 import { renderWindowsLaunch } from "../src/adapters/windows-launch.js";
 import { pathToFileURL } from "node:url";
+import { createWindowsPsmuxNativeFixture } from "./helpers/windows-psmux-native-fixture.js";
 
-const execFileAsync = promisify(execFile);
 const enabled = process.platform === "win32" && !!process.env.OPENRIG_TEST_PSMUX;
+const qualifiedPane = /^psmux:v2:[A-Za-z0-9_-]+:%\d+:\d+:\d+:\d+$/;
+const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
+
+function nativeFixture() {
+  const binary = process.env.OPENRIG_TEST_PSMUX!;
+  if (!path.isAbsolute(binary)) throw new Error("OPENRIG_TEST_PSMUX must name an absolute qualified binary path");
+  const files = createWindowsPsmuxNativeFixture({ binary });
+  const fileOps = { ...defaultTmuxFileOps(), tmpName: () => path.join(files.dir, `openrig-tmux-send-${process.pid}-${randomUUID()}.txt`) };
+  const adapter = new TmuxAdapter(async () => { throw new Error("No POSIX transport"); }, fileOps, files.invoke, "psmux");
+  const owned = new Set<string>();
+  const unqualified = new Set<string>();
+  return {
+    ...files,
+    adapter,
+    async createSession(name: string) {
+      unqualified.add(name);
+      expect(await adapter.createSession(name, files.dir, files.sessionEnv)).toEqual({ ok: true });
+      const panes = await adapter.listPanes(name);
+      expect(panes).toHaveLength(1);
+      const pane = panes[0]!;
+      expect(pane.id).toMatch(qualifiedPane);
+      owned.add(pane.id);
+      unqualified.delete(name);
+      return pane;
+    },
+    async stop(ref: string) {
+      expect(await adapter.killSession(ref)).toEqual({ ok: true });
+      owned.delete(ref);
+    },
+    async close() {
+      const failures: string[] = [];
+      for (const ref of owned) {
+        try {
+          const result = await adapter.killSession(ref);
+          if (result.ok) owned.delete(ref);
+          else failures.push(`${ref}: ${result.code}: ${result.message}`);
+        } catch (error) { failures.push(`${ref}: ${String(error)}`); }
+      }
+      if (unqualified.size || failures.length) {
+        throw new Error(`Native fixture cleanup unverified; preserved ${files.dir}; unqualified sessions: ${[...unqualified].join(", ")}; ${failures.join("; ")}`);
+      }
+      files.removeFiles();
+    },
+  };
+}
+
+async function withNativeFixture(run: (fixture: ReturnType<typeof nativeFixture>) => Promise<void>) {
+  const fixture = nativeFixture();
+  let failure: unknown;
+  try { await run(fixture); } catch (error) { failure = error; }
+  try { await fixture.close(); } catch (error) {
+    if (failure) throw new AggregateError([failure, error], "Native assertion and checked cleanup failed");
+    throw error;
+  }
+  if (failure) throw failure;
+}
+
+async function waitForFile(file: string, adapter: TmuxAdapter, target: string, timeout = 5_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try { return readFileSync(file, "utf8"); } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  const screen = await adapter.capturePaneScreen(target);
+  throw new Error(`receiver did not produce ${path.basename(file)}; fixture screen: ${screen?.slice(-1200) ?? "unavailable"}`);
+}
 
 describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
   it("delivers a multiline block as one runner submission", async () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "openrig-native-input-"));
-    const session = `openrig-input-${process.pid}-${Date.now()}`;
-    const output = path.join(dir, "result.json"), ready = path.join(dir, "ready");
-    const script = path.join(dir, "receiver.mjs");
-    const runner = pathToFileURL(path.resolve(import.meta.dirname, "../dist/adapters/pi-runner.js")).href;
-    writeFileSync(script, `import fs from 'node:fs'; import {createRunnerInput} from ${JSON.stringify(runner)};
-      createRunnerInput(process.stdin, process.stdout, block => { fs.writeFileSync(${JSON.stringify(output + ".tmp")}, JSON.stringify(block)); fs.renameSync(${JSON.stringify(output + ".tmp")}, ${JSON.stringify(output)}); process.exit(0); });
-      fs.writeFileSync(${JSON.stringify(ready)}, 'ready');`);
-    const invoke = async (argv: string[]) => (await execFileAsync(process.env.OPENRIG_TEST_PSMUX!, argv.slice(1), { windowsHide: true })).stdout;
-    const adapter = new TmuxAdapter(async () => { throw new Error("No POSIX transport"); }, undefined, invoke, "psmux");
-    try {
-      expect(await adapter.createSession(session, os.tmpdir())).toEqual({ ok: true });
-      const q = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
-      expect(await adapter.sendShellCommand(session, renderWindowsLaunch([process.execPath, script].map(q).join(" "), {}))).toEqual({ ok: true });
-      const waitForFile = async (file: string) => {
-        const deadline = Date.now() + 5000;
-        while (Date.now() < deadline) { try { return readFileSync(file, "utf8"); } catch { await new Promise(resolve => setTimeout(resolve, 50)); } }
-        const screen = await adapter.capturePaneScreen(session);
-        throw new Error(`receiver did not produce ${path.basename(file)}; fixture screen: ${screen?.slice(-1200) ?? "unavailable"}`);
-      };
-      await waitForFile(ready);
-      const pane = (await adapter.listPanes(session))[0]!;
+    await withNativeFixture(async fixture => {
+      const { dir, adapter, sessionEnv } = fixture;
+      const session = `openrig-input-${randomUUID()}`;
+      const output = path.join(dir, "result.json"), ready = path.join(dir, "ready");
+      const script = path.join(dir, "receiver.mjs");
+      const runner = pathToFileURL(path.resolve(import.meta.dirname, "../dist/adapters/pi-runner.js")).href;
+      writeFileSync(script, `import fs from 'node:fs'; import {createRunnerInput} from ${JSON.stringify(runner)};
+        createRunnerInput(process.stdin, process.stdout, block => { fs.writeFileSync(${JSON.stringify(output + ".tmp")}, JSON.stringify(block)); fs.renameSync(${JSON.stringify(output + ".tmp")}, ${JSON.stringify(output)}); process.exit(0); });
+        fs.writeFileSync(${JSON.stringify(ready)}, 'ready');`);
+      const pane = await fixture.createSession(session);
+      expect(await adapter.sendShellCommand(pane.id, renderWindowsLaunch([process.execPath, script].map(quote).join(" "), sessionEnv))).toEqual({ ok: true });
+      await waitForFile(ready, adapter, pane.id);
       const message = "first line\nsecond line; 中文";
       expect(await adapter.sendText(pane.id, message)).toEqual({ ok: true });
       expect(await adapter.sendKeys(pane.id, ["Enter"])).toEqual({ ok: true });
-      expect(JSON.parse(await waitForFile(output))).toBe(message);
-    } finally {
-      await invoke(["tmux", "kill-session", "-t", `=${session}`]).catch(() => {});
-      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    }
+      expect(JSON.parse(await waitForFile(output, adapter, pane.id))).toBe(message);
+    });
   }, 20_000);
+
   it("delivers exact native argv and environment through a real pane", async () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "openrig-native-"));
-    const session = `openrig-test-${process.pid}-${Date.now()}`;
-    const decoy = `${session}-other`;
-    const output = path.join(dir, "result.json");
-    const script = path.join(dir, "echo args.js");
-    writeFileSync(script, `require('fs').writeFileSync(process.argv[2], JSON.stringify({args: process.argv.slice(3), marker: process.env.OPENRIG_TEST_MARKER}));`);
-    const invoke = async (argv: string[]) => (await execFileAsync(process.env.OPENRIG_TEST_PSMUX!, argv.slice(1), { windowsHide: true })).stdout;
-    const adapter = new TmuxAdapter(async () => { throw new Error("POSIX shell execution is forbidden in this probe"); }, undefined, invoke, "psmux");
-    try {
-      expect(await adapter.createSession(session, dir)).toEqual({ ok: true });
-      expect(await adapter.createSession(decoy, dir)).toEqual({ ok: true });
-      const q = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
+    await withNativeFixture(async fixture => {
+      const { dir, adapter, sessionEnv } = fixture;
+      const session = `openrig-test-${randomUUID()}`;
+      const decoy = `${session}-other`;
+      const output = path.join(dir, "result.json");
+      const script = path.join(dir, "echo args.js");
+      writeFileSync(script, `const fs = require('fs'); const output = process.argv[2];
+        fs.writeFileSync(output + '.tmp', JSON.stringify({args: process.argv.slice(3), marker: process.env.OPENRIG_TEST_MARKER,
+          dataDir: process.env.PSMUX_DATA_DIR, configFile: process.env.PSMUX_CONFIG_FILE, noWarm: process.env.PSMUX_NO_WARM, userProfile: process.env.USERPROFILE}));
+        fs.renameSync(output + '.tmp', output);`);
+      const pane = await fixture.createSession(session);
+      const other = await fixture.createSession(decoy);
+      expect(other.id).not.toBe(pane.id);
       const args = ["space word", "a'b", "中文;$HOME", "", 'embedded"quote', "space trailing\\", "trailing\\"];
-      const command = [process.execPath, script, output, ...args].map(q).join(" ");
-      const panes = await adapter.listPanes(session);
-      expect(panes).toHaveLength(1);
-      expect(panes[0]!.id).toMatch(/^psmux:v2:[A-Za-z0-9_-]+:%\d+:\d+:\d+:\d+$/);
-      const other = (await adapter.listPanes(decoy))[0]!;
-      expect(other.id).not.toBe(panes[0]!.id);
-      expect(await adapter.sendShellCommand(panes[0]!.id, renderWindowsLaunch(command, { OPENRIG_TEST_MARKER: "native-ok" }))).toEqual({ ok: true });
-      let result: unknown;
-      const deadline = Date.now() + 12_000;
-      while (Date.now() < deadline) {
-        try { result = JSON.parse(readFileSync(output, "utf8")); break; } catch { await new Promise(resolve => setTimeout(resolve, 100)); }
-      }
-      expect(result).toEqual({ args, marker: "native-ok" });
-      expect(await adapter.killSession(session)).toEqual({ ok: true });
-      // Pinned psmux 3.4 returns silent exit 1 after this stop, indistinguishable
-      // from an unreachable session server. The probe alone cannot prove absence.
+      const command = [process.execPath, script, output, ...args].map(quote).join(" ");
+      expect(await adapter.sendShellCommand(pane.id, renderWindowsLaunch(command, { ...sessionEnv, OPENRIG_TEST_MARKER: "native-ok" }))).toEqual({ ok: true });
+      expect(JSON.parse(await waitForFile(output, adapter, pane.id, 12_000))).toEqual({
+        args, marker: "native-ok", dataDir: fixture.dataDir, configFile: fixture.configFile,
+        noWarm: "1", userProfile: process.env.USERPROFILE,
+      });
+      await fixture.stop(pane.id);
+      // A silent exit does not establish absence on pinned psmux 3.4.
       expect(await adapter.probeSession(session)).toEqual({
         state: "transport_unavailable",
         cause: "psmux has-session returned silent exit 1; session presence is unknown.",
       });
+      expect((await adapter.listPanes(decoy))[0]?.id).toBe(other.id);
       expect((await adapter.probeSession(decoy)).state).toBe("present");
-    } finally {
-      await invoke(["tmux", "kill-session", "-t", `=${session}`]).catch(() => {});
-      await invoke(["tmux", "kill-session", "-t", `=${decoy}`]).catch(() => {});
-      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-    }
+    });
   }, 20_000);
+
+  it("rejects a stopped server epoch after same-name replacement while both live sessions remain responsive", async () => {
+    await withNativeFixture(async fixture => {
+      const { dir, adapter, sessionEnv } = fixture;
+      const session = `openrig-epoch-${randomUUID()}`;
+      const siblingName = `${session}-sibling`;
+      const original = await fixture.createSession(session);
+      const sibling = await fixture.createSession(siblingName);
+      await fixture.stop(original.id);
+      const replacement = await fixture.createSession(session);
+      expect(replacement.id).not.toBe(original.id);
+
+      expect(await adapter.killSession(original.id)).toMatchObject({
+        ok: false,
+        code: "guard_target_changed",
+        message: expect.stringContaining("checked stop identity rejected"),
+      });
+      expect((await adapter.listPanes(session))[0]?.id).toBe(replacement.id);
+      expect((await adapter.listPanes(siblingName))[0]?.id).toBe(sibling.id);
+
+      const script = path.join(dir, "consume-marker.js");
+      writeFileSync(script, `const fs = require('fs'); fs.writeFileSync(process.argv[2] + '.tmp', process.argv[3]); fs.renameSync(process.argv[2] + '.tmp', process.argv[2]);`);
+      for (const [pane, marker] of [[replacement, "replacement-consumed"], [sibling, "sibling-consumed"]] as const) {
+        const output = path.join(dir, `${marker}.txt`);
+        expect(await adapter.sendShellCommand(pane.id, renderWindowsLaunch([process.execPath, script, output, marker].map(quote).join(" "), sessionEnv))).toEqual({ ok: true });
+        expect(await waitForFile(output, adapter, pane.id)).toBe(marker);
+      }
+      expect((await adapter.listPanes(session))[0]?.id).toBe(replacement.id);
+      expect((await adapter.listPanes(siblingName))[0]?.id).toBe(sibling.id);
+    });
+  }, 30_000);
 });

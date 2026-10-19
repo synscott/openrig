@@ -7,9 +7,6 @@ import type { ComposerSnapshot } from "../domain/composer-prompts.js";
 import { inspectComposerInput } from "../domain/session-transport.js";
 import { parentSessionEnvKeys } from "../domain/parent-session-env.js";
 import { powershellQuote, hasOnlyWindowsTerminalResponseDraft } from "./windows-launch.js";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-const execFileAsync = promisify(execFile);
 import type { TmuxControlExec } from "./tmux-control.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
@@ -526,8 +523,17 @@ export class TmuxAdapter {
     await (this.argvExec as Partial<TmuxControlExec> | undefined)?.close?.();
   }
 
-  /** Start an empty native terminal server, without inventing a seat/session. */
+  /** Prepare the backend where supported, without inferring session absence. */
   async startServer(): Promise<TmuxResult> {
+    if (this.terminalKind === "psmux") {
+      try {
+        // Lazy-session readiness is a binary capability, not actor liveness or
+        // positive session absence. This entry bypasses vendor maintenance.
+        const output = await this.argvExec?.(["tmux", "openrig-capabilities"]);
+        if (output === "OPENRIG-PSMUX 1 checked-input-v1 checked-stop-v1 observe-v1 lazy-session\n") return { ok: true };
+      } catch { /* An unavailable or older backend is not readiness evidence. */ }
+      return { ok: false, code: "native_readiness_unverified", message: "Native backend capability readiness is unverified; session presence remains unknown." };
+    }
     const probeName = `openrig-startup-${randomUUID()}`;
     try {
       if ((await this.probeSession(probeName)).state !== "transport_unavailable") return { ok: true };
@@ -785,6 +791,9 @@ export class TmuxAdapter {
 
   private async sendTextUnchecked(target: string, text: string, beforeWrite: () => void, bracketed = true,
     policy?: { beforePaste: () => Promise<void>; afterPaste: () => Promise<void> }): Promise<TmuxResult> {
+    if (this.terminalKind === "psmux") {
+      return this.sendNativeInput(target, bracketed ? "auto" : "raw", text, beforeWrite, policy);
+    }
     const path = this.fileOps.tmpName();
     const buffer = this.fileOps.bufferName();
     let bufferLoaded = false;
@@ -792,29 +801,8 @@ export class TmuxAdapter {
     try {
       await this.fileOps.writeFile(path, text, { mode: 0o600, flag: "wx" });
       created = true;
-      const windowsCommand = this.terminalKind === "psmux" && process.platform === "win32"
-        ? (await this.getPaneCommand(target) ?? "").replace(/\.exe$/, "").toLowerCase() : null;
-      if (windowsCommand && bracketed && !["pwsh", "powershell"].includes(windowsCommand)) {
-        const pid = await this.getPanePid(target);
-        if (!pid) throw new Error("Windows pane process unavailable; no payload submitted");
-        if (policy) await policy.beforePaste();
-        beforeWrite();
-        // ConPTY removes bracketed-paste delimiters on its pipe. Console input
-        // records preserve the delimiters and raw LF for the receiving editor.
-        const helper = pathJoin(import.meta.dirname, "../../assets/windows-console-input.ps1");
-        const powershell = pathJoin(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe");
-        try {
-          await execFileAsync(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper,
-            "-TargetPid", String(pid), "-PayloadFile", path, "-Mode", ["codex", "codex-code-mode-host"].includes(windowsCommand) ? "codex" : "bracketed"], { windowsHide: true, timeout: 15000 });
-        } catch (error) {
-          const phase = /failed at (read|compile|attach|open|write);/.exec(String((error as { stderr?: string }).stderr ?? ""))?.[1];
-          throw new Error(`Windows console delivery failed${phase ? ` at ${phase}` : ""}; payload consumption unverified`);
-        }
-        if (policy) await policy.afterPaste();
-        return { ok: true };
-      }
       await this.run(["tmux", "load-buffer", "-b", buffer, path],
-        `tmux load-buffer -b ${shellQuote(buffer)} ${shellQuote(path)}`, this.terminalKind === "psmux" ? target : undefined);
+        `tmux load-buffer -b ${shellQuote(buffer)} ${shellQuote(path)}`);
       bufferLoaded = true;
       if (policy) await policy.beforePaste();
       beforeWrite();
@@ -831,7 +819,7 @@ export class TmuxAdapter {
         // resident. Best-effort delete to avoid leaking it.
         try {
           await this.run(["tmux", "delete-buffer", "-b", buffer],
-        `tmux delete-buffer -b ${shellQuote(buffer)}`, this.terminalKind === "psmux" ? target : undefined);
+        `tmux delete-buffer -b ${shellQuote(buffer)}`);
         } catch { /* best-effort cleanup */ }
       }
       return classifyWriteError(err);
@@ -948,25 +936,60 @@ export class TmuxAdapter {
       const identity = this.freshManaged.get(target)?.nodeId ?? target;
       const submit = keys.some(key => key === "Enter" || key === "C-m");
       if (this.deliveryGuard?.needsInputCheck(identity)) await this.deliveryGuard.beforeInput(identity, submit);
-      beforeWrite(); beforeInput?.();
-      const result = await this.sendKeysUnchecked(pane, keys);
+      const result = await this.sendKeysUnchecked(pane, keys, () => { beforeWrite(); beforeInput?.(); });
       if (result.ok && submit) this.deliveryGuard?.noteSubmitted(identity);
       return result;
     }, false, "keys");
   }
 
-  private async sendKeysUnchecked(target: string, keys: string[]): Promise<TmuxResult> {
+  /** Native completion proves input queue acceptance, never child consumption. */
+  private async sendNativeInput(target: string, mode: "auto" | "raw" | "keys" | "copy-cancel", payload: string | undefined,
+    beforeWrite: () => void,
+    policy?: { beforePaste: () => Promise<void>; afterPaste: () => Promise<void> }): Promise<TmuxResult> {
+    const ref = nativePaneRef(target);
+    if (!ref) return { ok: false, code: "guard_target_unknown", message: "Native input requires the original qualified server epoch; no input written." };
+    if (!this.argvExec) return { ok: false, code: "native_input_unverified", message: "Native checked input requires an argument-vector transport; no input written." };
+    if (payload !== undefined && Buffer.byteLength(payload, "utf8") > 1024 * 1024) {
+      return { ok: false, code: "native_input_too_large", message: "Native input exceeds the one MiB payload bound; no input written." };
+    }
+    const path = payload === undefined ? undefined : this.fileOps.tmpName();
+    let created = false;
+    let dispatched = false;
+    let accepted = false;
     try {
-      if (this.terminalKind === "psmux" && process.platform === "win32" && keys.length === 1 && keys[0] === "C-u"
-        && ["codex", "codex-code-mode-host"].includes((await this.getPaneCommand(target) ?? "").replace(/\.exe$/, "").toLowerCase())) {
-        const pid = await this.getPanePid(target);
-        if (!pid) return { ok: false, code: "guard_target_unknown", message: "Native console process unavailable; no key sent." };
-        try {
-          await execFileAsync(pathJoin(process.env.SystemRoot ?? "C:\\Windows", "System32/WindowsPowerShell/v1.0/powershell.exe"),
-            ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", pathJoin(import.meta.dirname, "../../assets/windows-console-input.ps1"), "-TargetPid", String(pid), "-Mode", "codex-clear"], { windowsHide: true, timeout: 15000 });
-        } catch { return { ok: false, code: "native_key_unverified", message: "Native console key delivery unverified." }; }
-        return { ok: true };
+      if (path !== undefined && payload !== undefined) {
+        await this.fileOps.writeFile(path, payload, { mode: 0o600, flag: "wx" });
+        created = true;
       }
+      if (policy) await policy.beforePaste();
+      // No await between the registry/occupant check and dispatch. The actor
+      // then checks this ORIGINAL tuple at its own input effect boundary.
+      beforeWrite();
+      dispatched = true;
+      const output = await this.argvExec(["tmux", "checked-input", "--session", ref.sid,
+        "--server", `${ref.pid}:${ref.birth}`, "--pane", ref.pane, "--mode", mode, ...(path ? ["--file", path] : [])]);
+      if (output !== "CHECKED-INPUT COMPLETE\n") {
+        return { ok: false, code: "native_input_unverified", message: "Native input acknowledgment is incomplete or unsupported; queue acceptance is unknown. No retry was attempted." };
+      }
+      accepted = true;
+      if (policy) await policy.afterPaste();
+      return { ok: true };
+    } catch (error) {
+      if (!dispatched && error instanceof DeliveryGuardError) return { ok: false, code: error.code, message: error.message };
+      if (accepted) return { ok: false, code: "native_input_unverified", message: "Native input was accepted by the original queue, but post-acceptance state could not be recorded. No retry was attempted." };
+      return { ok: false, code: "native_input_unverified", message: "Native checked input did not return a verified completion; queue acceptance is unknown. No retry was attempted." };
+    } finally {
+      if (created && path) { try { await this.fileOps.unlink(path); } catch { /* Preserve the input outcome. */ } }
+    }
+  }
+
+  private async sendKeysUnchecked(target: string, keys: string[], beforeWrite: () => void = () => {}): Promise<TmuxResult> {
+    if (this.terminalKind === "psmux") {
+      if (keys.length > 4096) return { ok: false, code: "native_input_too_large", message: "Native input exceeds the 4096 key bound; no input written." };
+      return this.sendNativeInput(target, "keys", JSON.stringify(keys), beforeWrite);
+    }
+    try {
+      beforeWrite();
       await this.run(["tmux", "send-keys", "-t", target, ...keys],
         `tmux send-keys -t ${shellQuote(target)} ${keys.map(shellQuote).join(" ")}`);
       return { ok: true };
@@ -1290,7 +1313,9 @@ export class TmuxAdapter {
 
   /** Leave the pane's current mode (copy mode) with `send-keys -X cancel`, through the same input guard as sendKeys. */
   async cancelPaneMode(target: string): Promise<TmuxResult> {
-    return this.guardedInput(target, (pane, beforeWrite) => { beforeWrite(); return this.sendKeysUnchecked(pane, ["-X", "cancel"]); });
+    return this.guardedInput(target, (pane, beforeWrite) => this.terminalKind === "psmux"
+      ? this.sendNativeInput(pane, "copy-cancel", undefined, beforeWrite)
+      : this.sendKeysUnchecked(pane, ["-X", "cancel"], beforeWrite));
   }
 
   /** A launch metadata read. Callers must never put credential values in terminal input. */

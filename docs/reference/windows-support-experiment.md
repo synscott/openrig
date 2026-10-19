@@ -90,6 +90,65 @@ those operator/provider acceptance requirements.
 
 ## Reproduce
 
+### Current patched psmux setup
+
+The current branch requires **patched psmux 3.4.0**, including server epoch and
+checked-stop support. The stock 3.3.8 used in historical experiments below does
+not satisfy that protocol. A stock 3.4.0 version string is also insufficient.
+Use the repository's [pinned source/build recipe](../../vendor/psmux/README.md),
+which preserves upstream MIT attribution and verifies the complete patched tree.
+It provides a fresh source/build route and an exact-digest setup route for an
+already obtained accepted binary; no public binary download is implied.
+
+```powershell
+# Inspect first; this command has no setup/build effects.
+node scripts/build-windows-psmux.mjs --plan
+# Fresh directories, in an x64 VS C++ tools environment with Rust 1.98.0 installed.
+# --fetch explicitly permits locked Cargo downloads; no global install is made.
+node scripts/build-windows-psmux.mjs --build --fetch --source-dir C:\Temp\psmux-src --output-dir C:\Temp\psmux-private
+node scripts/verify-windows-psmux.mjs --binary C:\Temp\psmux-private\psmux.exe --receipt C:\Temp\psmux-private\build-receipt.json
+```
+
+The portable directory contains identical `psmux.exe`/`tmux.exe` files and the MIT
+license. Select it for the **current private test shell only**, before starting
+the private daemon; do not change user/system PATH or replace live binaries:
+
+```powershell
+$previousPath = $env:PATH
+$env:PATH = "C:\Temp\psmux-private;$previousPath"
+$env:OPENRIG_TEST_PSMUX = 'C:\Temp\psmux-private\tmux.exe'
+$env:OPENRIG_HOME = 'C:\Temp\openrig-private-home'
+$env:PSMUX_DATA_DIR = 'C:\Temp\openrig-private-psmux'
+$env:PSMUX_CONFIG_FILE = 'C:\Temp\openrig-private-psmux\psmux.conf'
+$env:PSMUX_NO_WARM = '1'
+if (Test-Path $env:OPENRIG_HOME) { throw 'Choose a fresh private OpenRig home' }
+if (Test-Path $env:PSMUX_DATA_DIR) { throw 'Choose a fresh private psmux directory' }
+New-Item -ItemType Directory $env:OPENRIG_HOME | Out-Null
+New-Item -ItemType Directory $env:PSMUX_DATA_DIR | Out-Null
+New-Item -ItemType File $env:PSMUX_CONFIG_FILE | Out-Null
+# Run only the allocated private native checks; keep USERPROFILE unchanged.
+```
+
+Use fresh, owned home/state/config paths rather than adopting an existing psmux
+registry. `OPENRIG_TEST_PSMUX` selects the executable for native tests; the daemon
+resolves the `tmux.exe` alias through its launch environment's PATH. Keep private
+provider homes separately selected and establish sign-ins independently. Never
+copy authentication into test reports or infer provider access from a fixture.
+
+For rollback, stop only the private daemon through its normal control route,
+confirm its owned sessions stopped without disturbing siblings, restore
+`$env:PATH = $previousPath`, and close this shell to discard its environment.
+Keep build/receipt/state directories until process ownership and useful evidence
+are reconciled; do not force-kill unknown processes or clean live state. This
+recipe does not authorize a fleet migration or replacement of an active install.
+
+Source reconstruction and binary identity are distinct from native app and QA
+results. The accepted vendor artifact is a compiler-only milestone with residual
+process uncertainty. A locally generated receipt is unsigned source/build
+bookkeeping, not proof of byte-reproducible output, provider conversation resume,
+launch/message/capture/stop/restore success, full-suite parity or GUI acceptance.
+Current native validation remains tracked separately from the historical results.
+
 ### Rebase to current main, 2026-10-15
 
 The experiment has been rebased onto main `2cfc5fa017cf73bf4261d7b4c4e64c34b080757c`
@@ -133,8 +192,9 @@ compatibility, or complete the full-suite, GUI, kernel/operator or reboot/suspen
 requirements above. WSL's retained 0.6.6 installation reported an absent daemon
 PID on this date; its earlier ready status is historical.
 
-Install Node 22/24, Git for Windows, PowerShell and psmux 3.3.8. Put the portable
-psmux directory on PATH ahead of unrelated tmux installations. Keep USERPROFILE
+The following describes that historical setup, not the current patched protocol:
+Node 22/24, Git for Windows, PowerShell and stock psmux 3.3.8 were used. For the
+current branch, follow the patched setup above instead. Keep USERPROFILE
 unchanged. Use a separate OPENRIG_HOME and explicitly selected CODEX_HOME; establish
 provider sign-ins there. Configure Codex's supported Windows sandbox for that home
 before using OpenRig's normal workspace-write floor. The local test used
@@ -149,10 +209,11 @@ $env:OPENRIG_TEST_PSMUX = 'C:\path\to\psmux\tmux.exe'
 npm exec --workspace @openrig/daemon -- vitest run test/windows-terminal-native.test.ts test/windows-launch.test.ts test/windows-pi-command.test.ts test/windows-process-lineage.test.ts test/windows-daemon-control.test.ts test/resume-token-validation.test.ts
 ```
 
-The native terminal tests create and remove only their uniquely named fixtures.
-The Windows workflow verifies the pinned psmux archive digest and runs provider-free
-terminal, identity, drain, lifecycle and package checks. Live provider responses
-remain separate local evidence; a green CI job does not establish account access.
+The historical native terminal tests used uniquely named fixtures. The historical
+Windows workflow verified a pinned stock-3.3.8 archive and ran provider-free checks;
+that workflow and its results do not qualify the current patched-3.4.0 protocol.
+Its pipeline successor requires separate CI qualification. Live provider responses
+remain separate evidence; a green CI job does not establish account access.
 
 ```powershell
 rig daemon start --no-kernel
