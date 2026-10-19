@@ -82,14 +82,14 @@ test('setup plan is inert and setup refuses existing destinations before source 
 });
 
 
-test('current recipe has no accepted artifact and refuses historical or missing binaries without effects', t => {
+test('absent acceptance refuses binaries and current acceptance refuses a mismatched artifact', t => {
   const root = temporary(t);
   const old = join(root, 'historical.exe');
   writeFileSync(old, pe());
-  assert.equal(loadRecipe().acceptedArtifact, null);
+  assert.equal(loadRecipe().acceptedArtifact.sha256, '2136ec390148154ea0c09ff169f3d50a915fde4bf1189f9c5c17ae54a09d86af');
   assert.throws(() => verifyBinary(old, null), /No accepted artifact for current/);
   assert.throws(() => verifyBinary(join(root, 'missing.exe'), null), /No accepted artifact for current/);
-  assert.throws(() => setup(['--from-binary', old, '--output-dir', join(root, 'portable')]), /No accepted artifact for current/);
+  assert.throws(() => setup(['--from-binary', old, '--output-dir', join(root, 'portable')]), /accepted artifact digest mismatch/);
   assert.throws(() => verifyBinary(old, null, { schema: 1, sourceManifestSHA256: 'historical' }, 'current'), /receipt source mismatch/);
 });
 

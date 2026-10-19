@@ -24,7 +24,16 @@
   "cargoLockSHA256": "36d4f0b7c3a141c1baab7b9d1a1810a654d2438a7d084e4ff28a9657a97b6164",
   "toolchain": "1.98.0",
   "target": "x86_64-pc-windows-msvc",
-  "acceptedArtifact": null,
+  "acceptedArtifact": {
+    "bytes": 10171392,
+    "sha256": "2136ec390148154ea0c09ff169f3d50a915fde4bf1189f9c5c17ae54a09d86af",
+    "format": "PE AMD64",
+    "sourceManifestSHA256": "cebcd078c1ae25a91be6220bf64d342b5000b74e176408dd1d7bad41722f5432",
+    "sourceInventorySHA256": "28a963879b1e40f0d4d857f88db7cf3fdb3eac9b41746e67ed1e36e99c40b83c",
+    "qualification": "Source-bound native compiler artifact only; residual unknown. Native APIs not executed. No lifecycle, OpenRig app, provider or user-path acceptance; no byte-reproducibility guarantee.",
+    "bindingReceiptSHA256": "1085eee92b6139e985e9efa7ef1adf2b21e7eb53b026201f7f600ae32d0c500e",
+    "independentReviewSHA256": "a3e91013f179578a73b57017a8ad7b97ada36857ce3a9f6f22dae29925469d85"
+  },
   "buildArgv": [
     "rustup",
     "run",
@@ -42,5 +51,5 @@
     "psmux"
   ],
   "reproducibility": "Exact source reconstruction, not a promise of byte-identical binaries across toolchains/environments.",
-  "artifactStatus": "No independently accepted binary for this checked-input/checked-create source. Binary-only verification/setup refuses until current artifact metadata is accepted. Historical B artifact is not eligible."
+  "artifactStatus": "Current checked-input/checked-create source-bound native compiler artifact accepted for identity verification only. Historical B artifact remains ineligible; local build receipts remain unsigned bookkeeping."
 }

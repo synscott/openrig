@@ -12,8 +12,10 @@ the source and portable binaries. This does not relicense OpenRig itself.
 
 `provenance.json` pins the upstream revision, exact `upstream.patch`, lockfile,
 license and full 1,613-file patched-source manifest. No executable, private archive,
-raw log, credentials or developer tool paths are shipped here. **No current
-binary has been independently accepted:** `acceptedArtifact` is `null`.
+raw log, credentials or developer tool paths are shipped here. The current source-bound native compiler artifact is 10,171,392 bytes, SHA256
+`2136ec390148154ea0c09ff169f3d50a915fde4bf1189f9c5c17ae54a09d86af`.
+It is accepted for binary identity only: residual process observations are unknown,
+native APIs were not executed, and lifecycle/app/user-path acceptance is separate.
 The historical B compiler artifact lacks the current checked-input/create source
 and must not be selected by digest, version string or PE shape.
 
@@ -66,14 +68,15 @@ independent attestation. Source reproducibility does not promise byte-identical
 binaries. Native compilation of this repository helper must be qualified in the
 allocated Windows build environment; source reconstruction alone does not do so.
 
-Binary-only `--binary FILE` verification and `--from-binary FILE` setup currently
-refuse with an actionable missing-current-artifact error. Do not substitute an
-old artifact or invent a pending digest. Once a current artifact is independently
-accepted, its exact metadata can be bound in `provenance.json`. Until then, the
-source/build route above produces an explicitly unsigned local build receipt;
-that receipt verifies source and byte identity only and does not confer native
-user-path acceptance. The helper never downloads a binary, starts a daemon,
-changes persistent PATH or replaces an installed tool.
+Binary-only `--binary FILE` verification and `--from-binary FILE --output-dir NEW`
+setup require the exact current artifact digest/length and PE AMD64 shape. Obtain
+that artifact through a trusted handoff; no public download is implied. Historical
+artifacts and arbitrary PE files are refused. The source/build route produces an
+explicitly unsigned local build receipt; that receipt verifies source and byte
+identity only and does not confer native user-path acceptance. The helper never
+downloads a binary, starts a daemon, changes persistent PATH or replaces an
+installed tool. If future source changes lack an accepted artifact, null acceptance
+continues to fail closed until new metadata is independently bound.
 See [Windows setup](../../docs/reference/windows-support-experiment.md#current-patched-psmux-setup)
 for selection, isolation and rollback. Keep local receipts outside public reports
 unless reviewed and redacted; no environment or provider data belongs in them.

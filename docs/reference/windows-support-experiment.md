@@ -97,10 +97,12 @@ checked-stop, checked-input-v1 and checked-create-v1 support. The stock 3.3.8 us
 not satisfy that protocol. A stock 3.4.0 version string is also insufficient.
 Use the repository's [pinned source/build recipe](../../vendor/psmux/README.md),
 which preserves upstream MIT attribution and verifies the complete patched tree.
-It provides a fresh source/build route. No current checked-input/create binary
-is independently accepted (`acceptedArtifact: null`); binary-only verification
-and portable setup refuse. The historical B artifact must not be promoted. A
-local source/build receipt remains unsigned bookkeeping, not native acceptance.
+It provides a fresh source/build route. The current checked-input/create compiler artifact is pinned in the recipe:
+10,171,392 bytes, SHA256 `2136ec390148154ea0c09ff169f3d50a915fde4bf1189f9c5c17ae54a09d86af`.
+Binary-only verification/portable setup require that exact identity; the historical
+B artifact remains ineligible. Compiler acceptance retains unknown process residuals
+and does not qualify native APIs, lifecycle or user paths. A local source/build
+receipt remains unsigned bookkeeping, not native acceptance.
 
 ```powershell
 # Inspect first; this command has no setup/build effects.
@@ -155,8 +157,9 @@ are reconciled; do not force-kill unknown processes or clean live state. This
 recipe does not authorize a fleet migration or replacement of an active install.
 
 Source reconstruction and binary identity are distinct from native app and QA
-results. No current checked-input/create artifact is accepted yet; the older
-compiler-only B milestone does not qualify this source or user path. A locally generated receipt is unsigned source/build
+results. The current artifact is accepted for source-bound compiler identity only;
+unknown residual observations and unexecuted native APIs remain explicit. The older
+B milestone does not qualify this source or user path. A locally generated receipt is unsigned source/build
 bookkeeping, not proof of byte-reproducible output, provider conversation resume,
 launch/message/capture/stop/restore success, full-suite parity or GUI acceptance.
 Current native validation remains tracked separately from the historical results.
