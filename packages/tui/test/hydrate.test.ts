@@ -199,6 +199,24 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     });
     expect(snap.hosts[0]?.rigs[0]?.pods[0]?.agents[0]).toMatchObject({ nodeId: "01JNODEIMPL" });
   });
+  it("carries display labels separately from canonical summary identity and health", async () => {
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/rigs/summary": [{ id: "01JRIG", name: "myrig", displayLabel: "Build Ω", lifecycleState: "running" }],
+    }));
+    expect(snap.hosts[0]?.rigs[0]).toMatchObject({ id: "01JRIG", name: "myrig", displayLabel: "Build Ω" });
+    expect(snap.health?.records[0]?.id).toBe("health-context-dev-impl");
+    expect(snap.readErrors.some((error) => error.startsWith("display-labels:"))).toBe(false);
+  });
+  it("preserves navigation and health when label configuration is unavailable or unsafe", async () => {
+    const snap = await hydrateSnapshot(fixtureClient({}, {
+      "/api/rigs/summary": [{ id: "01JRIG", name: "myrig", displayLabel: "bad\u001b[2J", displayLabelError: true, lifecycleState: "running" }],
+    }));
+    expect(snap.hosts[0]?.rigs[0]).toMatchObject({ id: "01JRIG", name: "myrig" });
+    expect(snap.hosts[0]?.rigs[0]).not.toHaveProperty("displayLabel");
+    expect(snap.readErrors).toContain("display-labels: configuration unavailable or invalid; canonical fallbacks used");
+    expect(snap.health).toMatchObject({ availability: "loaded", total: 1 });
+    expect(snap.health?.records[0]?.id).toBe("health-context-dev-impl");
+  });
   it("leaves health unassessed when a focused view skips the projection read", async () => {
     const context = { section: "topology" as const, viewTab: "table" as const, drill: [] };
     const snap = await hydrateSnapshot(fixtureClient(), undefined, undefined, undefined, undefined, context);
