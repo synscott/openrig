@@ -1000,6 +1000,8 @@ export class SeatLifecycleService {
     ).all(node.id) as Array<{ id: string }>).map((row) => row.id);
     const retiringGeneration = this.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid ?? null;
 
+    const checkedCreation = this.tmuxAdapter.usesCheckedCreation?.() === true;
+    let checkedStoppedCreation = false;
     let canonicalProbe = await this.probeLiveness(
       canonicalSessionName,
       "fresh launch refuses rather than overwrite a possibly-live canonical session",
@@ -1009,8 +1011,9 @@ export class SeatLifecycleService {
     // probe sees unavailable transport instead of positive absence. Reopen an
     // empty server only when the persisted state proves this seat's managed
     // occupant was deliberately stopped and no other managed row remains live.
-    // The probe below still decides absence; a recreated session or failed
-    // transport remains a refusal.
+    // POSIX still requires positive absence after bootstrap. Native capability
+    // readiness does not prove absence: only the deliberately stopped branch
+    // may submit a collision-safe checked-create request while the probe stays unknown.
     if ("code" in canonicalProbe) {
       const latest = this.latestSession(node.id);
       const hasCurrentBinding = this.sessionRegistry.getBindingForNode(node.id) !== null;
@@ -1021,6 +1024,7 @@ export class SeatLifecycleService {
         && !hasCurrentBinding
         && this.nonTerminalSessions(node.id).length === 0;
       if (stoppedManagedOccupant) {
+        checkedStoppedCreation = checkedCreation;
         try {
           const restored = await this.tmuxAdapter.startServer();
           if (restored.ok) {
@@ -1035,8 +1039,8 @@ export class SeatLifecycleService {
         }
       }
     }
-    if ("code" in canonicalProbe) return canonicalProbe;
-    if (canonicalProbe.state === "present") {
+    if ("code" in canonicalProbe && !checkedStoppedCreation) return canonicalProbe;
+    if (!("code" in canonicalProbe) && canonicalProbe.state === "present") {
       const currentSession = await this.validateFreshCollision(resolved, canonicalSessionName, input.stop === true);
       if ("code" in currentSession) return currentSession;
       const stopped = await this.stopManagedTmuxSeat(
@@ -1047,6 +1051,7 @@ export class SeatLifecycleService {
         false,
       );
       if (!stopped.ok) return stopped;
+      checkedStoppedCreation = checkedCreation;
       // Stopping the server's last session ends tmux's server, and every probe
       // below would then be transport_unavailable, never absence. Restore an
       // empty server (no session is invented; a no-op while the server is up)
@@ -1067,13 +1072,14 @@ export class SeatLifecycleService {
     }
 
     // The stop/clean composition may have taken time; buy absence again at the
-    // mutation boundary. NodeLauncher also refuses duplicate_session and never kills it.
+    // mutation boundary. Native checked-create arbitrates collision atomically
+    // in the selected stopped-seat branch; it never interprets unknown as absent.
     const finalProbe = await this.probeLiveness(
       canonicalSessionName,
       "fresh launch refuses rather than race a canonical-session collision",
     );
-    if ("code" in finalProbe) return finalProbe;
-    if (finalProbe.state === "present") {
+    if ("code" in finalProbe && !checkedStoppedCreation) return finalProbe;
+    if (!("code" in finalProbe) && finalProbe.state === "present") {
       return {
         ok: false,
         code: "unmanaged_session_collision",
@@ -1081,21 +1087,28 @@ export class SeatLifecycleService {
       };
     }
 
-    // Historical rows remain append-only but no longer look current.
-    for (const sessionId of supersededSessionIds) this.sessionRegistry.markSuperseded(sessionId);
-    this.occupantInvalidator?.invalidateRetiringOccupant({
-      retiringSessionName: canonicalSessionName,
-      successorSessionName: canonicalSessionName,
-      ...(retiringGeneration ? { retiringGeneration } : {}),
-    });
+    const retireHistory = () => {
+      // Native history commits only after atomic creation returns its own epoch.
+      for (const sessionId of supersededSessionIds) this.sessionRegistry.markSuperseded(sessionId);
+      this.occupantInvalidator?.invalidateRetiringOccupant({
+        retiringSessionName: canonicalSessionName,
+        successorSessionName: canonicalSessionName,
+        ...(retiringGeneration ? { retiringGeneration } : {}),
+      });
+    };
+    if (!checkedCreation) retireHistory();
 
     const launch = await nodeLauncher.launchNode(seat.rigId, seat.logicalId, {
       sessionName: canonicalSessionName,
       cwd: node.cwd ?? undefined,
       occupantKind: "fresh",
+      ...(checkedCreation ? { beforeNativeBinding: retireHistory } : {}),
     });
     if (!launch.ok) {
       return { ok: false, code: "launch_failed", message: launch.message };
+    }
+    if (checkedCreation) {
+      if (!launch.creation) return { ok: false, code: "attention_required", message: "Native launch did not return its creation receipt; history was preserved." };
     }
     const observedGeneration = this.sessionRegistry.currentOccupantTenure(node.id)?.generationUuid ?? null;
     const generation = observedGeneration && observedGeneration !== retiringGeneration
@@ -1582,7 +1595,9 @@ export class SeatLifecycleService {
     operator?: string | null;
     errors: string[];
   }): Promise<"zero" | "attention"> {
-    const kill = await this.tmuxAdapter.killSession(input.launch.sessionName);
+    const kill = input.launch.creation
+      ? await this.tmuxAdapter.stopCreatedSession(input.launch.creation, input.seat.nodeId)
+      : await this.tmuxAdapter.killSession(input.launch.sessionName);
     const stopped = !kill || kill.ok || kill.code === "session_not_found";
     const errors = stopped
       ? input.errors

@@ -8,12 +8,12 @@
   },
   "patch": {
     "file": "upstream.patch",
-    "sha256": "b4cf990fb8af8a4563bb000d632129bbf6ffd4edbe38222037955a1ade5841d8"
+    "sha256": "3f5b5cce3d7b7b5da5cd1c8e098655d5466f8f061eef254e6c3a7d6e44c2f04a"
   },
   "sourceManifest": {
     "file": "source-manifest.json",
-    "sha256": "fceabcee4d169a92a71cd6506a1392f4440f3383b09c97952656addf492298bb",
-    "files": 1607
+    "sha256": "cebcd078c1ae25a91be6220bf64d342b5000b74e176408dd1d7bad41722f5432",
+    "files": 1613
   },
   "license": {
     "spdx": "MIT",
@@ -24,12 +24,7 @@
   "cargoLockSHA256": "36d4f0b7c3a141c1baab7b9d1a1810a654d2438a7d084e4ff28a9657a97b6164",
   "toolchain": "1.98.0",
   "target": "x86_64-pc-windows-msvc",
-  "acceptedArtifact": {
-    "bytes": 9957888,
-    "sha256": "d7f88c4f47522e48c439415fcf6ad84241e9c472cd11be6468348d079d06391b",
-    "format": "PE AMD64",
-    "qualification": "Vendor compiler artifact only; residual unknown. No native OpenRig app, lifecycle or QA qualification; not distributed by this repository."
-  },
+  "acceptedArtifact": null,
   "buildArgv": [
     "rustup",
     "run",
@@ -46,5 +41,6 @@
     "--bin",
     "psmux"
   ],
-  "reproducibility": "Exact source reconstruction, not a promise of byte-identical binaries across toolchains/environments."
+  "reproducibility": "Exact source reconstruction, not a promise of byte-identical binaries across toolchains/environments.",
+  "artifactStatus": "No independently accepted binary for this checked-input/checked-create source. Binary-only verification/setup refuses until current artifact metadata is accepted. Historical B artifact is not eligible."
 }

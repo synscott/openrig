@@ -1,3 +1,296 @@
+diff --git a/src/checked_create.rs b/src/checked_create.rs
+new file mode 100644
+--- /dev/null
++++ b/src/checked_create.rs
+@@ -0,0 +1,125 @@
++//! Scoped managed cold creation. No absence inference, warm claim or name cleanup.
++use std::{collections::{BTreeMap,HashSet},io::{self,Read,Write},path::{Path,PathBuf},time::{Duration,Instant}};
++use serde::{Serialize,Deserialize};
++pub(crate) const MAX_REQUEST:usize=1024*1024;
++fn invalid()->io::Error{io::Error::new(io::ErrorKind::InvalidInput,"checked creation unknown")}
++
++fn unique_env<'de,D:serde::Deserializer<'de>>(d:D)->Result<BTreeMap<String,String>,D::Error>{
++ struct Visitor;
++ impl<'de> serde::de::Visitor<'de> for Visitor{
++  type Value=BTreeMap<String,String>;
++  fn expecting(&self,f:&mut std::fmt::Formatter)->std::fmt::Result{f.write_str("unique environment map")}
++  fn visit_map<M:serde::de::MapAccess<'de>>(self,mut m:M)->Result<Self::Value,M::Error>{
++   let mut map=BTreeMap::new();let mut keys=HashSet::new();
++   while let Some((key,value))=m.next_entry::<String,String>()?{
++    if !keys.insert(key.to_ascii_lowercase()){return Err(serde::de::Error::custom("duplicate environment name"))}
++    map.insert(key,value);
++   }Ok(map)
++  }
++ }d.deserialize_map(Visitor)
++}
++#[derive(Debug,Serialize,Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct Request{pub version:u8,pub attempt:String,pub name:String,pub cwd:String,#[serde(deserialize_with="unique_env")]pub env:BTreeMap<String,String>,pub unset:Vec<String>}
++fn component(s:&str)->bool{!s.is_empty()&&s.len()<=128&&s.as_bytes()[0].is_ascii_alphanumeric()&&s.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b"_.@-".contains(&b))}
++fn uuid(s:&str)->bool{s.len()==36&&s.bytes().enumerate().all(|(i,b)|if [8,13,18,23].contains(&i){b==b'-'}else{b.is_ascii_digit()||(b'a'..=b'f').contains(&b)})&&s.as_bytes()[14]==b'4'&&b"89ab".contains(&s.as_bytes()[19])}
++fn reserved(s:&str)->bool{let s=s.to_ascii_uppercase();s.starts_with("PSMUX_")||["SYSTEMROOT","WINDIR","COMSPEC"].contains(&s.as_str())}
++fn env_name(s:&str)->bool{!s.is_empty()&&!s.contains(['=','\0'])&&s.len()<=32767}
++pub(crate) fn validate(r:&Request)->io::Result<()>{
++ if r.version!=1||!uuid(&r.attempt)||!component(&r.name)||!Path::new(&r.cwd).is_absolute()||!Path::new(&r.cwd).is_dir()||r.env.len()>4096||r.unset.len()>4096{return Err(invalid())}
++ let mut keys=HashSet::new();
++ for (key,value) in &r.env{if !env_name(key)||reserved(key)||value.contains('\0')||!keys.insert(key.to_ascii_lowercase()){return Err(invalid())}}
++ keys.clear();for key in &r.unset{if !env_name(key)||reserved(key)||!keys.insert(key.to_ascii_lowercase()){return Err(invalid())}}
++ if serde_json::to_vec(r).map_err(|_|invalid())?.len()>MAX_REQUEST{return Err(invalid())}Ok(())
++}
++pub(crate) fn decode(bytes:&[u8])->io::Result<Request>{if bytes.len()>MAX_REQUEST{return Err(invalid())}let r=serde_json::from_slice(bytes).map_err(|_|invalid())?;validate(&r)?;Ok(r)}
++fn read_request(path:&Path)->io::Result<(Request,Vec<u8>)>{
++ no_redirect(path)?;if !std::fs::metadata(path)?.is_file(){return Err(invalid())}let mut bytes=Vec::new();std::fs::File::open(path)?.take(MAX_REQUEST as u64+1).read_to_end(&mut bytes)?;Ok((decode(&bytes)?,bytes))
++}
++fn no_redirect(path:&Path)->io::Result<()>{
++ if !path.is_absolute(){return Err(invalid())}
++ for part in path.ancestors(){let m=std::fs::symlink_metadata(part)?;if m.file_type().is_symlink(){return Err(invalid())}
++  #[cfg(windows)]{use std::os::windows::fs::MetadataExt;if m.file_attributes()&0x400!=0{return Err(invalid())}}
++ }Ok(())
++}
++fn path_key(path:&Path)->String{let s=path.to_string_lossy();let s=s.strip_prefix(r"\\?\").unwrap_or(&s);if cfg!(windows){s.replace('\\',"/").trim_end_matches('/').to_lowercase()}else{s.to_string()}}
++fn root()->io::Result<(PathBuf,String)>{let path=PathBuf::from(std::env::var_os("PSMUX_DATA_DIR").ok_or_else(invalid)?);no_redirect(&path)?;if !path.is_dir(){return Err(invalid())}let canonical=path.canonicalize()?;if path_key(&canonical)!=path_key(&path){return Err(invalid())}let key=path_key(&canonical);Ok((canonical,key))}
++
++#[derive(Clone,Debug,PartialEq,Eq)]pub(crate) struct SpawnIdentity{pub pid:u32,pub birth:u64}
++#[derive(Clone,Debug,Serialize,Deserialize)]#[serde(deny_unknown_fields)]
++pub(crate) struct Ready{pub version:u8,pub status:String,pub attempt:String,pub name:String,pub root:String,pub pid:String,pub birth:String,pub sid:Option<String>,pub pane:Option<String>}
++fn decimal(s:&str)->bool{!s.is_empty()&&s.bytes().all(|b|b.is_ascii_digit())}
++pub(crate) fn qualify(r:&Request,root:&str,spawn:&SpawnIdentity,ready:&Ready)->io::Result<()>{
++ if ready.version!=1||ready.attempt!=r.attempt||ready.name!=r.name||ready.root!=root||ready.pid!=spawn.pid.to_string()||ready.birth!=spawn.birth.to_string()||spawn.pid==0||spawn.birth==0{return Err(invalid())}
++ match ready.status.as_str(){
++ "created"=>{if !ready.sid.as_deref().is_some_and(decimal)||!ready.pane.as_deref().and_then(|p|p.strip_prefix('%')).is_some_and(decimal){return Err(invalid())}},
++ "collision"=>{if ready.sid.is_some()||ready.pane.is_some(){return Err(invalid())}},
++ _=>return Err(invalid())}Ok(())
++}
++pub(crate) enum Outcome{Created{sid:String,pid:String,birth:String,pane:String},Collision,Unknown(Option<SpawnIdentity>)}
++impl Outcome{
++ fn code(&self)->i32{match self{Self::Created{..}=>0,Self::Collision=>2,Self::Unknown(_)=>3}}
++ pub(crate) fn output(&self,r:&Request)->serde_json::Value{match self{
++ Self::Created{sid,pid,birth,pane}=>serde_json::json!({"version":1,"status":"created","attempt":r.attempt,"name":r.name,"sid":sid,"pid":pid,"birth":birth,"pane":pane}),
++ Self::Collision=>serde_json::json!({"version":1,"status":"collision","attempt":r.attempt,"name":r.name}),
++ Self::Unknown(spawn)=>serde_json::json!({"version":1,"status":"unknown","attempt":r.attempt,"name":r.name,"pid":spawn.as_ref().map(|s|s.pid.to_string()),"birth":spawn.as_ref().map(|s|s.birth.to_string())})}}
++}
++#[derive(Debug,PartialEq,Eq)]pub(crate) enum LockDecision{Owned,Collision,Unknown}
++pub(crate) fn strict_lock_decision(code:u32)->LockDecision{match code{0=>LockDecision::Owned,0x102=>LockDecision::Collision,_=>LockDecision::Unknown}}
++
++// Consistency checksum for a trusted, exclusively staged request, not a MAC or
++// authentication boundary. Actor receipt ownership uses original OS spawn identity.
++fn checksum(bytes:&[u8])->String{use std::hash::{Hash,Hasher};let mut h=std::collections::hash_map::DefaultHasher::new();bytes.hash(&mut h);format!("{:016x}",h.finish())}
++fn attempt_dir(root:&Path,r:&Request)->PathBuf{root.join("openrig-create-attempts").join(&r.attempt)}
++fn write_ready(path:&Path,ready:&Ready)->io::Result<()>{
++ let parent=path.parent().ok_or_else(invalid)?;no_redirect(parent)?;
++ if std::fs::symlink_metadata(path).is_ok(){return Err(invalid())}
++ let pending=parent.join("ready.pending");let mut f=std::fs::OpenOptions::new().write(true).create_new(true).open(&pending)?;
++ serde_json::to_writer(&mut f,ready).map_err(|_|invalid())?;f.write_all(b"\n")?;f.sync_all()?;drop(f);std::fs::rename(pending,path)
++}
++fn apply_environment(r:&Request){for key in &r.unset{std::env::remove_var(key)}for(key,value)in &r.env{std::env::set_var(key,value)}}
++pub(crate) struct Context{pub request:Request,pub root:String,pub receipt:PathBuf}
++impl Context{
++ pub(crate) fn ready(&self,app:&crate::types::AppState)->io::Result<()>{
++  let id=crate::checked_stop::Identity::own(app.session_id).ok_or_else(invalid)?;
++  let window=app.windows.first().ok_or_else(invalid)?;let pane=crate::tree::get_active_pane_id(&window.root,&window.active_path).ok_or_else(invalid)?;
++  write_ready(&self.receipt,&Ready{version:1,status:"created".into(),attempt:self.request.attempt.clone(),name:self.request.name.clone(),root:self.root.clone(),pid:id.pid.to_string(),birth:id.birth.to_string(),sid:Some(id.sid.to_string()),pane:Some(format!("%{pane}"))})
++ }
++}
++pub(crate) fn child(file:&Path,wanted:&str,receipt:&Path,namespace:Option<String>)->io::Result<()>{
++ let(r,bytes)=read_request(file)?;if checksum(&bytes)!=wanted{return Err(invalid())}if namespace.as_deref().is_some_and(|n|!component(n)){return Err(invalid())}
++ let(root_path,root_key)=root()?;if receipt!=attempt_dir(&root_path,&r).join("ready.json"){return Err(invalid())}no_redirect(receipt.parent().ok_or_else(invalid)?)?;
++ let base=crate::session::namespaced_session_base(namespace.as_deref(),&r.name);
++ let guard=match crate::platform::acquire_checked_session_mutex(&base){
++  Ok(g)=>g,
++  Err(LockDecision::Collision)=>{let pid=std::process::id();let birth=crate::platform::process_kill::process_creation_time(pid).filter(|b|*b!=0).ok_or_else(invalid)?;return write_ready(receipt,&Ready{version:1,status:"collision".into(),attempt:r.attempt,name:r.name,root:root_key,pid:pid.to_string(),birth:birth.to_string(),sid:None,pane:None})},
++  Err(_)=>return Err(invalid())};
++ // Existing registry of any kind is unresolved, never stale-pruned by creation.
++ for path in [crate::paths::port_file(&base),crate::paths::key_file(&base),crate::paths::sid_file(&base),crate::paths::pid_file(&base)]{
++  match std::fs::symlink_metadata(path){Err(e)if e.kind()==io::ErrorKind::NotFound=>{},_=>return Err(invalid())}
++ }
++ apply_environment(&r);std::env::set_var("PSMUX_NO_WARM","1");
++ let name=r.name.clone();let cwd=r.cwd.clone();let context=Context{request:r,root:root_key,receipt:receipt.into()};
++ crate::server::run_managed_server(name,namespace,cwd,guard,context)
++}
++pub(crate) fn run(file:&Path,namespace:Option<String>)->i32{
++ let start=Instant::now();let Ok((r,bytes))=read_request(file)else{return 3};let mut original=None;
++ let result=(||->io::Result<Outcome>{
++  if namespace.as_deref().is_some_and(|n|!component(n)){return Err(invalid())}
++  let(root_path,root_key)=root()?;let attempts=root_path.join("openrig-create-attempts");
++  match std::fs::create_dir(&attempts){Ok(())=>{},Err(e)if e.kind()==io::ErrorKind::AlreadyExists=>{},Err(e)=>return Err(e)}no_redirect(&attempts)?;
++  let dir=attempt_dir(&root_path,&r);std::fs::create_dir(&dir)?;no_redirect(&dir)?;let receipt=dir.join("ready.json");
++  let mut args=vec!["checked-create-server".into(),"--file".into(),file.to_string_lossy().into_owned(),"--checksum".into(),checksum(&bytes),"--receipt".into(),receipt.to_string_lossy().into_owned()];
++  if let Some(ns)=&namespace{args.splice(0..0,["-L".into(),ns.clone()]);}
++  apply_environment(&r);
++  let spawned=crate::platform::spawn_checked_server_hidden(&std::env::current_exe()?,&args)?;
++  let identity=SpawnIdentity{pid:spawned.pid,birth:spawned.birth};original=Some(identity.clone());
++  while start.elapsed()<Duration::from_secs(30){
++   if receipt.exists(){no_redirect(&receipt)?;let mut data=Vec::new();std::fs::File::open(&receipt)?.take(4097).read_to_end(&mut data)?;if data.len()>4096{return Err(invalid())}let ready:Ready=serde_json::from_slice(&data).map_err(|_|invalid())?;qualify(&r,&root_key,&identity,&ready)?;
++    return if ready.status=="collision"{Ok(Outcome::Collision)}else{Ok(Outcome::Created{sid:ready.sid.ok_or_else(invalid)?,pid:ready.pid,birth:ready.birth,pane:ready.pane.ok_or_else(invalid)?})}
++   }std::thread::sleep(Duration::from_millis(10));
++  }Err(invalid())
++ })();
++ let outcome=result.unwrap_or(Outcome::Unknown(original));let code=outcome.code();println!("{}",outcome.output(&r));let _=io::stdout().flush();code
++}
++#[cfg(test)]#[path="../tests-rs/test_checked_create.rs"]mod tests;
+diff --git a/src/checked_input.rs b/src/checked_input.rs
+new file mode 100644
+--- /dev/null
++++ b/src/checked_input.rs
+@@ -0,0 +1,156 @@
++//! OpenRig checked input v1. Same actor + original pane writer, never PID injection.
++//! Derived from psmux 20aa1d7; upstream MIT attribution retained.
++use std::io::{self,Read,Write};
++use std::path::PathBuf;
++use std::time::Duration;
++use base64::Engine;
++use crate::checked_stop::Identity;
++
++pub(crate) const CAPABILITIES:&str="OPENRIG-PSMUX 1 checked-input-v1 checked-create-v1 checked-stop-v1 observe-v1 lazy-session\n";
++pub(crate) const COMPLETE:&[u8]=b"CHECKED-INPUT COMPLETE\n";
++pub(crate) const REJECTED:&[u8]=b"CHECKED-INPUT REJECTED\n";
++pub(crate) const UNKNOWN:&[u8]=b"CHECKED-INPUT UNKNOWN\n";
++pub(crate) const MAX_FILE:usize=1024*1024;
++pub(crate) const MAX_ENCODED:usize=16*1024*1024;
++pub(crate) const MAX_WIRE:usize=8*1024*1024+4096;
++fn invalid()->io::Error{io::Error::new(io::ErrorKind::InvalidInput,"checked input invalid")}
++#[derive(Clone,Copy,Debug,PartialEq,Eq)]
++pub(crate) enum Mode{Raw,Bracketed,Codex,CodexClear,CopyCancel,Keys,Auto}
++impl Mode{
++ fn parse(s:&str)->Option<Self>{Some(match s{"raw"=>Self::Raw,"bracketed"=>Self::Bracketed,"codex"=>Self::Codex,"codex-clear"=>Self::CodexClear,"copy-cancel"=>Self::CopyCancel,"keys"=>Self::Keys,"auto"=>Self::Auto,_=>return None})}
++ fn name(self)->&'static str{match self{Self::Raw=>"raw",Self::Bracketed=>"bracketed",Self::Codex=>"codex",Self::CodexClear=>"codex-clear",Self::CopyCancel=>"copy-cancel",Self::Keys=>"keys",Self::Auto=>"auto"}}
++}
++#[derive(Clone,Debug,PartialEq,Eq)]
++pub(crate) enum Payload{Text(String),Keys(Vec<String>),None}
++#[derive(Clone,Debug,PartialEq,Eq)]
++pub(crate) struct Request{pub expected:Identity,pub pane:usize,pub mode:Mode,pub payload:Payload}
++#[derive(Debug,PartialEq,Eq)]
++pub(crate) struct Invocation{pub expected:Identity,pub pane:usize,pub mode:Mode,pub file:Option<PathBuf>}
++fn pane_id(s:&str)->Option<usize>{let n=s.strip_prefix('%')?;if n.is_empty()||!n.bytes().all(|b|b.is_ascii_digit()){return None}n.parse().ok()}
++pub(crate) fn parse_cli(tail:&[&str])->Option<Invocation>{
++ if tail.len()%2!=0{return None}
++ let(mut sid,mut server,mut pane,mut mode,mut file)=(None,None,None,None,None);
++ for pair in tail.chunks_exact(2){match pair[0]{
++ "--session" if sid.is_none()=>sid=Some(pair[1]),
++ "--server" if server.is_none()=>server=Some(pair[1]),
++ "--pane" if pane.is_none()=>pane=Some(pair[1]),
++ "--mode" if mode.is_none()=>mode=Some(pair[1]),
++ "--file" if file.is_none()=>file=Some(PathBuf::from(pair[1])),
++ _=>return None}}
++ let(pid,birth)=server?.split_once(':')?;let expected=Identity::parse(sid?,pid,birth)?;
++ let mode=Mode::parse(mode?)?;let pane=pane_id(pane?)?;
++ if matches!(mode,Mode::CodexClear|Mode::CopyCancel){if file.is_some(){return None}}else if !file.as_ref()?.is_absolute(){return None}
++ Some(Invocation{expected,pane,mode,file})
++}
++fn validate(r:&Request)->io::Result<()>{
++ if r.expected.pid==0||r.expected.birth==0{return Err(invalid())}
++ match(&r.mode,&r.payload){
++ (Mode::Keys,Payload::Keys(keys))if keys.len()<=4096&&keys.iter().all(|k|k.len()<=4096)&&keys.iter().map(String::len).sum::<usize>()<=MAX_FILE=>{},
++ (Mode::CodexClear|Mode::CopyCancel,Payload::None)=>{},
++ (Mode::Raw|Mode::Bracketed|Mode::Codex|Mode::Auto,Payload::Text(s))if s.len()<=MAX_FILE=>{},
++ _=>return Err(invalid())}Ok(())
++}
++fn decode_payload(mode:Mode,bytes:&[u8])->io::Result<Payload>{
++ if bytes.len()>MAX_FILE{return Err(invalid())}
++ if mode==Mode::Keys{Ok(Payload::Keys(serde_json::from_slice::<Vec<String>>(bytes).map_err(|_|invalid())?))}
++ else{Ok(Payload::Text(String::from_utf8(bytes.to_vec()).map_err(|_|invalid())?))}
++}
++pub(crate) fn load(i:Invocation)->io::Result<Request>{
++ let payload=if matches!(i.mode,Mode::CodexClear|Mode::CopyCancel){Payload::None}else{
++  let file=std::fs::File::open(i.file.ok_or_else(invalid)?)?;let mut bytes=Vec::new();file.take(MAX_FILE as u64+1).read_to_end(&mut bytes)?;decode_payload(i.mode,&bytes)?};
++ let r=Request{expected:i.expected,pane:i.pane,mode:i.mode,payload};validate(&r)?;Ok(r)
++}
++#[derive(serde::Serialize,serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Wire{session:String,server:String,pane:String,mode:String,payload:serde_json::Value}
++pub(crate) fn wire(r:&Request)->io::Result<String>{
++ validate(r)?;
++ let payload=match &r.payload{Payload::Text(s)=>serde_json::json!(s),Payload::Keys(k)=>serde_json::json!(k),Payload::None=>serde_json::Value::Null};
++ let bytes=serde_json::to_vec(&Wire{session:r.expected.sid.to_string(),server:format!("{}:{}",r.expected.pid,r.expected.birth),pane:format!("%{}",r.pane),mode:r.mode.name().into(),payload}).map_err(|_|invalid())?;
++ let value=base64::engine::general_purpose::STANDARD.encode(bytes);if value.len()>MAX_WIRE{return Err(invalid())}Ok(value)
++}
++pub(crate) fn parse_wire(s:&str)->io::Result<Request>{
++ if s.len()>MAX_WIRE{return Err(invalid())}
++ let bytes=base64::engine::general_purpose::STANDARD.decode(s).map_err(|_|invalid())?;
++ let w:Wire=serde_json::from_slice(&bytes).map_err(|_|invalid())?;
++ let(pid,birth)=w.server.split_once(':').ok_or_else(invalid)?;
++ let expected=Identity::parse(&w.session,pid,birth).ok_or_else(invalid)?;
++ let mode=Mode::parse(&w.mode).ok_or_else(invalid)?;let pane=pane_id(&w.pane).ok_or_else(invalid)?;
++ let payload=match mode{
++ Mode::CodexClear|Mode::CopyCancel if w.payload.is_null()=>Payload::None,
++ Mode::Keys=>Payload::Keys(serde_json::from_value(w.payload).map_err(|_|invalid())?),
++ Mode::Raw|Mode::Bracketed|Mode::Codex|Mode::Auto=>Payload::Text(w.payload.as_str().ok_or_else(invalid)?.to_string()),
++ _=>return Err(invalid())};
++ let r=Request{expected,pane,mode,payload};validate(&r)?;Ok(r)
++}
++pub(crate) fn auto_mode(command:&str)->Mode{
++ // OSC may supply a quoted command line or an executable-only path with spaces.
++ // Reuse the vendor Windows-aware tokenizer for command lines; do not split a
++ // complete unquoted .exe path merely because its directory contains spaces.
++ let command=command.trim();
++ let parsed=crate::commands::parse_command_line(command);
++ let whole_executable=!command.starts_with(['\"','\'']) && command.to_ascii_lowercase().ends_with(".exe");
++ let token=if whole_executable{command}else{parsed.first().map(String::as_str).unwrap_or("")};
++ let name=token.rsplit(['\\','/']).next().unwrap_or("").to_ascii_lowercase();
++ match name.strip_suffix(".exe").unwrap_or(&name){"pwsh"|"powershell"=>Mode::Raw,"codex"|"codex-code-mode-host"=>Mode::Codex,_=>Mode::Bracketed}
++}
++pub(crate) struct Encoded{pub bytes:Vec<u8>,pub win32:bool}
++pub(crate) fn encode(r:&Request,command:&str)->io::Result<Encoded>{
++ validate(r)?;let mode=if r.mode==Mode::Auto{auto_mode(command)}else{r.mode};let mut bytes=Vec::new();let mut win32=false;
++ match(mode,&r.payload){
++ (Mode::Raw,Payload::Text(s))=>bytes.extend_from_slice(s.as_bytes()),
++ (Mode::Bracketed,Payload::Text(s))=>{bytes.extend_from_slice(b"\x1b[200~");bytes.extend_from_slice(s.as_bytes());bytes.extend_from_slice(b"\x1b[201~");},
++ (Mode::Codex,Payload::Text(s))=>{win32=true;for c in s.encode_utf16(){let(vk,uc,ctrl)=if c==10{(13,13,16)}else{(0,c,0)};bytes.extend_from_slice(crate::input::win32_input_key_seq(vk,0,uc,ctrl).as_bytes());if bytes.len()>MAX_ENCODED{return Err(invalid())}}},
++ (Mode::CodexClear,Payload::None)=>{win32=true;bytes.extend_from_slice(crate::input::win32_input_key_seq(85,0,21,8).as_bytes());},
++ (Mode::Keys,Payload::Keys(keys))=>{
++  use crossterm::event::{KeyCode,KeyEvent,KeyModifiers};
++  for key in keys{
++   if let Some((code,mods))=if key.trim()==key {crate::config::parse_key_string(key)}else{None}{
++    if let KeyCode::Char(c)=code{if c.is_ascii_alphabetic()&&mods==KeyModifiers::CONTROL{win32=true;let uc=crate::input::ctrl_char_send_keys_byte(c).ok_or_else(invalid)?;bytes.extend_from_slice(crate::input::win32_input_key_seq(c.to_ascii_uppercase()as u16,0,uc as u16,8).as_bytes());continue;}}
++    let encoded=crate::input::encode_key_event(&KeyEvent::new(code,mods)).ok_or_else(invalid)?;bytes.extend_from_slice(&encoded);
++   }else{bytes.extend_from_slice(key.as_bytes());}
++   if bytes.len()>MAX_ENCODED{return Err(invalid())}
++  }},
++ (Mode::CopyCancel,Payload::None)=>{},
++ _=>return Err(invalid())}
++ if bytes.len()>MAX_ENCODED{return Err(invalid())}Ok(Encoded{bytes,win32})
++}
++fn selected_pane(app:&mut crate::types::AppState,id:usize)->Option<&mut crate::types::Pane>{
++ fn walk(node:&mut crate::types::Node,id:usize)->Option<&mut crate::types::Pane>{match node{crate::types::Node::Leaf(p)if p.id==id=>Some(p),crate::types::Node::Split{children,..}=>children.iter_mut().find_map(|n|walk(n,id)),_=>None}}
++ for w in &mut app.windows{if let Some(p)=walk(&mut w.root,id){return Some(p)}for f in &mut w.floating{if f.pane.id==id{return Some(&mut f.pane)}}}None
++}
++fn pane_command(p:&crate::types::Pane)->String{
++ if let Ok(parser)=p.term.lock(){if let Some(cmd)=parser.screen().shell_command(){return cmd.to_string()}}
++ p.child_pid.and_then(crate::platform::process_info::get_deepest_foreground_process_name_fresh).unwrap_or_default()
++}
++pub(crate) fn apply<W:Write>(app:&mut crate::types::AppState,r:&Request,reply:&mut W,birth:impl FnOnce(u32)->Option<u64>)->io::Result<()>{
++ let pid=std::process::id();let actual=birth(pid).filter(|b|*b!=0).map(|birth|Identity{sid:app.session_id,pid,birth});
++ if actual!=Some(r.expected)||validate(r).is_err(){reply.write_all(REJECTED)?;return reply.flush()}
++ let active=app.windows.get(app.active_idx).filter(|w|w.floating_focus.is_none()).and_then(|w|crate::tree::get_active_pane_id(&w.root,&w.active_path));
++ let pane=match selected_pane(app,r.pane){Some(p)if !p.dead&&p.accepts_input()=>p,_=>{reply.write_all(REJECTED)?;return reply.flush()}};
++ if r.mode==Mode::CopyCancel{
++  pane.copy_state=None;pane.leave_copy_snapshot();if let Ok(mut parser)=pane.term.lock(){parser.screen_mut().set_scrollback(0);}
++  if active==Some(r.pane)&&app.mode.in_copy(){crate::copy_mode::exit_copy_mode(app);}
++  reply.write_all(COMPLETE)?;return reply.flush()
++ }
++ let command=if r.mode==Mode::Auto{pane_command(pane)}else{String::new()};
++ let encoded=match encode(r,&command){Ok(e)=>e,Err(_)=>{reply.write_all(REJECTED)?;return reply.flush()}};
++ let result=pane.writer.write_all(&encoded.bytes).and_then(|_|pane.writer.flush());
++ if result.is_ok(){if encoded.win32{pane.win32_input_latched=true;}reply.write_all(COMPLETE)?;}else{reply.write_all(UNKNOWN)?;}
++ reply.flush()
++}
++pub(crate) fn read_result(reader:&mut impl Read)->io::Result<()>{
++ let mut bytes=Vec::new();reader.take(65).read_to_end(&mut bytes)?;
++ if bytes==[b"OK\n".as_slice(),COMPLETE].concat(){return Ok(())}
++ if bytes==[b"OK\n".as_slice(),REJECTED].concat(){return Err(io::Error::new(io::ErrorKind::PermissionDenied,"checked input rejected"))}
++ Err(io::Error::new(io::ErrorKind::InvalidData,"checked input completion unknown"))
++}
++pub(crate) fn send(route:&str,r:&Request)->io::Result<()>{
++ let port=std::fs::read_to_string(crate::paths::port_file(route))?.trim().parse::<u16>().map_err(|_|invalid())?;
++ let key=crate::session::read_session_key(route)?;let command=format!("openrig-input-v1 {}\n",wire(r)?);
++ let mut stream=crate::session::open_authed_checked(&format!("127.0.0.1:{}",port),&key,command.as_bytes(),Duration::from_secs(1),Duration::from_secs(3)).ok_or_else(||io::Error::new(io::ErrorKind::Other,"checked input transport unknown"))?;
++ read_result(&mut stream)
++}
++#[cfg(test)]
++#[path="../tests-rs/test_checked_input.rs"]
++mod tests;
+diff --git a/src/checked_stop.rs b/src/checked_stop.rs
+new file mode 100644
 --- /dev/null
 +++ b/src/checked_stop.rs
 @@ -0,0 +1,203 @@
@@ -204,6 +497,7 @@
 +        assert!(perform(original(), Some(original()), &mut Broken, || {}).is_err());
 +    }
 +}
+diff --git a/src/cli.rs b/src/cli.rs
 --- a/src/cli.rs
 +++ b/src/cli.rs
 @@ -56,7 +56,7 @@
@@ -224,6 +518,7 @@
      ("list-sessions",         "ls",         "F:f:O:r"),
      ("list-windows",          "lsw",        "aF:f:O:rt:"),
      ("load-buffer",           "loadb",      "b:t:w"),
+diff --git a/src/format.rs b/src/format.rs
 --- a/src/format.rs
 +++ b/src/format.rs
 @@ -1606,6 +1606,8 @@
@@ -244,17 +539,32 @@
          // Namespace-scoped identity (issue #509): constant for the life of this
          // `-L` namespace's server set, and different after a genuine restart.
          // Every server in the namespace reads the same token, so the value does
+diff --git a/src/input.rs b/src/input.rs
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -2315,7 +2315,7 @@
+ /// Terminal sends and conhost's input state machine parses:
+ /// `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, with `Kd` 1 for the press and 0 for
+ /// the release.
+-#[cfg(windows)]
++// Pure encoding is shared with checked input and cross-platform source tests.
+ pub(crate) fn win32_input_key_seq(vk: u16, scan: u16, uchar: u16, ctrl_state: u32) -> String {
+     format!(
+         "\x1b[{};{};{};1;{};1_\x1b[{};{};{};0;{};1_",
+diff --git a/src/main.rs b/src/main.rs
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -3,6 +3,7 @@
+@@ -3,6 +3,9 @@
  #![allow(dead_code)]
  
  mod types;
 +mod checked_stop;
++mod checked_input;
++mod checked_create;
  mod platform;
  mod cli;
  mod session;
-@@ -865,7 +866,6 @@
+@@ -865,7 +868,6 @@
  }
  
  fn main() {
@@ -262,7 +572,7 @@
      if let Err(e) = run_main() {
          // Print a user-friendly error message instead of Rust's Debug format
          // which shows "Error: Custom { kind: Other, error: \"...\" }"  (fixes #47)
-@@ -941,6 +941,18 @@
+@@ -941,6 +943,18 @@
          let args = strings(&["psmux", "bind-key", "x", "kill-window", "-t", "child"]);
          let command = process_command_index(&args).unwrap();
          assert_eq!(process_target_position(&args, command), None);
@@ -281,12 +591,16 @@
      }
  
      #[test]
-@@ -1122,6 +1134,93 @@
+@@ -1122,6 +1136,126 @@
      std::process::exit(1);
  }
  
 +#[derive(Debug, PartialEq, Eq)]
 +enum CheckedEntry {
++    Capabilities,
++    Create { file:std::path::PathBuf, namespace:Option<String> },
++    CreateServer { file:std::path::PathBuf, checksum:String, receipt:std::path::PathBuf, namespace:Option<String> },
++    Input { invocation: crate::checked_input::Invocation, namespace: Option<String> },
 +    Stop { expected: crate::checked_stop::Identity, namespace: Option<String> },
 +    Observe { route: String, pane: Option<String> },
 +}
@@ -300,12 +614,16 @@
 +    let chained = args[index..].iter().any(separator);
 +    let commands: Vec<Vec<String>> = args[index..].split(separator)
 +        .filter(|group| !group.is_empty()).map(|group| group.to_vec()).collect();
-+    let has_check = |command: &[String]| matches!(command.first().map(String::as_str),
-+        Some("kill-session" | "kill-ses" | "list-panes" | "lsp"))
-+        && command.iter().skip(1).any(|a| a.starts_with('-') && a[1..].contains('G'));
++    let has_check = |command: &[String]| matches!(command.first().map(String::as_str), Some("checked-input" | "openrig-capabilities" | "checked-create" | "checked-create-server"))
++        || (matches!(command.first().map(String::as_str), Some("kill-session" | "kill-ses" | "list-panes" | "lsp"))
++        && command.iter().skip(1).any(|a| a.starts_with('-') && a[1..].contains('G')));
 +    if !commands.iter().any(|command| has_check(command)) { return Ok(None); }
 +    let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "checked invocation must be one explicit supported command");
 +    if chained || commands.len() != 1 { return Err(invalid()); }
++    if commands[0][0] == "openrig-capabilities" {
++        if index != 1 || commands[0].len() != 1 { return Err(invalid()); }
++        return Ok(Some(CheckedEntry::Capabilities));
++    }
 +    let mut namespace = None; let mut outer_target = None; let mut i = 1;
 +    while i < index {
 +        if i + 1 >= index { return Err(invalid()); }
@@ -318,6 +636,20 @@
 +    }
 +    let command = &commands[0];
 +    let tail: Vec<&str> = command.iter().skip(1).map(String::as_str).collect();
++    if command[0] == "checked-create" || command[0] == "checked-create-server" {
++        if outer_target.is_some(){return Err(invalid())}
++        if command[0]=="checked-create" && tail.len()==2 && tail[0]=="--file" && std::path::Path::new(tail[1]).is_absolute(){
++            return Ok(Some(CheckedEntry::Create{file:tail[1].into(),namespace}));
++        }
++        if command[0]=="checked-create-server" && tail.len()==6 && tail[0]=="--file" && tail[2]=="--checksum" && tail[4]=="--receipt" && std::path::Path::new(tail[1]).is_absolute() && std::path::Path::new(tail[5]).is_absolute() && tail[3].len()==16 && tail[3].bytes().all(|b|b.is_ascii_hexdigit()){
++            return Ok(Some(CheckedEntry::CreateServer{file:tail[1].into(),checksum:tail[3].into(),receipt:tail[5].into(),namespace}));
++        }return Err(invalid());
++    }
++    if command[0] == "checked-input" {
++        if outer_target.is_some() { return Err(invalid()); }
++        let invocation = crate::checked_input::parse_cli(&tail).ok_or_else(invalid)?;
++        return Ok(Some(CheckedEntry::Input { invocation, namespace }));
++    }
 +    if matches!(command[0].as_str(), "kill-session" | "kill-ses") {
 +        if outer_target.is_some() { return Err(invalid()); }
 +        let expected = crate::checked_stop::parse_cli(&tail).ok_or_else(invalid)?;
@@ -360,6 +692,17 @@
 +
 +fn execute_checked_entry(plan: CheckedEntry) -> io::Result<()> {
 +    match plan {
++        CheckedEntry::Create{file,namespace}=>std::process::exit(crate::checked_create::run(&file,namespace)),
++        CheckedEntry::CreateServer{file,checksum,receipt,namespace}=>return crate::checked_create::child(&file,&checksum,&receipt,namespace),
++        CheckedEntry::Capabilities => print!("{}", crate::checked_input::CAPABILITIES),
++        CheckedEntry::Input { invocation, namespace } => {
++            let request = crate::checked_input::load(invocation)?;
++            let resolved = crate::session::resolve_session_by_id(request.expected.sid)
++                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "checked input route unavailable"))?;
++            let route = crate::session::namespaced_session_base(namespace.as_deref(), &resolved);
++            crate::checked_input::send(&route, &request)?;
++            print!("{}", std::str::from_utf8(crate::checked_input::COMPLETE).unwrap());
++        },
 +        CheckedEntry::Stop { expected, namespace } => {
 +            let resolved = crate::session::resolve_session_by_id(expected.sid)
 +                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "checked stop route unavailable"))?;
@@ -375,7 +718,7 @@
  fn run_main() -> io::Result<()> {
      // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
      // command-level `-tname` (attached target): running attached passes
-@@ -1131,6 +1230,14 @@
+@@ -1131,6 +1265,14 @@
              crate::cli::normalize_flag_equals(env::args().collect()),
          ),
      );
@@ -390,7 +733,7 @@
      // `psmux a \; b`: from here on `args` is the first command alone, which
      // decides routing and the client side target check; the whole list goes
      // to the server as one line just before dispatch (run_command_list).
-@@ -6751,3 +6858,61 @@
+@@ -6751,3 +6893,69 @@
  #[cfg(test)]
  #[path = "../tests-rs/test_ready_poll_backoff.rs"]
  mod tests_ready_poll_backoff;
@@ -452,12 +795,122 @@
 +        }
 +    }
 +}
++
++#[cfg(test)]
++#[path = "../tests-rs/test_checked_input_entry.rs"]
++mod checked_input_entry_tests;
++
++#[cfg(test)]
++#[path = "../tests-rs/test_checked_input_handler.rs"]
++mod checked_input_handler_tests;
+diff --git a/src/platform.rs b/src/platform.rs
+--- a/src/platform.rs
++++ b/src/platform.rs
+@@ -102,8 +102,17 @@
+ /// `CREATE_NEW_CONSOLE` so that ConPTY has a real console session while the
+ /// window remains invisible.  This replicates the behaviour of
+ /// `Start-Process -WindowStyle Hidden` in PowerShell.
++pub struct OwnedServer { pub pid:u32, pub birth:u64, #[cfg(windows)] handle:isize }
+ #[cfg(windows)]
+-pub fn spawn_server_hidden(exe: &std::path::Path, args: &[String]) -> std::io::Result<u32> {
++impl Drop for OwnedServer { fn drop(&mut self) { #[link(name="kernel32")] extern "system"{fn CloseHandle(h:isize)->i32;} unsafe {CloseHandle(self.handle);} } }
++#[cfg(windows)]
++pub fn spawn_server_hidden(exe:&std::path::Path,args:&[String])->std::io::Result<u32>{spawn_server_hidden_impl(exe,args,false).map(|child|child.pid)}
++#[cfg(windows)]
++pub fn spawn_checked_server_hidden(exe:&std::path::Path,args:&[String])->std::io::Result<OwnedServer>{spawn_server_hidden_impl(exe,args,true)}
++#[cfg(not(windows))]
++pub fn spawn_checked_server_hidden(_exe:&std::path::Path,_args:&[String])->std::io::Result<OwnedServer>{Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"checked creation requires Windows"))}
++#[cfg(windows)]
++fn spawn_server_hidden_impl(exe: &std::path::Path, args: &[String],require_birth:bool) -> std::io::Result<OwnedServer> {
+     #[repr(C)]
+     #[allow(non_snake_case)]
+     struct STARTUPINFOW {
+@@ -224,18 +233,15 @@
+         return Err(std::io::Error::last_os_error());
+     }
+ 
+-    // Capture the server PID before closing handles so callers can poll the
+-    // process for liveness (used by the new-session readiness gate to fail fast
+-    // if the server dies, instead of waiting out the readiness deadline).
+-    let server_pid = pi.dwProcessId;
+-
+-    // Close handles – we don't need to wait for the child.
+-    unsafe {
+-        CloseHandle(pi.hProcess);
+-        CloseHandle(pi.hThread);
+-    }
+-
+-    Ok(server_pid)
++    // Checked creation keeps the original process handle through readiness.
++    #[repr(C)] struct FileTime { low:u32, high:u32 }
++    #[link(name="kernel32")] extern "system" { fn GetProcessTimes(h:isize,c:*mut FileTime,e:*mut FileTime,k:*mut FileTime,u:*mut FileTime)->i32; }
++    let(mut created,mut exited,mut kernel,mut user)=(FileTime{low:0,high:0},FileTime{low:0,high:0},FileTime{low:0,high:0},FileTime{low:0,high:0});
++    let queried=if require_birth{unsafe{GetProcessTimes(pi.hProcess,&mut created,&mut exited,&mut kernel,&mut user)}}else{1};
++    unsafe {CloseHandle(pi.hThread);}
++    let birth=((created.high as u64)<<32)|created.low as u64;
++    if require_birth && (queried==0 || birth==0) { unsafe{CloseHandle(pi.hProcess);} return Err(std::io::Error::new(std::io::ErrorKind::Other,"spawn identity unknown")); }
++    Ok(OwnedServer{pid:pi.dwProcessId,birth,handle:pi.hProcess})
+ }
+ 
+ /// Return true while the process with `pid` is still running.
+@@ -385,6 +391,29 @@
+ /// legitimate start). psmux's duplicate-server race is a Windows-only concern.
+ #[cfg(not(windows))]
+ pub fn acquire_session_mutex(_name: &str) -> Option<SessionMutex> { Some(SessionMutex) }
++
++/// Managed creation refuses abandoned/failed acquisition before registry/SID effects.
++#[cfg(windows)]
++pub fn acquire_checked_session_mutex(name:&str)->Result<SessionMutex,crate::checked_create::LockDecision>{
++    use crate::checked_create::{strict_lock_decision,LockDecision};
++    #[link(name="kernel32")] extern "system"{
++        fn CreateMutexW(attrs:*const std::ffi::c_void,owner:i32,name:*const u16)->*mut std::ffi::c_void;
++        fn WaitForSingleObject(h:*mut std::ffi::c_void,ms:u32)->u32;
++        fn ReleaseMutex(h:*mut std::ffi::c_void)->i32;
++        fn CloseHandle(h:isize)->i32;
++    }
++    let wide:Vec<u16>=session_mutex_name(name).encode_utf16().chain(std::iter::once(0)).collect();
++    unsafe{
++        let h=CreateMutexW(std::ptr::null(),0,wide.as_ptr());if h.is_null(){return Err(LockDecision::Unknown)}
++        let code=WaitForSingleObject(h,0);
++        match strict_lock_decision(code){
++            LockDecision::Owned=>Ok(SessionMutex{handle:h}),
++            other=>{if code==0x80{ReleaseMutex(h);}CloseHandle(h as isize);Err(other)}
++        }
++    }
++}
++#[cfg(not(windows))]
++pub fn acquire_checked_session_mutex(_name:&str)->Result<SessionMutex,crate::checked_create::LockDecision>{Err(crate::checked_create::LockDecision::Unknown)}
+ 
+ /// Enable virtual terminal processing on Windows Console Host.
+ /// This is required for ANSI color codes to work in conhost.exe (legacy console).
+diff --git a/src/server/connection.rs b/src/server/connection.rs
 --- a/src/server/connection.rs
 +++ b/src/server/connection.rs
-@@ -1994,6 +1994,49 @@
+@@ -1994,6 +1994,70 @@
      }
      let parsed = crate::cli::normalize_flag_equals(parse_command_line(&effective_line));
      let raw_cmd = parsed.get(0).map(|s| s.as_str()).unwrap_or("");
++// Checked input carries only one base64 JSON token; data cannot become a
++// command list. Transfer original reply socket to the actor before alias,
++// TARGET, focus or forwarding. An auth ACK is never an input completion.
++if raw_cmd == "openrig-input-v1" {
++    let request = if !persistent && !in_command_list && parsed.len() == 2 {
++        crate::checked_input::parse_wire(&parsed[1]).ok()
++    } else { None };
++    if let Some(request) = request {
++        if let Ok(reply) = write_stream.socket().try_clone() {
++            clear_inherit(&reply);
++            if reply.set_write_timeout(Some(Duration::from_secs(2))).is_ok() {
++                let _ = tx.send(CtrlReq::CheckedInput(request, reply));
++            }
++        }
++    } else {
++        let _ = write_stream.write_all(crate::checked_input::REJECTED);
++        let _ = write_stream.flush();
++    }
++    return;
++}
++
 +// Fixed read-only epoch observation: bypass aliases, target focus, forwarding
 +// and arbitrary format execution. List ALL panes of this one answering actor;
 +// callers requiring a sole managed pane refuse additional panes/windows.
@@ -504,7 +957,7 @@
      // Check command aliases before normal dispatch
      let alias_expanded = if let Ok(map) = aliases.read() {
          map.get(raw_cmd).cloned()
-@@ -2051,6 +2094,8 @@
+@@ -2051,6 +2115,8 @@
  // Save raw -t value for relative pane targets like :.+ or :.-
  // Falls back to global_raw_target from TARGET protocol line
  let mut raw_target: Option<String> = global_raw_target.clone();
@@ -513,7 +966,7 @@
  let set_option_command = matches!(
      cmd,
      "set-option" | "set" | "set-window-option" | "setw"
-@@ -2081,6 +2126,7 @@
+@@ -2081,6 +2147,7 @@
              if let Some(v) = args.get(i+1) {
              // Issue #558: drop the '=' exact-match marker (see TARGET capture).
                  raw_target = Some(crate::cli::strip_exact_match_prefix(v).to_string());
@@ -521,7 +974,7 @@
                  // Issue #692: a window command's bare `-t 0` is a window index
                  // in the current session (tmux cmd-find.c:443), not a session
                  // name, so put the colon back before the generic parse.
-@@ -2982,12 +3028,20 @@
+@@ -2982,12 +3049,20 @@
          }
      }
      "kill-session" | "kill-ses" => {
@@ -544,7 +997,7 @@
              let port_path = crate::paths::port_file(tgt);
              let mut handled = false;
              // A differently spelled registry entry is another session: never
-@@ -6423,6 +6477,10 @@
+@@ -6423,6 +6498,10 @@
              true
          }
          "kill-session" => {
@@ -555,7 +1008,7 @@
              let _ = tx.send(CtrlReq::KillSession);
              let _ = resp_tx.send(String::new());
              true
-@@ -7005,3 +7063,7 @@
+@@ -7005,3 +7084,7 @@
  #[cfg(test)]
  #[path = "../../tests-rs/test_issue734_followup_new_session_reply.rs"]
  mod tests_issue734_followup_new_session_reply;
@@ -563,14 +1016,13 @@
 +#[cfg(test)]
 +#[path = "../../tests-rs/test_targetless_kill_session_self.rs"]
 +mod tests_targetless_kill_session_self;
+diff --git a/src/server/mod.rs b/src/server/mod.rs
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -1512,6 +1512,50 @@
-         Some(w) if w + 2 >= since_epoch => lines.map(|l| l.to_string()).filter(|l| !l.is_empty()).collect(),
-         _ => Vec::new(),
+@@ -1514,6 +1514,50 @@
      }
-+}
-+
+ }
+ 
 +// Main-owner dispatch seam. Test injection replaces ONLY the OS birth query
 +// and destructive effects; the actual AppState SID, own PID and decision/order
 +// are exercised. Production enters own teardown directly in the same turn.
@@ -613,12 +1065,68 @@
 +    // Preserve the historical handle-cleanup delay; this does
 +    // not prove descendant death or synchronous TerminateProcess.
 +    std::thread::sleep(std::time::Duration::from_millis(10));
- }
- 
++}
++
  /// Move the single-server-per-name guard (issue #2) onto `new_base` after this
-@@ -4907,31 +4951,17 @@
+ /// server's session was renamed or a warm server was claimed (issue #505).
+ ///
+@@ -1970,6 +2014,12 @@
+ 
+ 
+ pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
++    run_server_inner(session_name,socket_name,initial_command,raw_command,start_dir,window_name,init_size,group_target,env_vars,None,None)
++}
++pub(crate) fn run_managed_server(name:String,namespace:Option<String>,cwd:String,guard:crate::platform::SessionMutex,context:crate::checked_create::Context)->io::Result<()>{
++    run_server_inner(name,namespace,None,None,Some(cwd),None,None,None,vec![],Some(guard),Some(context))
++}
++fn run_server_inner(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>, strict_guard:Option<crate::platform::SessionMutex>, managed:Option<crate::checked_create::Context>) -> io::Result<()> {
+     crate::startup_trace::mark("srv.entry");
+     // From here on this process is the server: a console injection must leave
+     // it detached rather than move it into its parent's console, which for a
+@@ -2076,7 +2126,7 @@
+     // or slow registration strand another live process (issue #459). Fail-open:
+     // any FFI hiccup yields a live guard, never a blocked legitimate start.
+     // Re-keyed on every rename/claim, see rekey_session_guard (issue #505).
+-    let mut session_guard = {
++    let mut session_guard = if strict_guard.is_some() { strict_guard } else {
+         let base = app.port_file_base();
+         {
+             match crate::platform::acquire_session_mutex(&base) {
+@@ -2258,7 +2308,7 @@
+     // Only when using default shell (no custom command).
+     // For detached sessions without -x/-y, last_window_area defaults to
+     // 120x30 which is fine for the warm pane (resized later on first attach).
+-    let early_warm = if initial_command.is_none() && raw_command.is_none() && start_dir.is_none() {
++    let early_warm = if managed.is_none() && initial_command.is_none() && raw_command.is_none() && start_dir.is_none() {
+         match spawn_warm_pane(&*pty_system, &mut app) {
+             Ok(wp) => Some(wp),
+             Err(_) => None,
+@@ -2351,6 +2401,8 @@
+     if !app.warm_enabled {
+         app.warm_pane.target = 0;
+     }
++
++    if managed.is_some() { app.warm_enabled=false; app.warm_pane.target=0; app.warm_pane.kill_all(); }
+ 
+     // Update shared aliases now that config has been loaded
+     if let Ok(mut w) = shared_aliases_main.write() {
+@@ -2423,6 +2475,7 @@
+     // the initial window of a `new-session -n NAME`, matching tmux semantics
+     // and the two later `-n` paths in this file (lines ~789, ~812).
+     apply_initial_window_name(&mut app, window_name.as_deref());
++    if let Some(context)=&managed { context.ready(&app)?; }
+     // The pool is filled by the background spawner from the server loop
+     // below; nothing is spawned on this path any more, so `new-session`
+     // returns without waiting on a spare shell it does not itself need.
+@@ -4906,36 +4959,31 @@
+                         }
                      }
                  }
++                CtrlReq::CheckedInput(request, mut reply) => {
++                    let _ = crate::checked_input::apply(&mut app, &request, &mut reply,
++                        crate::platform::process_kill::process_creation_time);
++                    let _ = reply.shutdown(std::net::Shutdown::Write);
++                }
                  CtrlReq::KillSession => {
 -                    // Fire session-closed hook before cleanup
 -                    if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
@@ -658,7 +1166,15 @@
                  }
                  CtrlReq::HasSession(resp) => {
                      let _ = resp.send(true);
-@@ -8875,3 +8905,32 @@
+                 }
++                CtrlReq::RenameSession(_) if managed.is_some() => {
++                    app.status_message=Some(("managed session rename refused".into(),std::time::Instant::now(),None));state_dirty=true;
++                }
++                CtrlReq::ClaimSession(_,_,_,_,_,resp) if managed.is_some() => { let _=resp.send("ERR: managed session claim refused\n".into()); }
+                 CtrlReq::RenameSession(name) if crate::session::rename_blocker(
+                     &app.port_file_base(),
+                     &crate::session::namespaced_session_base(app.socket_name.as_deref(), &name),
+@@ -8875,3 +8923,32 @@
  #[cfg(test)]
  #[path = "../../tests-rs/test_select_pane_input_off.rs"]
  mod tests_select_pane_input_off;
@@ -691,6 +1207,7 @@
 +        assert_eq!(out, crate::checked_stop::COMPLETE);
 +    }
 +}
+diff --git a/src/session.rs b/src/session.rs
 --- a/src/session.rs
 +++ b/src/session.rs
 @@ -2198,17 +2198,39 @@
@@ -734,6 +1251,7 @@
      Some(std::io::BufReader::new(std::io::Read::take(s, MAX_AUTHED_RESPONSE_BYTES)))
  }
  
+diff --git a/src/startup_trace.rs b/src/startup_trace.rs
 --- a/src/startup_trace.rs
 +++ b/src/startup_trace.rs
 @@ -17,13 +17,13 @@
@@ -753,18 +1271,21 @@
  //!   `cli.dispatch`     argv parsed, about to act on the subcommand
  //!   `cli.warm.claimed` a warm standby server was claimed (fast path)
  //!   `cli.server.spawn` `spawn_server_hidden` returned (cold path)
+diff --git a/src/types.rs b/src/types.rs
 --- a/src/types.rs
 +++ b/src/types.rs
-@@ -3303,6 +3303,9 @@
+@@ -3303,6 +3303,10 @@
          resp: mpsc::Sender<Result<(), String>>,
      },
      KillSession,
 +    /// One-shot checked stop: the main owner owns this reply socket, so it
 +    /// flushes the actual result before exiting, without an enqueue ACK.
 +    CheckedKillSession(crate::checked_stop::Identity, std::net::TcpStream),
++    CheckedInput(crate::checked_input::Request, std::net::TcpStream),
      HasSession(mpsc::Sender<bool>),
      RenameSession(String),
      /// Claim a warm server: rename session + send response so CLI knows it's done.
+diff --git a/src/util.rs b/src/util.rs
 --- a/src/util.rs
 +++ b/src/util.rs
 @@ -53,6 +53,19 @@
@@ -795,6 +1316,345 @@
      fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
          None
      }
+diff --git a/tests-rs/test_checked_create.rs b/tests-rs/test_checked_create.rs
+new file mode 100644
+--- /dev/null
++++ b/tests-rs/test_checked_create.rs
+@@ -0,0 +1,64 @@
++use super::*;
++
++fn request() -> Request {
++    Request { version: 1, attempt: "818bff4a-3ffd-4ddb-9aed-a46593c141a8".into(), name: "seat@rig".into(), cwd: std::env::temp_dir().to_string_lossy().into(), env: Default::default(), unset: vec![] }
++}
++
++#[test]
++fn schema_refuses_duplicate_extra_and_wrong_types() {
++    let good = serde_json::to_string(&request()).unwrap();
++    assert!(decode(good.as_bytes()).is_ok());
++    for bad in [good.replacen("\"version\":1", "\"version\":1,\"version\":1", 1), good.replacen("\"version\":1", "\"version\":1,\"extra\":true", 1), good.replacen("\"version\":1", "\"version\":\"1\"", 1), good.replacen("\"env\":{}", "\"env\":{\"X\":\"1\",\"X\":\"2\"}", 1)] {
++        assert!(decode(bad.as_bytes()).is_err());
++    }
++}
++
++#[test]
++fn reserved_controls_refuse_assignments_and_removals() {
++    for key in ["PSMUX_DATA_DIR", "psmux_config_file", "PSMUX_CHECKED_CREATE", "SystemRoot"] {
++        let mut r=request(); r.env.insert(key.into(), "value".into()); assert!(validate(&r).is_err());
++        let mut r=request(); r.unset.push(key.into()); assert!(validate(&r).is_err());
++    }
++    let mut r=request(); r.unset.push("CLAUDE_CODE_SESSION_ID".into()); r.env.insert("OPENRIG_NODE_ID".into(), "literal".into()); assert!(validate(&r).is_ok());
++}
++
++#[test]
++fn managed_names_attempts_and_environment_are_bounded() {
++    for name in ["", "MixedCase", "../seat", "a/b", "__warm__", "x:y", "x\n"] {
++        let mut r=request(); r.name=name.into(); assert!(validate(&r).is_err());
++    }
++    let mut r=request(); r.attempt="not-a-uuid".into(); assert!(validate(&r).is_err());
++    let mut r=request(); r.env.insert("X".into(), "a\0b".into()); assert!(validate(&r).is_err());
++    let mut r=request(); r.unset=vec!["Path".into(), "PATH".into()]; assert!(validate(&r).is_err());
++    let mut r=request(); r.cwd="relative".into(); assert!(validate(&r).is_err());
++    assert!(decode(&vec![b' ';MAX_REQUEST+1]).is_err());
++}
++
++#[test]
++fn original_spawn_and_nonce_are_required_for_created_receipt() {
++    let r=request(); let original=SpawnIdentity{pid:123,birth:456};
++    let mut ready=Ready{version:1,status:"created".into(),attempt:r.attempt.clone(),name:r.name.clone(),root:"root".into(),pid:"123".into(),birth:"456".into(),sid:Some("7".into()),pane:Some("%1".into())};
++    assert!(qualify(&r,"root",&original,&ready).is_ok());
++    for field in 0..6 {
++        let mut wrong=ready.clone(); match field { 0=>wrong.attempt="other".into(),1=>wrong.name="sibling".into(),2=>wrong.root="other-root".into(),3=>wrong.pid="124".into(),4=>wrong.birth="457".into(),_=>wrong.pane=Some("%bad".into()) }
++        assert!(qualify(&r,"root",&original,&wrong).is_err());
++    }
++    ready.status="collision".into(); assert!(qualify(&r,"root",&original,&ready).is_err());
++    ready.sid=None;ready.pane=None;assert!(qualify(&r,"root",&original,&ready).is_ok());
++    ready.status="unknown".into(); assert!(qualify(&r,"root",&original,&ready).is_err());
++}
++
++#[test]
++fn lock_outcomes_do_not_turn_abandoned_or_failed_into_absence() {
++    assert_eq!(strict_lock_decision(0),LockDecision::Owned);
++    assert_eq!(strict_lock_decision(0x102),LockDecision::Collision);
++    for code in [0x80,0xffffffff,1] { assert_eq!(strict_lock_decision(code),LockDecision::Unknown); }
++}
++
++#[test]
++fn result_protocol_never_contains_environment_or_error_details() {
++    let mut r=request();r.env.insert("PRIVATE_VALUE".into(),"do-not-emit".into());
++    for result in [Outcome::Unknown(None),Outcome::Unknown(Some(SpawnIdentity{pid:123,birth:456})),Outcome::Collision,Outcome::Created{sid:"7".into(),pid:"123".into(),birth:"456".into(),pane:"%1".into()}] {
++        let value=result.output(&r);assert!(!value.to_string().contains("do-not-emit"));assert!(!value.to_string().contains("PRIVATE_VALUE"));assert_eq!(value["attempt"],r.attempt);
++    }
++}
+diff --git a/tests-rs/test_checked_input.rs b/tests-rs/test_checked_input.rs
+new file mode 100644
+--- /dev/null
++++ b/tests-rs/test_checked_input.rs
+@@ -0,0 +1,202 @@
++use super::*;
++use std::sync::atomic::{AtomicBool,AtomicU64,AtomicU8};
++use std::sync::{Arc,Mutex};
++use std::time::{Instant,Duration};
++use crate::types::{AppState,Node};
++const ROWS:u16=24; const COLS:u16=80; const FILL:usize=0;
++#[derive(Clone, Default)]
++struct Captured(Arc<Mutex<Vec<u8>>>);
++
++impl crate::pane::PaneInputSink for Captured {}
++
++impl std::io::Write for Captured {
++    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
++        self.0.lock().unwrap().extend_from_slice(buf);
++        Ok(buf.len())
++    }
++    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++}
++
++fn make_pane(writer: Box<dyn crate::pane::PaneInputSink>) -> crate::types::Pane {
++    let (master, _sink) = crate::util::stub_pane_pty(portable_pty::PtySize {
++        rows: ROWS,
++        cols: COLS,
++        pixel_width: 0,
++        pixel_height: 0,
++    });
++    let term = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 2000)));
++    {
++        let mut parser = term.lock().unwrap();
++        for i in 1..=FILL {
++            parser.process(format!("line{i}\r\n").as_bytes());
++        }
++    }
++    let epoch = Instant::now() - Duration::from_secs(2);
++    crate::types::Pane {
++        master,
++        writer,
++        child: crate::util::StubChild::exited(),
++        term,
++        last_rows: ROWS,
++        last_cols: COLS,
++        id: 0,
++        title: "pane0".to_string(),
++        title_locked: false,
++        child_pid: None,
++        data_version: Arc::new(AtomicU64::new(0)),
++        last_title_check: epoch,
++        last_infer_title: epoch,
++        dead: false,
++        last_text_input: None,
++        last_special_key: None,
++        vt_bridge_cache: None,
++        vti_mode_cache: None,
++        mouse_input_cache: None, win32_input_latched: false, input_off: false,
++        scroll_fg_cache: None,
++        mouse_proto_owner: None,
++        wheel_auth: None,
++        cursor_shape: Arc::new(AtomicU8::new(0)),
++        bell_pending: Arc::new(AtomicBool::new(false)),
++        cpr_pending: Arc::new(AtomicBool::new(false)),
++        color_query_pending: Arc::new(std::sync::atomic::AtomicU32::new(0)),
++        copy_state: None, live_term: None,
++        pane_style: None,
++        pane_options: Default::default(),
++        squelch_until: None,
++        output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
++        spawned_at: None,
++        start_command: String::new(),
++        cwd_hint: None,
++    }
++}
++
++fn make_window(pane: crate::types::Pane) -> crate::types::Window {
++    crate::types::Window {
++        root: Node::Leaf(pane),
++        active_path: vec![],
++        name: "w".to_string(),
++        id: 0,
++        area: ratatui::layout::Rect::new(0, 0, COLS, ROWS),
++        window_size: None,
++        window_options: Default::default(),
++        activity_flag: false,
++        bell_flag: false,
++        silence_flag: false,
++        last_output_time: Instant::now(),
++        last_seen_version: 0,
++        manual_rename: false,
++        layout_index: 0,
++        pane_mru: vec![],
++        zoom_saved: None,
++        linked_from: None,
++        floating: Vec::new(),
++        floating_focus: None,
++    }
++}
++
++
++fn request(mode:Mode,payload:Payload)->Request {Request{expected:crate::checked_stop::Identity{sid:7,pid:std::process::id(),birth:11},pane:0,mode,payload}}
++fn own_app(first:Captured,second:Captured)->AppState{
++ let mut a=AppState::new("renamed".into());a.session_id=7;
++ a.windows.push(make_window(make_pane(Box::new(first))));
++ let mut other=make_pane(Box::new(second));other.id=2;
++ let mut w=make_window(other);w.id=1;a.windows.push(w);a.active_idx=1;a.sync_input=true;a
++}
++#[test]fn cli_strict_identity_modes_and_staging(){
++ let a=["--session","7","--server","10:134368509179055469","--pane","%1","--mode","raw","--file","/private/input"];
++ assert!(parse_cli(&a).is_some());
++ for flag in ["--session","--server","--pane","--mode","--file"]{let mut b=a.to_vec();b.extend([flag,"duplicate"]);assert!(parse_cli(&b).is_none());}
++ for value in ["10:0","+10:11","10:18446744073709551616"]{let mut b=a;b[3]=value;assert!(parse_cli(&b).is_none());}
++ let mut b=a;b[5]="sibling:1";assert!(parse_cli(&b).is_none());
++ let mut b=a;b[9]="relative";assert!(parse_cli(&b).is_none());
++}
++#[test]fn wire_roundtrip_keeps_unicode_lf_bom_and_separators_as_data(){
++ let r=request(Mode::Raw,Payload::Text("\u{feff}hi\n世界😀 ; \" \0".into()));
++ let encoded=wire(&r).unwrap();assert!(!encoded.contains(';'));assert!(!encoded.contains('\n'));
++ let back=parse_wire(&encoded).unwrap();assert_eq!(back,r);
++}
++#[test]fn malformed_wire_cannot_be_an_input_request(){
++ use base64::Engine;
++ for json in [r#"{}"#,r#"{"session":"7","session":"8","server":"10:11","pane":"%1","mode":"raw","payload":"x"}"#,
++ r#"{"session":"7","server":"10:11","pane":"%1","mode":"raw","payload":"x","command":"kill-session"}"#]{
++ assert!(parse_wire(&base64::engine::general_purpose::STANDARD.encode(json)).is_err());}
++}
++#[test]fn raw_and_bracketed_preserve_exact_text(){
++ let text="\u{feff}a\nβ😀\r\n";assert_eq!(encode(&request(Mode::Raw,Payload::Text(text.into())),"").unwrap().bytes,text.as_bytes());
++ assert_eq!(encode(&request(Mode::Bracketed,Payload::Text(text.into())),"").unwrap().bytes,format!("\x1b[200~{}\x1b[201~",text).as_bytes());
++}
++#[test]fn codex_utf16_shift_return_and_clear_are_record_data(){
++ let e=encode(&request(Mode::Codex,Payload::Text("😀\n".into())),"").unwrap();
++ let expected=format!("{}{}{}",crate::input::win32_input_key_seq(0,0,0xD83D,0),crate::input::win32_input_key_seq(0,0,0xDE00,0),crate::input::win32_input_key_seq(13,0,13,16));
++ assert_eq!(e.bytes,expected.as_bytes());assert!(e.win32);
++ assert_eq!(encode(&request(Mode::CodexClear,Payload::None),"").unwrap().bytes,crate::input::win32_input_key_seq(85,0,21,8).as_bytes());
++}
++#[test]fn keys_are_ordered_literals_or_known_keys_never_options(){
++ let r=request(Mode::Keys,Payload::Keys(vec!["C-u".into(),"Enter".into(),"; kill-session".into(),"-X".into()]));
++ let e=encode(&r,"").unwrap();let expected=format!("{}\r; kill-session-X",crate::input::win32_input_key_seq(85,0,21,8));
++ assert_eq!(e.bytes,expected.as_bytes());
++}
++#[test]fn rejected_actor_epochs_have_zero_writer_effects(){
++ let first=Captured::default();let second=Captured::default();let mut app=own_app(first.clone(),second.clone());
++ let base=request(Mode::Raw,Payload::Text("private".into()));
++ for (sid,pid,birth,actualbirth) in [(8,base.expected.pid,11,Some(11)),(7,base.expected.pid+1,11,Some(11)),(7,base.expected.pid,12,Some(11)),(7,base.expected.pid,11,None)]{
++  let mut r=base.clone();r.expected=crate::checked_stop::Identity{sid,pid,birth};let mut out=Vec::new();apply(&mut app,&r,&mut out,|_|actualbirth).unwrap();assert_eq!(out,REJECTED);}
++ assert!(first.0.lock().unwrap().is_empty());assert!(second.0.lock().unwrap().is_empty());
++}
++#[test]fn actor_rename_focus_sync_never_changes_selected_writer(){
++ let first=Captured::default();let second=Captured::default();let mut app=own_app(first.clone(),second.clone());let mut out=Vec::new();
++ apply(&mut app,&request(Mode::Raw,Payload::Text("exact\nβ".into())),&mut out,|_|Some(11)).unwrap();
++ assert_eq!(out,COMPLETE);assert_eq!(*first.0.lock().unwrap(),"exact\nβ".as_bytes());assert!(second.0.lock().unwrap().is_empty());assert_eq!(app.active_idx,1);assert!(app.sync_input);
++}
++#[test]fn missing_dead_or_input_off_pane_is_not_success(){
++ for which in 0..3{let first=Captured::default();let mut a=own_app(first.clone(),Captured::default());let mut r=request(Mode::Raw,Payload::Text("x".into()));if which==0{r.pane=999}else{let p=crate::tree::find_pane_mut_by_id_global(&mut a,0).unwrap();if which==1{p.dead=true}else{p.input_off=true}};
++ let mut out=Vec::new();apply(&mut a,&r,&mut out,|_|Some(11)).unwrap();assert_eq!(out,REJECTED);assert!(first.0.lock().unwrap().is_empty());}
++}
++#[test]fn automatic_mode_is_only_encoding_not_target_choice(){
++ for (command,mode)in[("pwsh.exe",Mode::Raw),("powershell",Mode::Raw),("codex",Mode::Codex),("codex-code-mode-host.exe",Mode::Codex),("other",Mode::Bracketed)]{
++ assert_eq!(auto_mode(command),mode);}
++}
++#[test]fn automatic_mode_accepts_quoted_commands_and_executable_paths_with_spaces(){
++ for (command,mode) in [
++  (r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo"#,Mode::Raw),
++  (r#""C:\Program Files\Codex\codex.exe" --session test"#,Mode::Codex),
++  (r"C:\Program Files\PowerShell\7\pwsh.exe",Mode::Raw),
++  (r"C:\Program Files\Codex\codex.exe",Mode::Codex),
++  (r#"'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile"#,Mode::Raw),
++  (r#""C:\Program Files\Other\other.exe" --pwsh"#,Mode::Bracketed),
++ ]{assert_eq!(auto_mode(command),mode,"{command}");}
++}
++#[test]fn only_authenticated_exact_completion_is_success(){
++ for bytes in [b"".as_slice(),b"OK\n",COMPLETE,b"OK\nCHECKED-INPUT COMPLETE",b"OK\nCHECKED-INPUT COMPLETE\nextra",b"OK\nCHECKED-INPUT UNKNOWN\n",b"OK\nCHECKED-INPUT REJECTED\n"]{assert!(read_result(&mut &bytes[..]).is_err());}
++ assert!(read_result(&mut &b"OK\nCHECKED-INPUT COMPLETE\n"[..]).is_ok());
++}
++
++#[test]fn file_decode_is_strict_and_bom_text_is_data(){
++ assert!(decode_payload(Mode::Raw,b"\xff").is_err());
++ assert_eq!(decode_payload(Mode::Raw,b"\xef\xbb\xbfx").unwrap(),Payload::Text("\u{feff}x".into()));
++ assert!(decode_payload(Mode::Keys,b"\xef\xbb\xbf[\"Enter\"]").is_err());
++ assert_eq!(decode_payload(Mode::Keys,b"[\"Enter\",\"C-u\",\" x \"]").unwrap(),Payload::Keys(vec!["Enter".into(),"C-u".into()," x ".into()]));
++}
++#[test]fn file_key_and_encoded_bounds_refuse_before_effect(){
++ assert!(decode_payload(Mode::Raw,&vec![b'x';MAX_FILE+1]).is_err());
++ assert!(encode(&request(Mode::Keys,Payload::Keys(vec!["x".into();4097])),"").is_err());
++ assert!(encode(&request(Mode::Codex,Payload::Text("x".repeat(MAX_FILE))),"").is_err());
++}
++#[test]fn key_whitespace_is_literal_not_trimmed_into_enter(){
++ assert_eq!(encode(&request(Mode::Keys,Payload::Keys(vec![" Enter ".into()])),"").unwrap().bytes,b" Enter ");
++}
++#[test]fn writer_error_never_returns_complete(){
++ struct Broken;impl Write for Broken{fn write(&mut self,_:&[u8])->io::Result<usize>{Err(io::ErrorKind::BrokenPipe.into())}fn flush(&mut self)->io::Result<()>{Ok(())}}impl crate::pane::PaneInputSink for Broken{}
++ let mut a=own_app(Captured::default(),Captured::default());crate::tree::find_pane_mut_by_id_global(&mut a,0).unwrap().writer=Box::new(Broken);
++ let mut out=Vec::new();apply(&mut a,&request(Mode::Raw,Payload::Text("x".into())),&mut out,|_|Some(11)).unwrap();assert_eq!(out,UNKNOWN);
++}
++#[test]fn copy_cancel_changes_only_selected_parked_pane_snapshot(){
++ let mut a=own_app(Captured::default(),Captured::default());a.mode=crate::types::Mode::CopyMode;
++ let p=crate::tree::find_pane_mut_by_id_global(&mut a,0).unwrap();p.enter_copy_snapshot();assert!(p.live_term.is_some());
++ let mut out=Vec::new();apply(&mut a,&request(Mode::CopyCancel,Payload::None),&mut out,|_|Some(11)).unwrap();assert_eq!(out,COMPLETE);
++ assert!(a.mode.in_copy());assert_eq!(a.active_idx,1);assert!(crate::tree::find_pane_mut_by_id_global(&mut a,0).unwrap().live_term.is_none());
++}
++#[test]fn response_read_error_after_complete_is_unknown(){
++ struct Broken(bool);impl Read for Broken{fn read(&mut self,out:&mut[u8])->io::Result<usize>{if self.0{return Err(io::ErrorKind::TimedOut.into())}self.0=true;let b=b"OK\nCHECKED-INPUT COMPLETE\n";out[..b.len()].copy_from_slice(b);Ok(b.len())}}
++ assert!(read_result(&mut Broken(false)).is_err());
++}
+diff --git a/tests-rs/test_checked_input_entry.rs b/tests-rs/test_checked_input_entry.rs
+new file mode 100644
+--- /dev/null
++++ b/tests-rs/test_checked_input_entry.rs
+@@ -0,0 +1,18 @@
++
++use super::*;
++use std::cell::Cell;
++fn assert_checked(args:&[&str]){let effects=Cell::new(0);let maintenance=Cell::new(0);
++ let args=args.iter().map(|s|s.to_string()).collect::<Vec<_>>();
++ dispatch_cli_entry(&args,|_|{effects.set(effects.get()+1);Ok(())},||{maintenance.set(1);Ok(())}).unwrap();
++ assert_eq!(effects.get(),1);assert_eq!(maintenance.get(),0);}
++#[test]fn capability_bypasses_all_legacy_maintenance(){assert_checked(&["psmux","openrig-capabilities"]);}
++#[test]fn input_bypasses_all_legacy_maintenance(){assert_checked(&["psmux","checked-input","--session","7","--server","10:11","--pane","%1","--mode","raw","--file","/private/input"]);}
++#[test]fn checked_commands_refuse_combined_or_malformed_before_any_dispatch(){
++ for args in [vec!["psmux","openrig-capabilities","extra"],vec!["psmux","list-sessions",";","openrig-capabilities"],vec!["psmux","checked-input","--session","7"]]{let ran=Cell::new(false);let args=args.into_iter().map(String::from).collect::<Vec<_>>();assert!(dispatch_cli_entry(&args,|_|{ran.set(true);Ok(())},||{ran.set(true);Ok(())}).is_err());assert!(!ran.get());}}
++
++#[test]fn create_bypasses_legacy_without_asserting_absence(){assert_checked(&["psmux","checked-create","--file","/private/request.json"]);}
++#[test]fn create_refuses_extra_globals_chains_and_incomplete_child_without_effects(){
++ for args in [vec!["psmux","-t","sibling","checked-create","--file","/private/request.json"],vec!["psmux","checked-create","--file","/private/request.json",";","kill-session"],vec!["psmux","checked-create-server","--file","/private/request.json"]]{
++  let ran=Cell::new(false);let args=args.into_iter().map(String::from).collect::<Vec<_>>();assert!(dispatch_cli_entry(&args,|_|{ran.set(true);Ok(())},||{ran.set(true);Ok(())}).is_err());assert!(!ran.get());
++ }
++}
+diff --git a/tests-rs/test_checked_input_handler.rs b/tests-rs/test_checked_input_handler.rs
+new file mode 100644
+--- /dev/null
++++ b/tests-rs/test_checked_input_handler.rs
+@@ -0,0 +1,33 @@
++use super::*;
++use std::io::{Read,Write};
++use std::net::{TcpListener,TcpStream,Shutdown};
++use std::sync::{mpsc,Arc,RwLock};
++fn req()->crate::checked_input::Request{crate::checked_input::Request{expected:crate::checked_stop::Identity{sid:7,pid:10,birth:11},pane:1,mode:crate::checked_input::Mode::Raw,payload:crate::checked_input::Payload::Text("β\n; kill-session".into())}}
++fn exchange(line:String,accept:bool)->(usize,String){
++ let listener=TcpListener::bind("127.0.0.1:0").unwrap();let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let(server,_)=listener.accept().unwrap();let(tx,rx)=mpsc::channel();
++ let mut aliases=std::collections::HashMap::new();aliases.insert("openrig-input-v1".into(),"kill-session".into());
++ let handler=std::thread::spawn(move||crate::server::connection::handle_connection(server,tx,"public-synthetic-key",Arc::new(RwLock::new(aliases))));
++ write!(client,"AUTH public-synthetic-key\nTARGET =sibling\n{}\n",line).unwrap();client.flush().unwrap();client.shutdown(Shutdown::Write).unwrap();
++ let mut count=0;while let Ok(request)=rx.recv_timeout(Duration::from_millis(200)){match request{
++ crate::types::CtrlReq::CheckedInput(r,mut reply)=>{count+=1;assert_eq!(r,req());let result=if accept{crate::checked_input::COMPLETE}else{crate::checked_input::REJECTED};reply.write_all(result).unwrap();reply.flush().unwrap();reply.shutdown(Shutdown::Write).unwrap();},
++ crate::types::CtrlReq::ClientActivity(_)=>{},_=>panic!("unchecked input/focus/forwarding dispatched")}}
++ handler.join().unwrap();let mut output=String::new();client.read_to_string(&mut output).unwrap();(count,output)
++}
++#[test]fn authenticated_input_ignores_alias_and_sibling_target(){
++ let(count,out)=exchange(format!("openrig-input-v1 {}",crate::checked_input::wire(&req()).unwrap()),true);assert_eq!(count,1);assert_eq!(out,"OK\nCHECKED-INPUT COMPLETE\n");
++}
++#[test]fn rejected_actor_result_is_not_enqueue_success(){
++ let(count,out)=exchange(format!("openrig-input-v1 {}",crate::checked_input::wire(&req()).unwrap()),false);assert_eq!(count,1);assert_eq!(out,"OK\nCHECKED-INPUT REJECTED\n");
++}
++#[test]fn malformed_or_chained_request_has_zero_input_dispatch(){
++ for line in ["openrig-input-v1 invalid".to_string(),format!("openrig-input-v1 {} extra",crate::checked_input::wire(&req()).unwrap()),format!("openrig-input-v1 {} ; kill-session",crate::checked_input::wire(&req()).unwrap())]{
++ let(count,out)=exchange(line,true);assert_eq!(count,0);assert_eq!(out,"OK\nCHECKED-INPUT REJECTED\n");}
++}
++#[test]fn only_auth_ack_is_available_until_actor_completion(){
++ let listener=TcpListener::bind("127.0.0.1:0").unwrap();let mut client=TcpStream::connect(listener.local_addr().unwrap()).unwrap();client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let(server,_)=listener.accept().unwrap();let(tx,rx)=mpsc::channel();
++ let handler=std::thread::spawn(move||crate::server::connection::handle_connection(server,tx,"public-synthetic-key",Arc::new(RwLock::new(std::collections::HashMap::new()))));
++ writeln!(client,"AUTH public-synthetic-key\nopenrig-input-v1 {}",crate::checked_input::wire(&req()).unwrap()).unwrap();client.flush().unwrap();client.shutdown(Shutdown::Write).unwrap();
++ let mut reply=loop{match rx.recv_timeout(Duration::from_secs(2)).unwrap(){crate::types::CtrlReq::CheckedInput(_,reply)=>break reply,crate::types::CtrlReq::ClientActivity(_)=>{},_=>panic!("unexpected dispatch")}};
++ let mut auth=[0u8;3];client.read_exact(&mut auth).unwrap();assert_eq!(&auth,b"OK\n");client.set_read_timeout(Some(Duration::from_millis(30))).unwrap();let mut b=[0u8;1];assert!(client.read(&mut b).is_err());
++ reply.write_all(crate::checked_input::COMPLETE).unwrap();reply.shutdown(Shutdown::Write).unwrap();handler.join().unwrap();client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let mut text=String::new();client.read_to_string(&mut text).unwrap();assert_eq!(text,"CHECKED-INPUT COMPLETE\n");
++}
+diff --git a/tests-rs/test_checked_stop_handler.rs b/tests-rs/test_checked_stop_handler.rs
+new file mode 100644
 --- /dev/null
 +++ b/tests-rs/test_checked_stop_handler.rs
 @@ -0,0 +1,71 @@
@@ -869,6 +1729,8 @@
 +    let (count, result) = exchange("list-panes-checked", true, true);
 +    assert_eq!(count, 1); assert_eq!(result, "OK\nown|$7|10|11|%1|0|/inert|80|24|1\n");
 +}
+diff --git a/tests-rs/test_targetless_kill_session_self.rs b/tests-rs/test_targetless_kill_session_self.rs
+new file mode 100644
 --- /dev/null
 +++ b/tests-rs/test_targetless_kill_session_self.rs
 @@ -0,0 +1,173 @@

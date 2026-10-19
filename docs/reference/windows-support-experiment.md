@@ -93,12 +93,14 @@ those operator/provider acceptance requirements.
 ### Current patched psmux setup
 
 The current branch requires **patched psmux 3.4.0**, including server epoch and
-checked-stop support. The stock 3.3.8 used in historical experiments below does
+checked-stop, checked-input-v1 and checked-create-v1 support. The stock 3.3.8 used in historical experiments below does
 not satisfy that protocol. A stock 3.4.0 version string is also insufficient.
 Use the repository's [pinned source/build recipe](../../vendor/psmux/README.md),
 which preserves upstream MIT attribution and verifies the complete patched tree.
-It provides a fresh source/build route and an exact-digest setup route for an
-already obtained accepted binary; no public binary download is implied.
+It provides a fresh source/build route. No current checked-input/create binary
+is independently accepted (`acceptedArtifact: null`); binary-only verification
+and portable setup refuse. The historical B artifact must not be promoted. A
+local source/build receipt remains unsigned bookkeeping, not native acceptance.
 
 ```powershell
 # Inspect first; this command has no setup/build effects.
@@ -125,12 +127,22 @@ if (Test-Path $env:OPENRIG_HOME) { throw 'Choose a fresh private OpenRig home' }
 if (Test-Path $env:PSMUX_DATA_DIR) { throw 'Choose a fresh private psmux directory' }
 New-Item -ItemType Directory $env:OPENRIG_HOME | Out-Null
 New-Item -ItemType Directory $env:PSMUX_DATA_DIR | Out-Null
-New-Item -ItemType File $env:PSMUX_CONFIG_FILE | Out-Null
+# Bind the actual Windows PowerShell executable on this machine; fail if absent.
+$privateShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path -LiteralPath $privateShell -PathType Leaf)) { throw 'Bind an existing PowerShell executable' }
+$privateShell = (Get-Item -LiteralPath $privateShell).FullName.Replace('\', '/')
+# Outer single quotes wrap the config value; inner double quotes wrap the executable.
+$configLine = "set -g default-shell '" + '"' + $privateShell + '" -NoProfile' + "'"
+[IO.File]::WriteAllText($env:PSMUX_CONFIG_FILE, $configLine + "`n", [Text.UTF8Encoding]::new($false))
 # Run only the allocated private native checks; keep USERPROFILE unchanged.
 ```
 
 Use fresh, owned home/state/config paths rather than adopting an existing psmux
-registry. `OPENRIG_TEST_PSMUX` selects the executable for native tests; the daemon
+registry. The explicit existing `PSMUX_DATA_DIR` is required; no root fallback
+is assumed. `PSMUX_NO_WARM=1` alone does not suppress PowerShell profiles: the
+quoted `default-shell` value must include `-NoProfile`. Keep the real USERPROFILE;
+private state/config selection does not imply no other filesystem access.
+`OPENRIG_TEST_PSMUX` selects the executable for native tests; the daemon
 resolves the `tmux.exe` alias through its launch environment's PATH. Keep private
 provider homes separately selected and establish sign-ins independently. Never
 copy authentication into test reports or infer provider access from a fixture.
@@ -143,8 +155,8 @@ are reconciled; do not force-kill unknown processes or clean live state. This
 recipe does not authorize a fleet migration or replacement of an active install.
 
 Source reconstruction and binary identity are distinct from native app and QA
-results. The accepted vendor artifact is a compiler-only milestone with residual
-process uncertainty. A locally generated receipt is unsigned source/build
+results. No current checked-input/create artifact is accepted yet; the older
+compiler-only B milestone does not qualify this source or user path. A locally generated receipt is unsigned source/build
 bookkeeping, not proof of byte-reproducible output, provider conversation resume,
 launch/message/capture/stop/restore success, full-suite parity or GUI acceptance.
 Current native validation remains tracked separately from the historical results.

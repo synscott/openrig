@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { verifySource, verifyBinary } from './verify-windows-psmux.mjs';
+import { verifySource, verifyBinary, loadRecipe } from './verify-windows-psmux.mjs';
 import { main as setup } from './build-windows-psmux.mjs';
 
 function temporary(t) {
@@ -79,4 +79,29 @@ test('setup plan is inert and setup refuses existing destinations before source 
   assert.throws(() => setup(['--from-binary', join(root, 'missing.exe'), '--output-dir', root]), /already exists/);
   assert.throws(() => setup(['--prepare-only', '--source-dir', root]), /already exists/);
   assert.throws(() => setup(['--plan', '--fetch']), /requires --build/);
+});
+
+
+test('current recipe has no accepted artifact and refuses historical or missing binaries without effects', t => {
+  const root = temporary(t);
+  const old = join(root, 'historical.exe');
+  writeFileSync(old, pe());
+  assert.equal(loadRecipe().acceptedArtifact, null);
+  assert.throws(() => verifyBinary(old, null), /No accepted artifact for current/);
+  assert.throws(() => verifyBinary(join(root, 'missing.exe'), null), /No accepted artifact for current/);
+  assert.throws(() => setup(['--from-binary', old, '--output-dir', join(root, 'portable')]), /No accepted artifact for current/);
+  assert.throws(() => verifyBinary(old, null, { schema: 1, sourceManifestSHA256: 'historical' }, 'current'), /receipt source mismatch/);
+});
+
+test('null acceptance still permits explicitly unsigned current local build bookkeeping', t => {
+  const root = temporary(t);
+  const file = join(root, 'local.exe');
+  const data = pe();
+  writeFileSync(file, data);
+  const source = loadRecipe().sourceManifest.sha256;
+  const receipt = { schema: 1, sourceManifestSHA256: source, binary: { bytes: data.length, sha256: hash(data) } };
+  const result = verifyBinary(file, null, receipt, source);
+  assert.equal(result.identity, 'local-build-receipt');
+  assert.equal(result.acceptedArtifactMatch, false);
+  assert.match(result.qualification, /unsigned bookkeeping/);
 });

@@ -1,7 +1,8 @@
 import { DeliveryGuardError, type SeatDeliveryGuard } from "../domain/seat-delivery-guard.js";
 import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join as pathJoin } from "node:path";
+import { isAbsolute, resolve, join as pathJoin } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ComposerSnapshot } from "../domain/composer-prompts.js";
 import { inspectComposerInput } from "../domain/session-transport.js";
@@ -27,7 +28,12 @@ interface TmuxShellCommandOptions {
  * Windows/psmux no POSIX quoting or `/dev/null` redirections to depend on.
  * When absent every method uses the legacy shell-string path unchanged.
  */
-export type ArgvExecFn = (argv: string[]) => Promise<string>;
+export interface ArgvExecOptions {
+  timeoutMs?: number;
+  /** The original private native creation root, never arbitrary environment. */
+  psmuxDataDir?: string;
+}
+export type ArgvExecFn = (argv: string[], options?: ArgvExecOptions) => Promise<string>;
 
 /**
  * Injectable file/buffer operations for `sendText`.
@@ -35,6 +41,7 @@ export type ArgvExecFn = (argv: string[]) => Promise<string>;
  * without touching the real filesystem; production wires node fs + os.tmpdir.
  */
 export interface TmuxFileOps {
+  canonicalDirectory?(path: string): string | null;
   writeFile(path: string, content: string, options?: { mode: number; flag: "wx" }): Promise<void>;
   unlink(path: string): Promise<void>;
   /** Unique temp-file path per call - parallel `rig up` stands up many seats. */
@@ -73,6 +80,13 @@ export function isStagedSendScriptPath(path: string): boolean {
 
 export function defaultTmuxFileOps(): TmuxFileOps {
   return {
+    canonicalDirectory: path => {
+      try {
+        const stat = lstatSync(path);
+        const canonical = realpathSync(path);
+        return isAbsolute(path) && stat.isDirectory() && !stat.isSymbolicLink() && canonical === resolve(path) ? canonical : null;
+      } catch { return null; }
+    },
     writeFile: (p, content, options) => fsWriteFile(p, content, { encoding: "utf8", ...options }),
     unlink: (p) => fsUnlink(p),
     tmpName: () => pathJoin(tmpdir(), `${SEND_SCRIPT_PREFIX}${process.pid}-${randomUUID()}${SEND_SCRIPT_SUFFIX}`),
@@ -83,6 +97,33 @@ export function defaultTmuxFileOps(): TmuxFileOps {
 export type TmuxResult =
   | { ok: true; warnings?: string[] }
   | { ok: false; code: string; message: string };
+
+export interface NativeCreationContext { attempt: string; root: string }
+export interface NativeCreationReceipt extends NativeCreationContext { name: string; pane: string }
+export interface NativeCreationAttempt extends NativeCreationContext { name: string; pid: string | null; birth: string | null }
+export type TmuxCreationResult =
+  | { ok: true; warnings?: string[]; creation?: NativeCreationReceipt }
+  | { ok: false; code: string; message: string; creationOutcome?: "unknown" | "collision" | "not_started"; creationAttempt?: NativeCreationAttempt };
+
+/** Checked-create receipts contain scalar fields only. Reject duplicate decoded keys. */
+function creationObject(output: unknown): Record<string, unknown> | null {
+  if (typeof output !== "string" || Buffer.byteLength(output, "utf8") > 4096 || !output.startsWith("{") || !output.endsWith("}\n")) return null;
+  try {
+    const value = JSON.parse(output);
+    if (!value || Array.isArray(value) || typeof value !== "object" || Object.values(value).some(v => v !== null && typeof v === "object")) return null;
+    const keys = new Set<string>();
+    let key = true;
+    for (const token of output.match(/"(?:\\.|[^"\\])*"|[{},:]/g) ?? []) {
+      if (token === ",") key = true;
+      else if (key && token.startsWith('"')) {
+        const decoded = JSON.parse(token) as string;
+        if (keys.has(decoded)) return null;
+        keys.add(decoded); key = false;
+      }
+    }
+    return value as Record<string, unknown>;
+  } catch { return null; }
+}
 
 export interface TmuxSession {
   name: string;
@@ -372,6 +413,7 @@ export class TmuxAdapter {
     });
   }
   private readonly freshProbes = new Map<string, string>();
+  private readonly nativeCreated = new Map<string, NativeCreationReceipt>();
   private readonly freshManaged = new Map<string, {nodeId: string; pane: string}>();
 
   /** Only the private metadata probe uses this door. Success proves allocation,
@@ -530,7 +572,7 @@ export class TmuxAdapter {
         // Lazy-session readiness is a binary capability, not actor liveness or
         // positive session absence. This entry bypasses vendor maintenance.
         const output = await this.argvExec?.(["tmux", "openrig-capabilities"]);
-        if (output === "OPENRIG-PSMUX 1 checked-input-v1 checked-stop-v1 observe-v1 lazy-session\n") return { ok: true };
+        if (output === "OPENRIG-PSMUX 1 checked-input-v1 checked-create-v1 checked-stop-v1 observe-v1 lazy-session\n") return { ok: true };
       } catch { /* An unavailable or older backend is not readiness evidence. */ }
       return { ok: false, code: "native_readiness_unverified", message: "Native backend capability readiness is unverified; session presence remains unknown." };
     }
@@ -659,12 +701,24 @@ export class TmuxAdapter {
     return probe.state === "present";
   }
 
-  async createSession(name: string, cwd?: string, env?: Record<string, string>): Promise<TmuxResult> {
+  usesCheckedCreation(): boolean { return this.terminalKind === "psmux"; }
+
+  nativeCreationRoot(): string | null {
+    const root = process.env.PSMUX_DATA_DIR;
+    return root ? this.fileOps.canonicalDirectory?.(root) ?? null : null;
+  }
+
+  async createSession(name: string, cwd?: string, env?: Record<string, string>, context?: NativeCreationContext): Promise<TmuxCreationResult> {
     if (this.deliveryGuard && (!env?.OPENRIG_NODE_ID || !this.deliveryGuard.ownsLifecycle(env.OPENRIG_NODE_ID))) {
       return { ok: false, code: "guard_lease_required", message: "Managed launch requires a lifecycle lease before terminal creation." };
     }
-    const result = await this.createSessionUnchecked(name, cwd, env);
-    if (result.ok && this.deliveryGuard && env?.OPENRIG_NODE_ID) {
+    const result: TmuxCreationResult = this.terminalKind === "psmux"
+      ? await this.createNativeSession(name, cwd, env, context)
+      : await this.createSessionUnchecked(name, cwd, env);
+    if (result.ok && result.creation && this.deliveryGuard && env?.OPENRIG_NODE_ID) {
+      this.deliveryGuard.noteFreshLifecyclePane(env.OPENRIG_NODE_ID, result.creation.pane);
+      this.freshManaged.set(name, { nodeId: env.OPENRIG_NODE_ID, pane: result.creation.pane });
+    } else if (result.ok && this.deliveryGuard && env?.OPENRIG_NODE_ID) {
       try {
         const panes = await this.listPanes(name);
         if (panes.length === 1) {
@@ -676,10 +730,70 @@ export class TmuxAdapter {
     return result;
   }
 
+  private async createNativeSession(name: string, cwd: string | undefined, env: Record<string, string> | undefined,
+    context: NativeCreationContext | undefined): Promise<TmuxCreationResult> {
+    if (!context || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(context.attempt)
+      || !/^[a-z0-9][a-z0-9_.@-]{0,127}$/.test(name) || this.nativeCreationRoot() !== context.root || !this.argvExec) {
+      return { ok: false, code: "native_creation_context_required", message: "Checked creation requires a durable attempt and canonical private root; no creation dispatched.", creationOutcome: "not_started" };
+    }
+    const attempt: NativeCreationAttempt = { ...context, name, pid: null, birth: null };
+    const unknown = (): TmuxCreationResult => ({ ok: false, code: "native_create_unknown", message: "Native creation outcome is unknown. The durable attempt must be reconciled; no retry or name cleanup was attempted.", creationOutcome: "unknown", creationAttempt: attempt });
+    const seatEnv = { OPENRIG_TRANSCRIPTS_LINES: "", OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "", ...env };
+    const explicit = new Set(Object.keys(seatEnv).map(key => key.toUpperCase()));
+    const request = JSON.stringify({ version: 1, attempt: context.attempt, name, cwd: cwd ?? process.cwd(), env: seatEnv,
+      unset: parentSessionEnvKeys(process.env).filter(key => !explicit.has(key.toUpperCase())) });
+    if (Buffer.byteLength(request, "utf8") > 1024 * 1024) return { ok: false, code: "native_creation_request_too_large", message: "Checked creation request exceeds its byte bound; no creation dispatched.", creationOutcome: "not_started" };
+    const path = this.fileOps.tmpName();
+    let created = false;
+    try {
+      await this.fileOps.writeFile(path, request, { mode: 0o600, flag: "wx" }); created = true;
+      let code: unknown = 0, output: unknown;
+      try { output = await this.argvExec(["tmux", "checked-create", "--file", path], { timeoutMs: 35000, psmuxDataDir: context.root }); }
+      catch (error) { const e = error as { code?: unknown; stdout?: unknown }; code = e.code; output = e.stdout; }
+      const value = creationObject(output);
+      if (!value || value.version !== 1 || value.attempt !== context.attempt || value.name !== name) return unknown();
+      const exact = (keys: string[]) => Object.keys(value).sort().join("|") === keys.sort().join("|");
+      if (code === 0 && value.status === "created" && exact(["version", "status", "attempt", "name", "sid", "pid", "birth", "pane"])) {
+        const pane = `psmux:v2:${Buffer.from(name).toString("base64url")}:${value.pane}:${value.sid}:${value.pid}:${value.birth}`;
+        if ([value.sid, value.pid, value.birth, value.pane].some(field => typeof field !== "string") || !nativePaneRef(pane)) return unknown();
+        const creation = { ...context, name, pane };
+        this.nativeCreated.set(name, creation);
+        return { ok: true, creation };
+      }
+      if (code === 2 && value.status === "collision" && exact(["version", "status", "attempt", "name"])) {
+        return { ok: false, code: "duplicate_session", message: "Native creation refused a namespace collision; nothing was replaced.", creationOutcome: "collision", creationAttempt: attempt };
+      }
+      if (code === 3 && value.status === "unknown" && exact(["version", "status", "attempt", "name", "pid", "birth"])) {
+        if (value.pid === null && value.birth === null) return unknown();
+        if (typeof value.pid === "string" && typeof value.birth === "string"
+          && nativePaneRef(`psmux:v2:${Buffer.from(name).toString("base64url") }:%0:0:${value.pid}:${value.birth}`)) {
+          attempt.pid = value.pid; attempt.birth = value.birth;
+        }
+      }
+      return unknown();
+    } catch { return unknown(); }
+    finally { if (created) { try { await this.fileOps.unlink(path); } catch { /* Retain the creation outcome. */ } } }
+  }
+
+  async stopCreatedSession(creation: NativeCreationReceipt, nodeId: string): Promise<TmuxResult> {
+    const ref = nativePaneRef(creation.pane);
+    if (!ref || this.nativeCreated.get(creation.name) !== creation || !this.argvExec
+      || (this.deliveryGuard && !this.deliveryGuard.ownsLifecycle(nodeId))) {
+      return { ok: false, code: "guard_target_unknown", message: "The original creation receipt or lifecycle ownership is unavailable; no stop dispatched." };
+    }
+    try {
+      const output = await this.argvExec(["tmux", "kill-session", "-t", `$${ref.sid}`, "-G", `${ref.pid}:${ref.birth}`], { psmuxDataDir: creation.root });
+      if (output !== "CHECKED-STOP COMPLETE\n") return { ok: false, code: "kill_unverified", message: "Created actor stop completion is unverified." };
+      this.nativeCreated.delete(creation.name);
+      return { ok: true };
+    } catch { return { ok: false, code: "kill_unverified", message: "Created actor stop completion is unverified; no name cleanup attempted." }; }
+  }
+
   /** The committed binding now owns identity; this is not filesystem cleanup. */
   finishLaunchBinding(session: string): void { this.freshManaged.delete(session); }
 
   private async createSessionUnchecked(name: string, cwd?: string, env?: Record<string, string>): Promise<TmuxResult> {
+    if (this.terminalKind === "psmux") return { ok: false, code: "native_creation_context_required", message: "Native creation requires a durable checked-create attempt; no legacy creation dispatched." };
     // These are the daemon's resolved capture settings, not seat overrides.
     // An empty per-session value prevents the tmux server's inherited values
     // from pinning an old policy over config.json inside a newly launched seat.

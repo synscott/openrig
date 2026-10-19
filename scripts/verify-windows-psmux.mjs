@@ -61,8 +61,9 @@ export function inspectBinary(file) {
 }
 
 export function verifyBinary(file, accepted, receipt, sourceManifestSHA256) {
+  if (!accepted && !receipt) throw new Error("No accepted artifact for current checked-input/checked-create source; build from the pinned source and supply its unsigned local build receipt, or wait for an independently accepted current artifact.");
   const binary = inspectBinary(file);
-  const acceptedArtifactMatch = binary.bytes === accepted.bytes && binary.sha256 === accepted.sha256;
+  const acceptedArtifactMatch = accepted != null && binary.bytes === accepted.bytes && binary.sha256 === accepted.sha256;
   if (receipt) {
     if (receipt.schema !== 1 || receipt.sourceManifestSHA256 !== sourceManifestSHA256) throw new Error('receipt source mismatch');
     if (receipt.binary?.bytes !== binary.bytes || receipt.binary?.sha256 !== binary.sha256) throw new Error('receipt binary mismatch');

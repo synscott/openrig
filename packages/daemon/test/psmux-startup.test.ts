@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { TmuxAdapter, type ArgvExecFn } from "../src/adapters/tmux.js";
-const capabilities = "OPENRIG-PSMUX 1 checked-input-v1 checked-stop-v1 observe-v1 lazy-session\n";
+const capabilities = "OPENRIG-PSMUX 1 checked-input-v1 checked-create-v1 checked-stop-v1 observe-v1 lazy-session\n";
 describe("native terminal startup capability", () => {
   it("recognizes lazy readiness without session probes, bootstrap, or maintenance", async () => {
     const effects: string[][] = [];

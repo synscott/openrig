@@ -1,8 +1,9 @@
 import type Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { TmuxAdapter, TmuxCreationResult, NativeCreationContext, NativeCreationReceipt } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import type { PersistedEvent } from "./types.js";
 import { validateSessionName, deriveSessionName } from "./session-name.js";
@@ -20,7 +21,7 @@ import { SEAT_PROJECT_DIR_ENV, seatCorePluginDir, withCorePlugin } from "./claud
 import type { Session, Binding } from "./types.js";
 
 export type LaunchResult =
-  | { ok: true; sessionName: string; session: Session; binding: Binding; warnings?: string[] }
+  | { ok: true; sessionName: string; session: Session; binding: Binding; warnings?: string[]; creation?: NativeCreationReceipt }
   | { ok: false; code: string; message: string };
 
 interface LaunchOpts {
@@ -35,6 +36,8 @@ interface LaunchOpts {
   silenceWindowSeconds?: number;
   /** A deliberate fresh occupant is distinct from initial rig boot in the tenure ledger. */
   occupantKind?: OccupantKind;
+  /** Synchronous retirement after an accepted native receipt, before successor state is published. */
+  beforeNativeBinding?: () => void;
   /** One-off env for this launch only (`rig up --env`); wins over the spec's env and is not saved. */
   env?: SeatEnv;
   /** The seat's resolved plugin locations (what the profile resolver selected for it, or a snapshot saved). A Claude
@@ -166,9 +169,46 @@ export class NodeLauncher {
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
     });
     const openRigEnv = launchEnv(opts?.env);
-    const tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
+    let nativeContext: NativeCreationContext | undefined;
+    if (this.tmuxAdapter.usesCheckedCreation?.()) {
+      if (opts?.env && Object.keys(opts.env).length > 0) return { ok: false, code: "native_one_off_env_unsupported", message: "Native one-off environment cleanup is not epoch-bound; no session was created." };
+      const root = this.tmuxAdapter.nativeCreationRoot();
+      if (!root) return { ok: false, code: "native_creation_root_unverified", message: "Native creation requires a canonical private backend root; no session was created." };
+      if (this.unresolvedNativeCreation(node.id)) return { ok: false, code: "native_create_unresolved", message: "A prior native creation attempt is unresolved; reconcile it before another launch. No retry was attempted." };
+      nativeContext = { attempt: randomUUID(), root };
+      try { this.eventBus.emit({ type: "native.creation_attempt", rigId, nodeId: node.id, name: sessionName, ...nativeContext }); }
+      catch { return { ok: false, code: "native_creation_journal_failed", message: "Could not record the creation attempt; no creation was dispatched." }; }
+    }
+    let tmuxResult: TmuxCreationResult;
+    try { tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv, nativeContext); }
+    catch (error) {
+      if (!nativeContext) throw error;
+      tmuxResult = { ok: false, code: "native_create_unknown", message: "Creation completion is unknown; no retry or name cleanup was attempted.", creationOutcome: "unknown" };
+    }
     if (!tmuxResult.ok) {
+      if (nativeContext) {
+        this.nativeCreationResult(rigId, node.id, sessionName, nativeContext, tmuxResult.creationOutcome ?? "unknown", null,
+          tmuxResult.creationAttempt?.pid ?? null, tmuxResult.creationAttempt?.birth ?? null);
+      }
       return { ok: false, code: tmuxResult.code, message: tmuxResult.message };
+    }
+    const creation = tmuxResult.creation;
+    if (nativeContext && !creation) {
+      this.nativeCreationResult(rigId, node.id, sessionName, nativeContext, "unknown");
+      return { ok: false, code: "native_create_unknown", message: "Creation did not return its own qualified epoch; nothing was bound." };
+    }
+    if (creation && opts?.beforeNativeBinding) {
+      try { opts.beforeNativeBinding(); }
+      catch {
+        const stopped = await this.tmuxAdapter.stopCreatedSession(creation, node.id);
+        this.nativeCreationResult(rigId, node.id, sessionName, creation, stopped.ok ? "stopped" : "unknown", creation.pane);
+        return { ok: false, code: "native_retirement_failed", message: "Prior occupant retirement failed; the original creation was compensated without publishing a successor binding." };
+      }
+    }
+    if (creation && !this.nativeCreationResult(rigId, node.id, sessionName, creation, "created", creation.pane)) {
+      // The started record remains unresolved. Never use the name to repair it.
+      await this.tmuxAdapter.stopCreatedSession(creation, node.id);
+      return { ok: false, code: "native_creation_journal_failed", message: "Could not retain the creation receipt; its started attempt remains unresolved." };
     }
 
     // A one-off `rig up --env` value is on the first pane's command line and, because that is how
@@ -199,14 +239,15 @@ export class NodeLauncher {
     // Observe the pane before the DB transaction. A concrete pane is committed
     // with session+binding; an unresolved pane gets a durable named verdict in
     // that same transaction rather than carrying an unexplained NULL forward.
-    const paneObservation = await observeSolePane(this.tmuxAdapter, sessionName);
+    const paneObservation = creation ? { ok: true as const, pane: creation.pane } : await observeSolePane(this.tmuxAdapter, sessionName);
 
     // 3a2. OPR.0.4.6.02 S1 — apply the daemon's tmux option defaults to the
     // JUST-CREATED session via the shared applier (mouse/status session-scope
     // + set-clipboard/copy-command server-scope). Touches only this new
     // session, never an existing one (BR-1 never-retro). Option-set failures
     // come back as non-fatal launch warnings.
-    if (this.tmuxOptionDefaults) {
+    if (creation && this.tmuxOptionDefaults) launchWarnings.push("Native option defaults were not applied: epoch-bound option mutation is unavailable.");
+    if (!creation && this.tmuxOptionDefaults) {
       launchWarnings.push(...(await this.tmuxOptionDefaults.applyToFreshSession(sessionName)));
     }
 
@@ -215,7 +256,8 @@ export class NodeLauncher {
     // mechanism). Failures inside individual rotation ticks are silent
     // (best-effort); only the transcript directory not being writable
     // surfaces a launch warning.
-    if (this.transcriptStore?.enabled) {
+    if (creation && this.transcriptStore?.enabled) launchWarnings.push("Native transcript rotation was not started: epoch-bound capture is unavailable.");
+    if (!creation && this.transcriptStore?.enabled) {
       const dirOk = this.transcriptStore.ensureTranscriptDir(rig.rig.name);
       if (dirOk) {
         const transcriptPath = this.transcriptStore.getTranscriptPath(rig.rig.name, sessionName);
@@ -234,6 +276,7 @@ export class NodeLauncher {
     // 4. DB transaction: session + binding + event (atomic)
     let persistedEvent: PersistedEvent;
     let createdSessionId: string | null = null;
+    let nativeBoundEvent: PersistedEvent | null = null;
     try {
       const txn = this.db.transaction(() => {
         const session = this.sessionRegistry.registerSession(
@@ -256,6 +299,11 @@ export class NodeLauncher {
             observation: paneObservation,
           }));
         }
+        if (creation) {
+          nativeBoundEvent = this.eventBus.persistWithinTransaction({ type: "native.creation_result", rigId, nodeId: node.id,
+            ...creation, status: "bound", pid: null, birth: null });
+          this.eventBus.registerPersistedWithinActiveEnvelope(nativeBoundEvent);
+        }
         return this.eventBus.persistWithinTransaction({
           type: "node.launched",
           rigId,
@@ -266,8 +314,11 @@ export class NodeLauncher {
       });
       persistedEvent = txn();
     } catch (err) {
-      // DB failed — best-effort tmux cleanup
-      await this.tmuxAdapter.killSession(sessionName);
+      // Native compensation stays on the original receipt, never a reused name.
+      if (creation) {
+        const stopped = await this.tmuxAdapter.stopCreatedSession(creation, node.id);
+        this.nativeCreationResult(rigId, node.id, sessionName, creation, stopped.ok ? "stopped" : "unknown", creation.pane);
+      } else await this.tmuxAdapter.killSession(sessionName);
       return {
         ok: false,
         code: "db_error",
@@ -280,6 +331,7 @@ export class NodeLauncher {
 
     // 5. Notify subscribers (best-effort, after commit)
     this.eventBus.notifySubscribers(persistedEvent);
+    if (nativeBoundEvent) this.eventBus.notifySubscribers(nativeBoundEvent);
 
     // 6. Fetch the created session + binding for the caller
     const sessions = this.sessionRegistry.getSessionsForRig(rigId);
@@ -292,7 +344,28 @@ export class NodeLauncher {
       session: session!,
       binding: binding!,
       warnings: launchWarnings.length > 0 ? launchWarnings : undefined,
+      ...(creation ? { creation } : {}),
     };
+  }
+
+  private unresolvedNativeCreation(nodeId: string): boolean {
+    try {
+      const rows = this.db.prepare("SELECT type,payload FROM events WHERE node_id=? AND type IN ('native.creation_attempt','native.creation_result') ORDER BY seq").all(nodeId) as Array<{ type: string; payload: string }>;
+      const pending = new Map<string, string>();
+      for (const row of rows) {
+        const value = JSON.parse(row.payload) as { attempt: string; status?: string };
+        if (typeof value.attempt !== "string") return true;
+        pending.set(value.attempt, row.type === "native.creation_attempt" ? "started" : value.status ?? "unknown");
+      }
+      return [...pending.values()].some(status => !["bound", "stopped", "collision", "not_started"].includes(status));
+    } catch { return true; }
+  }
+
+  private nativeCreationResult(rigId: string, nodeId: string, name: string, context: NativeCreationContext,
+    status: "created" | "collision" | "not_started" | "unknown" | "stopped", pane: string | null = null,
+    pid: string | null = null, birth: string | null = null): boolean {
+    try { this.eventBus.emit({ type: "native.creation_result", rigId, nodeId, name, ...context, status, pane, pid, birth }); return true; }
+    catch { return false; } // The started record remains unresolved and blocks another create.
   }
 
   /**
