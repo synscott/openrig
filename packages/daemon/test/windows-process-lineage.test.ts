@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseWindowsProcesses, verifyCodexPaneProcess, verifyClaudePaneProcess, observeClaudeDelivery, listNativeProcesses, type NativeProcessRow } from "../src/domain/native-process-lineage.js";
+import { parseWindowsProcesses, verifyCodexPaneProcess, verifyClaudePaneProcess, observeClaudeDelivery, listNativeProcesses, observeCodexForkProcess, explainNativeRejection, type NativeProcessRow } from "../src/domain/native-process-lineage.js";
 
 const born = "2026-10-08T01:00:00Z";
 function rows(): NativeProcessRow[] {
@@ -10,6 +10,16 @@ function rows(): NativeProcessRow[] {
 }
 const verify = (values: NativeProcessRow[], token = "exact-id", foreground = "codex") => verifyCodexPaneProcess({ target: "pane", tmux: { getPanePid: async () => 100, getPaneCommand: async () => foreground }, listProcesses: () => values, expectedToken: token, requireResume: true });
 describe("Windows process ancestry without fabricated foreground groups", () => {
+  it("retains quoted native paths in fork selection and rejection explanations", async () => {
+    const values = rows();
+    values[1]!.command = '"C:\\program space\\codex.exe" fork "parent-id"';
+    const input = { target: "pane", tmux: { getPanePid: async () => 100 }, listProcesses: () => values, parentToken: "parent-id" };
+    expect((await observeCodexForkProcess(input))?.process.pid).toBe(101);
+    expect(await observeCodexForkProcess({ ...input, parentToken: "other-parent" })).toBeNull();
+    values[1]!.command = '"C:\\program space\\codex.exe" resume "exact-id"';
+    expect((await verify(values))?.process.pid).toBe(101);
+    expect(explainNativeRejection(values, 100, "codex", "exact-id", true)).toEqual({ kind: "passes" });
+  });
   it("keeps the current-main Codex launcher-chain proof with Windows quoting", async () => {
     const values = rows();
     values[1]!.command = '"C:\\program space\\codex.exe" resume "exact-id"';

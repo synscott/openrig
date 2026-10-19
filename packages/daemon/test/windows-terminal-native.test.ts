@@ -61,7 +61,7 @@ describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
       const command = [process.execPath, script, output, ...args].map(q).join(" ");
       const panes = await adapter.listPanes(session);
       expect(panes).toHaveLength(1);
-      expect(panes[0]!.id).toMatch(/^psmux:.*:%\d+$/);
+      expect(panes[0]!.id).toMatch(/^psmux:v2:[A-Za-z0-9_-]+:%\d+:\d+:\d+:\d+$/);
       const other = (await adapter.listPanes(decoy))[0]!;
       expect(other.id).not.toBe(panes[0]!.id);
       expect(await adapter.sendShellCommand(panes[0]!.id, renderWindowsLaunch(command, { OPENRIG_TEST_MARKER: "native-ok" }))).toEqual({ ok: true });
@@ -72,7 +72,12 @@ describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
       }
       expect(result).toEqual({ args, marker: "native-ok" });
       expect(await adapter.killSession(session)).toEqual({ ok: true });
-      expect((await adapter.probeSession(session)).state).toBe("absent");
+      // Pinned psmux 3.4 returns silent exit 1 after this stop, indistinguishable
+      // from an unreachable session server. The probe alone cannot prove absence.
+      expect(await adapter.probeSession(session)).toEqual({
+        state: "transport_unavailable",
+        cause: "psmux has-session returned silent exit 1; session presence is unknown.",
+      });
       expect((await adapter.probeSession(decoy)).state).toBe("present");
     } finally {
       await invoke(["tmux", "kill-session", "-t", `=${session}`]).catch(() => {});

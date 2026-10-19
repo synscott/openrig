@@ -33,9 +33,10 @@ describe("psmux PowerShell launch staging", () => {
     const calls: string[][] = [];
     const adapter = new TmuxAdapter(async () => "", undefined, async argv => {
       calls.push(argv);
-      return argv.includes("list-panes") ? "seat-a|%1|0|C:\\cwd|80|24|1\n" : "pwsh";
+      return argv.includes("list-panes") ? "seat-a|$7|4242|134368264782225092|%1|0|C:\\cwd|80|24|1\n" : "pwsh";
     }, "psmux");
     const pane = (await adapter.listPanes("seat-a"))[0]!;
+    expect(pane.id).toBe("psmux:v2:c2VhdC1h:%1:7:4242:134368264782225092");
     await adapter.getPaneCommand(pane.id);
     expect(calls.at(-1)?.slice(0, 3)).toEqual(["tmux", "-t", "=seat-a"]);
     expect(calls.at(-1)).toContain("%1");

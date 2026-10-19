@@ -66,8 +66,8 @@ function recordingAdapter(calls: RunCall[], opts: { failing?: string[]; guard?: 
     execs.push(cmd);
     return respond(cmd, opts.failing ?? [], opts.composer);
   }, fileOps, opts.psmux ? async argv => {
-    if (argv.includes("display-message")) return "$7\n";
-    if (argv.includes("has-session")) throw new Error("can't find session: missing");
+    if (argv.includes("list-panes")) return `${SESSION}|$7|10|11|%1|0|/w|80|24|1\n`;
+    if (argv.includes("kill-session")) return "CHECKED-STOP COMPLETE\n";
     return "";
   } : undefined, opts.psmux ? "psmux" : "tmux");
   if (opts.guard) {

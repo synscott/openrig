@@ -9,6 +9,16 @@ import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js"
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 import { typingGuardModesSchema } from "../src/db/migrations/100_typing_guard_modes.js";
 
+const nativeConsole = vi.hoisted(() => ({ write: undefined as (() => void) | undefined }));
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  return { ...actual, execFile: (...args: unknown[]) => {
+    nativeConsole.write?.();
+    (args.at(-1) as (error: null, stdout: string, stderr: string) => void)(null, "", "");
+    return {};
+  } };
+});
+
 const cleanup: Array<() => void> = [];
 afterEach(() => cleanup.splice(0).reverse().forEach(fn => fn()));
 
@@ -18,7 +28,7 @@ function screen(body: string): ComposerSnapshot {
     cursor: { x: 2 + stringWidth(rows.at(-1)!), y: 1 + rows.length, width: 120, height: 40 }, inMode: false };
 }
 
-function fixture() {
+function fixture(terminalKind: "tmux" | "psmux" = "tmux") {
   const db = new Database(":memory:"); cleanup.push(() => db.close());
   db.exec("CREATE TABLE nodes(id TEXT PRIMARY KEY); INSERT INTO nodes VALUES ('a'),('b');");
   db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql); db.exec(typingGuardModesSchema.sql);
@@ -40,8 +50,9 @@ function fixture() {
     }
     if (command.includes("send-keys")) writes.push(command);
     return "";
-  }, { writeFile: async (_path, text) => { staged = text; }, unlink: async () => {}, tmpName: () => "/fixture/input", bufferName: () => "fixture-buffer" });
+  }, { writeFile: async (_path, text) => { staged = text; }, unlink: async () => {}, tmpName: () => "/fixture/input", bufferName: () => "fixture-buffer" }, undefined, terminalKind);
   tmux.deliveryGuard = guard;
+  if (terminalKind === "psmux") vi.spyOn(tmux, "getPaneCommand").mockResolvedValue("powershell");
   vi.spyOn(tmux, "listPanes").mockImplementation(async name => {
     const t = guard.maybeTarget(name);
     return t?.pane ? [{ id: t.pane, index: 0, cwd: "/fixture", width: 120, height: 40, active: true }] : [];
@@ -54,6 +65,43 @@ function fixture() {
 }
 
 describe("typing guard modes", () => {
+
+  it.each([false, true])("native console paste respects draft ownership (busy=%s)", async busy => {
+    const f = fixture("psmux");
+    await f.guard.set("a", { mode: "draft-aware" }, "operator", "protect native console");
+    vi.spyOn(f.tmux, "getPaneCommand").mockResolvedValue("codex");
+    vi.spyOn(f.tmux, "getPanePid").mockResolvedValue(4242);
+    f.panes.a = screen(busy ? "human text" : "");
+    nativeConsole.write = () => { f.writes.push("console paste"); f.panes.a = screen("message"); };
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      await f.guard.operation("a", async () => {
+        const pasted = await f.tmux.sendText("a", "message");
+        if (busy) {
+          expect(pasted).toMatchObject({ ok: false, code: "draft_input_busy" });
+          expect(f.writes).toEqual([]);
+          expect(f.panes.a).toEqual(screen("human text"));
+        } else {
+          expect(pasted).toEqual({ ok: true });
+          expect(await f.tmux.sendKeys("a", ["Enter"])).toEqual({ ok: true });
+          expect(f.writes[0]).toBe("console paste");
+        }
+      });
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      nativeConsole.write = undefined;
+    }
+  });
+
+  it("preserves a human draft when staging a native shell command with a launch callback", async () => {
+    const f = fixture("psmux");
+    await f.guard.set("a", { mode: "draft-aware" }, "operator", "protect native draft");
+    f.onLoad(() => { f.panes.a = screen("human text"); });
+    expect(await f.tmux.sendShellCommand("a", "Write-Output inert", () => {})).toMatchObject({ ok: false });
+    expect(f.writes).toEqual([]);
+    expect(f.panes.a).toEqual(screen("human text"));
+  });
 
   it.each(["unchanged", "on", "off", "off-on"])("keeps rollback protection and honors the last legacy write (%s)", async setting => {
     const f = fixture();

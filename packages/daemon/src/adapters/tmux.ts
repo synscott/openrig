@@ -46,6 +46,20 @@ export interface TmuxFileOps {
   bufferName(): string;
 }
 
+interface NativePaneRef { session: string; pane: string; sid: string; pid: string; birth: string }
+function nativePaneRef(value: string): NativePaneRef | null {
+  const match = /^psmux:v2:([A-Za-z0-9_-]+):(%\d+):(\d+):(\d+):(\d+)$/.exec(value);
+  if (!match) return null;
+  const [, encoded, pane, sid, pid, birth] = match;
+  try {
+    if (BigInt(sid!) > 18446744073709551615n || BigInt(pid!) < 1n || BigInt(pid!) > 4294967295n
+      || BigInt(birth!) < 1n || BigInt(birth!) > 18446744073709551615n) return null;
+    const session = Buffer.from(encoded!, "base64url").toString("utf8");
+    if (!session || Buffer.from(session).toString("base64url") !== encoded) return null;
+    return { session, pane: pane!, sid: sid!, pid: pid!, birth: birth! };
+  } catch { return null; }
+}
+
 // One source for the staged script's name: the generator (defaultTmuxFileOps) and the matcher
 // (isStagedSendScriptPath) are both built from it.
 const SEND_SCRIPT_PREFIX = "openrig-tmux-send-";
@@ -494,10 +508,12 @@ export class TmuxAdapter {
    */
   private async run(argv: string[], legacy?: string, bufferScope?: string): Promise<string> {
     if (this.terminalKind === "psmux") {
-      const scoped = argv.find(a => /^psmux:[A-Za-z0-9_-]+:[%$@]\d+$/.test(a)) ?? bufferScope;
+      const scoped = argv.find(a => nativePaneRef(a) || /^psmux:[A-Za-z0-9_-]+:[%$@]\d+$/.test(a)) ?? bufferScope;
       if (scoped) {
-        const [, encoded, pane] = scoped.split(":");
-        const session = scoped.startsWith("psmux:") ? Buffer.from(encoded!, "base64url").toString("utf8") : scoped;
+        const epoch = nativePaneRef(scoped);
+        const [, encoded, legacyPane] = scoped.split(":");
+        const session = epoch?.session ?? (scoped.startsWith("psmux:") ? Buffer.from(encoded!, "base64url").toString("utf8") : scoped);
+        const pane = epoch?.pane ?? legacyPane;
         argv = [argv[0]!, "-t", `=${session}`, ...argv.slice(1).map(a => a === scoped ? pane! : a)];
       }
     }
@@ -562,19 +578,23 @@ export class TmuxAdapter {
     const exactTarget = target.startsWith("psmux:") ? target : /^[%$@]\d+$/.test(target) ? target
       : namedTarget.includes(":") ? namedTarget : `${namedTarget}:`;
     try {
-      const format = this.terminalKind === "psmux" ? `#{session_name}|${PANE_FORMAT}` : PANE_FORMAT;
-      const output = await this.run(["tmux", "list-panes", "-t", exactTarget, "-F", format],
-        `tmux list-panes -t ${shellQuote(exactTarget)} -F "${PANE_FORMAT}"`);
+      // Explicit vendor read-only entry bypasses startup registry/process
+      // maintenance and uses one fixed actor-owned epoch/pane observation.
+      const output = this.terminalKind === "psmux"
+        ? await this.run(["tmux", "list-panes", "-G", "-t", exactTarget])
+        : await this.run(["tmux", "list-panes", "-t", exactTarget, "-F", PANE_FORMAT],
+          `tmux list-panes -t ${shellQuote(exactTarget)} -F "${PANE_FORMAT}"`);
       if (this.terminalKind === "psmux") {
         return parseLines(output, line => {
-          const separator = line.indexOf("|");
-          if (separator <= 0) return null;
-          const session = line.slice(0, separator);
-          const pane = parsePaneLine(line.slice(separator + 1));
-          if (!pane || !/^%\d+$/.test(pane.id)) return null;
-          // psmux has one server per session: %1 is NOT globally unique.
-          // Persist its scope with the immutable pane id, never its mutable index.
-          return { ...pane, id: `psmux:${Buffer.from(session).toString("base64url")}:${pane.id}` };
+          const [session, sid, pid, birth, ...fields] = line.split("|");
+          const pane = parsePaneLine(fields.join("|"));
+          if (!session || !sid || !/^\$\d+$/.test(sid) || !pane || !/^%\d+$/.test(pane.id)) return null;
+          // One actor formats all fields in one observation. Persist its epoch
+          // in the EXISTING binding string: local %1 resets in each server.
+          // Older vendors with no own-birth format cannot qualify this binding.
+          const id = `psmux:v2:${Buffer.from(session).toString("base64url")}:${pane.id}:${sid.slice(1)}:${pid}:${birth}`;
+          if (!nativePaneRef(id)) return null;
+          return { ...pane, id };
         });
       }
       return parseLines(output, parsePaneLine);
@@ -604,11 +624,14 @@ export class TmuxAdapter {
         `tmux has-session -t ${shellQuote(target)}`);
       return { state: "present" }; // exit 0 = session exists
     } catch (err) {
-      // psmux's has-session returns an empty exit 1 for an absent session.
-      // Spawn/permission/transport failures carry diagnostics or a different code.
+      // psmux returns silent exit 1 for both a missing session and an
+      // unreachable session server. Without corroboration presence is unknown.
       const native = err as { code?: unknown; stdout?: unknown; stderr?: unknown; signal?: unknown; killed?: boolean };
       if (this.terminalKind === "psmux" && native.code === 1 && native.stdout === "" && native.stderr === ""
-        && !native.signal && !native.killed) return { state: "absent" };
+        && !native.signal && !native.killed) return {
+          state: "transport_unavailable",
+          cause: "psmux has-session returned silent exit 1; session presence is unknown.",
+        };
       if (isSessionAbsenceError(err)) {
         return { state: "absent" };
       }
@@ -774,6 +797,7 @@ export class TmuxAdapter {
       if (windowsCommand && bracketed && !["pwsh", "powershell"].includes(windowsCommand)) {
         const pid = await this.getPanePid(target);
         if (!pid) throw new Error("Windows pane process unavailable; no payload submitted");
+        if (policy) await policy.beforePaste();
         beforeWrite();
         // ConPTY removes bracketed-paste delimiters on its pipe. Console input
         // records preserve the delimiters and raw LF for the receiving editor.
@@ -786,6 +810,7 @@ export class TmuxAdapter {
           const phase = /failed at (read|compile|attach|open|write);/.exec(String((error as { stderr?: string }).stderr ?? ""))?.[1];
           throw new Error(`Windows console delivery failed${phase ? ` at ${phase}` : ""}; payload consumption unverified`);
         }
+        if (policy) await policy.afterPaste();
         return { ok: true };
       }
       await this.run(["tmux", "load-buffer", "-b", buffer, path],
@@ -905,14 +930,10 @@ export class TmuxAdapter {
     try {
       await this.fileOps.writeFile(script, `Remove-Item -LiteralPath ${powershellQuote(script)}\n${command}\n`, { mode: 0o600, flag: "wx" });
       created = true;
-      const text = beforeInput
-        ? await this.guardedInput(target, (pane, check) => this.sendTextUnchecked(pane, invocation, () => { check(); beforeInput(); }))
-        : await this.sendText(target, invocation);
+      const text = await this.sendText(target, invocation, beforeInput);
       if (!text.ok) return text;
       // The actual consumer deletes the script. Successful paste alone is not consumption.
-      const enter = beforeInput
-        ? await this.guardedInput(target, pane => { beforeInput(); return this.sendKeysUnchecked(pane, ["Enter"]); })
-        : await this.sendKeys(target, ["Enter"]);
+      const enter = await this.sendKeys(target, ["Enter"], beforeInput);
       if (enter.ok) created = false;
       return enter;
     } catch (error) {
@@ -982,14 +1003,17 @@ export class TmuxAdapter {
 
   async killSession(name: string): Promise<TmuxResult> {
     if (this.deliveryGuard) {
-      return this.guardedInput(name, async pane => {
+      return this.guardedInput(name, async (pane, beforeWrite) => {
+        if (this.terminalKind === "psmux") {
+          if (!nativePaneRef(pane)) return { ok: false, code: "guard_target_unknown", message: "Stored native pane has no qualified server epoch; nothing killed." };
+          beforeWrite();
+          return this.killSessionUnchecked(pane);
+        }
         const stdout = await this.run(["tmux", "display-message", "-p", "-t", pane, "#{session_id}"], `tmux display-message -p -t ${shellQuote(pane)} '#{session_id}'`);
         const sessionId = stdout.trim();
         if (!/^\$\d+$/.test(sessionId)) return { ok: false, code: "guard_target_unknown", message: "Cannot establish immutable session identity; no session killed." };
         const kill = async () => {
-          const scopedId = this.terminalKind === "psmux" && pane.startsWith("psmux:")
-            ? `${pane.slice(0, pane.lastIndexOf(":") + 1)}${sessionId}` : sessionId;
-          const result = await this.killSessionUnchecked(scopedId);
+          const result = await this.killSessionUnchecked(sessionId);
           if (result.ok) { this.freshProbes.delete(name); this.freshProbes.delete(pane); this.freshManaged.delete(name); }
           return result;
         };
@@ -1003,20 +1027,24 @@ export class TmuxAdapter {
   private async killSessionUnchecked(name: string): Promise<TmuxResult> {
     if (this.terminalKind === "psmux") {
       try {
-        const scoped = /^psmux:([A-Za-z0-9_-]+):(\$\d+)$/.exec(name);
-        const sessionName = scoped ? Buffer.from(scoped[1]!, "base64url").toString("utf8") : name.replace(/^=/, "");
-        const id = scoped?.[2] ?? (await this.run(["tmux", "display-message", "-p", "-t", `=${sessionName}`, "#{session_id}"])).trim();
-        if (!/^\$\d+$/.test(id)) return { ok: false, code: "guard_target_unknown", message: "Native session identity unavailable; nothing killed." };
-        // psmux doesn't accept $N as a selector. Select its server once, check
-        // identity inside that connection, then kill SELF without resolving a
-        // name again. Each native session has its own server: no sibling view can switch.
-        const out = await this.run(["tmux", "if-shell", "-F", `#{==:#{session_id},${id}}`, "kill-session", "display-message -p kept"], undefined, sessionName);
-        if (out.includes("kept")) return { ok: false, code: "guard_target_changed", message: "Native server identity changed; nothing killed." };
-        if ((await this.probeSession(sessionName)).state !== "absent") return { ok: false, code: "kill_unverified", message: "Native session disappearance unverified." };
+        // Managed callers arrive only after equality with the stored epoch.
+        // An explicit unmanaged name observes once; legacy refs never upgrade.
+        let ref = nativePaneRef(name);
+        if (!ref && !name.startsWith("psmux:")) {
+          const panes = await this.listPanes(name);
+          if (panes.length === 1) ref = nativePaneRef(panes[0]!.id);
+        }
+        if (!ref) return { ok: false, code: "guard_target_unknown", message: "Native server epoch unavailable; nothing killed." };
+        const out = await this.run(["tmux", "kill-session", "-t", `$${ref.sid}`, "-G", `${ref.pid}:${ref.birth}`]);
+        if (out !== "CHECKED-STOP COMPLETE\n") return { ok: false, code: "kill_unverified", message: "Native actor completion unknown." };
         this.freshProbes.delete(name); this.freshManaged.delete(name);
         return { ok: true };
-      } catch (error) { return classifyWriteError(error); }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, code: message.includes("checked stop identity rejected") ? "guard_target_changed" : "kill_unverified", message };
+      }
     }
+
     // The guarded path passes the immutable `$N` id, which stays as it is; a bare name is made exact.
     const session = exactTarget(name, "session");
     // Detach first so `detach-on-destroy off` cannot switch views onto another session.
