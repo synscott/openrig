@@ -132,11 +132,11 @@ function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expec
     return false;
   }
 
-  return codexResumeToken(args) === expectedToken;
+  return codexConversationToken(args, "resume") === expectedToken;
 }
 
-// undefined is a fresh command; null is a resume command without an exact token.
-function codexResumeToken(args: string[]): string | null | undefined {
+// undefined is another command; null is the requested command without an exact token.
+function codexConversationToken(args: string[], subcommand: "resume" | "fork"): string | null | undefined {
   const topLevelOptionsWithValues = new Set([
     "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
     "-p", "--profile", "-s", "--sandbox",
@@ -146,7 +146,7 @@ function codexResumeToken(args: string[]): string | null | undefined {
     const arg = args[index]!;
     if (topLevelOptionsWithValues.has(arg)) { index += 1; continue; }
     if (arg.startsWith("-")) continue;
-    if (arg === "resume") resumeIndex = index;
+    if (arg === subcommand) resumeIndex = index;
     break;
   }
   if (resumeIndex < 0) return undefined;
@@ -175,7 +175,7 @@ export function claudeCommandSessionToken(command: string): string | null {
 /** The conversation a Codex command line resumes: its token, null for a resume naming none, undefined
  *  when the command is not a resume at all (a fresh `codex -C …`). */
 export function codexCommandResumeToken(command: string): string | null | undefined {
-  return codexResumeToken(tokens(command).slice(1));
+  return codexConversationToken(tokens(command).slice(1), "resume");
 }
 
 type ClaudeArgvIds = { resume: string | null; "session-id": string | null };
@@ -532,13 +532,75 @@ function selectNativeProcess(rows: NativeProcessRow[], panePid: number, expected
     // links naming different conversations stay refused. Exact resume proof
     // needs the deepest process's own argv: a launcher's token is never
     // inherited by a child that names nothing, which stays deliverable but unproved.
-    const identities = chain.map((link) => codexResumeToken(rowArgv(link.process).slice(1)));
+    const identities = chain.map((link) => codexConversationToken(rowArgv(link.process).slice(1), "resume"));
     if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return null;
     if (requireResume && (!expectedToken || identities[0] !== expectedToken)) return null;
     if (expectedToken !== undefined && identities.some((value) => value !== undefined
       && (!expectedToken || value !== expectedToken))) return null;
   }
   return observation;
+}
+
+/** Whether any process in the pane's subtree (the pane's own process included) has a Claude executable anywhere in its
+ *  argv: the recognizer `findExactNativeResumeProcess` (via `commandUsesExpectedToken`) starts from. A Claude run as
+ *  `node …/bin/claude`, or in the background, counts. */
+export function subtreeNamesClaudeExecutable(rows: NativeProcessRow[], panePid: number): boolean {
+  const byParent = new Map<number, NativeProcessRow[]>();
+  for (const row of rows) byParent.set(row.ppid, [...(byParent.get(row.ppid) ?? []), row]);
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const queue = [panePid];
+  const seen = new Set<number>();
+  while (queue.length > 0) {
+    const pid = queue.shift()!;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const row = byPid.get(pid);
+    if (row && tokens(row.command).some((token) => claudeExecutable(token))) return true;
+    for (const child of byParent.get(pid) ?? []) queue.push(child.pid);
+  }
+  return false;
+}
+
+/** Why `selectNativeProcess` rejects a snapshot, in the same order it checks. Used only to word a failed check;
+ *  a test pins `kind: "passes"` to `selectNativeProcess` returning a process, so the two cannot drift apart. */
+export type NativeRejection =
+  | { kind: "passes" }
+  | { kind: "no_single_process" }
+  | { kind: "no_recorded_conversation" }
+  | { kind: "names_no_conversation" }
+  | { kind: "not_a_resume" }
+  | { kind: "other_conversation"; conversation: string }
+  | { kind: "conflicting_conversations" }
+  | { kind: "rotation_process_mismatch"; conversation: string };
+
+export function explainNativeRejection(rows: NativeProcessRow[], panePid: number, runtime: NativeRuntime,
+  expectedToken: string | null | undefined, requireResume: boolean, rotation?: ClaudeResumeRotation | null, selectedExecutable?: string): NativeRejection {
+  const matches = nativeProcessCandidates(rows, panePid, runtime, selectedExecutable);
+  const chain = runtime === "codex" ? launcherChain(matches, rows) : matches;
+  if (!chain || chain.length === 0 || (runtime !== "codex" && chain.length !== 1)) return { kind: "no_single_process" };
+  const { process } = chain[0]!;
+  if (runtime === "claude-code") {
+    if (!expectedToken) return { kind: "no_recorded_conversation" };
+    const launched = claudeSessionToken(tokens(process.command).slice(1));
+    if (launched === expectedToken) return { kind: "passes" };
+    if (launched === null) return { kind: "names_no_conversation" };
+    if (launched === rotation?.token) return rotationProcess(process, rotation) ? { kind: "passes" } : { kind: "rotation_process_mismatch", conversation: launched };
+    return { kind: "other_conversation", conversation: launched };
+  }
+  const identities = chain.map((link) => codexConversationToken(tokens(link.process.command).slice(1), "resume"));
+  if (new Set(identities.filter((value) => typeof value === "string")).size > 1) return { kind: "conflicting_conversations" };
+  if (requireResume) {
+    if (!expectedToken) return { kind: "no_recorded_conversation" };
+    if (identities[0] === undefined) return { kind: "not_a_resume" };
+    if (identities[0] === null) return { kind: "names_no_conversation" };
+    if (identities[0] !== expectedToken) return { kind: "other_conversation", conversation: identities[0] };
+  }
+  if (expectedToken !== undefined) {
+    const named = identities.find((value) => value !== undefined && (!expectedToken || value !== expectedToken));
+    if (named === null) return { kind: "names_no_conversation" };
+    if (typeof named === "string") return { kind: "other_conversation", conversation: named };
+  }
+  return { kind: "passes" };
 }
 
 async function observeNativePaneProcess(input: {
@@ -568,6 +630,29 @@ async function observeNativePaneProcess(input: {
 
 export async function observeCodexPaneProcess(input: Parameters<typeof observeNativePaneProcess>[0]): Promise<CodexProcessObservation | null> {
   return observeNativePaneProcess(input, "codex");
+}
+
+/** A single foreground Codex chain that explicitly forks the requested parent.
+ * The child's PID-owned native record must still supply its own identity. */
+export async function observeCodexForkProcess(input: {
+  target: string;
+  tmux: { getPanePid(target: string): Promise<number | null> };
+  listProcesses?: NativeProcessLister;
+  parentToken: string;
+}): Promise<CodexProcessObservation | null> {
+  try {
+    const pid = await input.tmux.getPanePid(input.target);
+    if (!pid || !input.parentToken) return null;
+    const rows = await (input.listProcesses ?? listNativeProcesses)();
+    const chain = launcherChain(nativeProcessCandidates(rows, pid, "codex"), rows);
+    if (!chain?.length) return null;
+    const args = chain.map(link => tokens(link.process.command).slice(1));
+    const parents = args.map(argv => codexConversationToken(argv, "fork"));
+    if (!parents.includes(input.parentToken)
+      || parents.some(parent => parent !== undefined && parent !== input.parentToken)
+      || args.some(argv => codexConversationToken(argv, "resume") !== undefined)) return null;
+    return chain[0]!;
+  } catch { return null; }
 }
 
 export async function verifyCodexPaneProcess(input: Parameters<typeof observeCodexPaneProcess>[0]): Promise<CodexProcessObservation | null> {

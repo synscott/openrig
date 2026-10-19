@@ -27,6 +27,10 @@ supports, though OpenRig's automated tests don't run on it yet. One user's
 odd-numbered releases (23, 25 and so on) are not supported; Node 26 and later
 even-numbered releases are untested.
 
+On Linux, if Codex cannot run commands and reports `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`,
+ask the machine owner to follow [OpenAI's sandbox prerequisites](https://developers.openai.com/codex/concepts/sandboxing#prerequisites),
+including its `bwrap` AppArmor profile guidance; changes to AppArmor are the owner's choice.
+
 **Choose permissions before starting the team.** Ordinary OpenRig launches use
 Codex's `-s workspace-write`, with approval policy from your native configuration,
 or Claude Code's `acceptEdits`, which still leaves commands subject to native
@@ -98,8 +102,22 @@ user.
 
 **Agents:** if you're setting OpenRig up for someone, load the `rigs` skill and follow it. It carries the install, the
 OpenRig view and the handoff to the operator as one procedure. From 0.6.7, OpenRig installs it as `rigs` in
-`~/.claude/skills` and `~/.agents/skills` when the daemon starts. Before that, add it with
-`npx skills add mvschwarz/openrig --skill rigs`, or read [`skills/rigs/SKILL.md`](../../skills/rigs/SKILL.md).
+`~/.claude/skills` and `~/.agents/skills` when the daemon starts. To add it manually, use the release tag matching
+your installed `rig --version`: replace `<release-tag>` below with that tag, including its `v` prefix.
+`rig --version` prints the version and a commit, for example `0.6.11 (379f0a0d)`; the tag is `v0.6.11`.
+The skill is in the repository from v0.6.6; on an older install, use the v0.6.6 tag or upgrade first.
+Choose the command for the agent doing the setup:
+
+```sh
+# Claude Code
+npx skills add "https://github.com/mvschwarz/openrig/tree/<release-tag>/skills/rigs" --skill rigs --agent claude-code
+
+# Codex
+npx skills add "https://github.com/mvschwarz/openrig/tree/<release-tag>/skills/rigs" --skill rigs --agent codex
+```
+
+These are the pinned, per-agent forms used on the [rigs pages](https://openrig.dev/rigs).
+You can also read [`skills/rigs/SKILL.md`](../../skills/rigs/SKILL.md) directly.
 
 **One command, for the full setup.** It needs Node.js 22 or 24 with npm already installed. The preview prints what the
 script will do and changes nothing:
@@ -590,6 +608,7 @@ the lifecycle API without booting a new kernel, then stop the remaining rigs.
 | Tool missing or login fails | Use the specific setup/auth hint; recheck that executable in the launch shell. Do not send work to an unready seat. |
 | "Startup attention" or "Startup details" names a prompt | Answer the login, trust or bypass prompt in that seat's terminal, then run the `rig seat continue <seat>` it shows. |
 | "Readiness timeout after 30s — harness did not become interactive" | The harness took longer than the readiness window. Raise it for the next launch with `rig config set runtime.readiness_timeout_seconds <1-600>`, then relaunch that seat. |
+| "Claude resume did not finish within Ns; Claude may still be starting, so the launch was kept" | A restored Claude seat was not interactive when the wait ended. Its pane and resume token are kept. Look at the pane; once Claude is up, run `rig seat clear-attention <seat>`. The wait is about `runtime.readiness_timeout_seconds` in total for each seat (default 30 s), counting the first 3.2 s, and the time adds up seat by seat in a restore. Raising the setting for slow fresh launches lengthens it. If `rig up` or `rig launch` times out at 120 s, that is not a rollback: check `rig ps` before running it again. |
 | Daemon is healthy, kernel is still starting | Read `rig status` and `rig ps --nodes --rig kernel`; kernel readiness is separate. |
 | Kernel seats fail within a second of the first start, and tmux reports "server exited unexpectedly" | Check that your tmux can capture a pane, then start the failed seats again; see the tmux check below this table. |
 | Shared terminal is absent | Inspect the existing kernel binding and recovery state; use standalone `rig tui` while resolving it. |
@@ -884,7 +903,10 @@ after an authorized launch before claiming its actual permission behavior.
 The rig-level verbs are `rig policy permissions list`, `show`, `current` and
 `apply`. Existing `rig policy list/show/current/apply` remain compatibility
 aliases with the same JSON and exit behavior. Pi resource trust and the per-seat
-typing guard are separate controls.
+typing guard are separate controls. To retain automatic messages while you have
+an unfinished terminal input, opt that seat into [draft-aware delivery](seat-delivery.md).
+The same typing guard offers `hold` for a manual terminal (`--enabled true`)
+and `off` for ordinary automatic sends (`--enabled false`).
 
 ### Claude Code: a different launch flag
 
