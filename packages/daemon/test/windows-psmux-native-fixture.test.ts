@@ -4,11 +4,98 @@ import { describe, expect, it } from "vitest";
 import { createWindowsPsmuxNativeFixture, withWindowsPsmuxNativeFixture, type NativeFixtureExec } from "./helpers/windows-psmux-native-fixture.js";
 
 type CreationRequest = { attempt: string; name: string; env: Record<string, string> };
+const exitedServer = async () => ({ waitForExit: async () => "exited" as const, close: async () => {} });
 function created(request: CreationRequest) {
   return JSON.stringify({ version: 1, status: "created", attempt: request.attempt, name: request.name, sid: "7", pid: "100", birth: "123456", pane: "%1" }) + "\n";
 }
 
 describe("native psmux fixture isolation", () => {
+  it("holds the original full-precision server identity before one stop and waits before deletion", async () => {
+    const events: string[] = [];
+    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused",
+      observeServer: async identity => {
+        expect(identity).toEqual({ pid: "100", birth: "123456" });
+        events.push("open");
+        return { waitForExit: async () => { events.push("wait"); return "exited"; }, close: async () => { events.push("release"); } };
+      },
+      execute: async (_binary, command) => {
+        if (command[0] === "checked-create") return { stdout: created(JSON.parse(readFileSync(command[2]!, "utf8"))) };
+        events.push("stop");
+        return { stdout: "CHECKED-STOP COMPLETE\n" };
+      },
+    });
+    try {
+      const pane = await fixture.createSession("owned");
+      await fixture.stop(pane.id);
+      expect(events).toEqual(["open", "stop", "wait", "release"]);
+      expect(fixture.diagnostics().ownedReceipts).toHaveLength(1);
+      expect(existsSync(fixture.dir)).toBe(true);
+      await fixture.close();
+      expect(events).toEqual(["open", "stop", "wait", "release"]);
+      expect(existsSync(fixture.dir)).toBe(false);
+    } finally { fixture.removeFiles(); }
+  });
+
+  it("preserves receipt and directory on identity/access/exit uncertainty without a second stop", async () => {
+    for (const outcome of ["identity_mismatch", "access_unknown", "handle_lost", "timeout", "unknown", "observer_close_unknown"] as const) {
+      let stops = 0;
+      const fixture = createWindowsPsmuxNativeFixture({ binary: "unused",
+        observeServer: async () => {
+          if (outcome === "identity_mismatch" || outcome === "access_unknown") throw Object.assign(new Error(outcome), { code: outcome });
+          return { assertRetained: () => { if (outcome === "handle_lost") throw new Error("handle_lost"); },
+            waitForExit: async () => outcome === "observer_close_unknown" || outcome === "handle_lost" ? "exited" : outcome,
+            close: async () => { if (outcome === "observer_close_unknown") throw new Error("observer_close_unknown"); } };
+        },
+        execute: async (_binary, command) => {
+          if (command[0] === "checked-create") return { stdout: created(JSON.parse(readFileSync(command[2]!, "utf8"))) };
+          stops += 1; return { stdout: "CHECKED-STOP COMPLETE\n" };
+        },
+      });
+      try {
+        const pane = await fixture.createSession("owned");
+        await expect(fixture.stop(pane.id)).rejects.toThrow();
+        await expect(fixture.close()).rejects.toThrow("cleanup unverified; preserved");
+        expect(stops).toBe(outcome === "identity_mismatch" || outcome === "access_unknown" || outcome === "handle_lost" ? 0 : 1);
+        expect(fixture.diagnostics().ownedReceipts).toHaveLength(1);
+        expect(existsSync(fixture.dir)).toBe(true);
+        expect(readdirSync(fixture.dir).filter(file => file.endsWith(".receipt.json"))).toHaveLength(1);
+      } finally { fixture.removeFiles(); }
+    }
+  });
+
+  it("passes the original birth FILETIME above JavaScript's safe integer range without rounding", async () => {
+    const birth = "134368656404675219";
+    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused",
+      observeServer: async identity => { expect(identity).toEqual({ pid: "100", birth }); return exitedServer(); },
+      execute: async (_binary, command) => {
+        if (command[0] === "checked-create") {
+          const request: CreationRequest = JSON.parse(readFileSync(command[2]!, "utf8"));
+          return { stdout: JSON.stringify({ ...JSON.parse(created(request)), birth }) + "\n" };
+        }
+        expect(command).toEqual(["kill-session", "-t", "$7", "-G", `100:${birth}`]);
+        return { stdout: "CHECKED-STOP COMPLETE\n" };
+      },
+    });
+    try {
+      const pane = await fixture.createSession("owned");
+      await fixture.stop(pane.id);
+      expect(fixture.diagnostics().acknowledgedStopReceipts[0]!.pane.endsWith(`:${birth}`)).toBe(true);
+      await fixture.close();
+    } finally { fixture.removeFiles(); }
+  });
+
+  it("distinguishes missing original route from actor rejection and generic transport failure", async () => {
+    for (const [message, code] of [["checked stop route unavailable", "kill_unverified"], ["checked stop identity rejected", "guard_target_changed"], ["transport failed", "kill_unverified"]]) {
+      const fixture = createWindowsPsmuxNativeFixture({ binary: "unused", execute: async (_binary, command) => {
+        expect(command).toEqual(["kill-session", "-t", "$0", "-G", "100:123456"]);
+        throw new Error(message);
+      } });
+      try {
+        expect(await fixture.adapter.killSession("psmux:v2:b3duZWQ:%1:0:100:123456"))
+          .toEqual({ ok: false, code, message });
+      } finally { fixture.removeFiles(); }
+    }
+  });
   it("serializes bounded refusal and cleanup diagnostics while preserving both original errors", async () => {
     const secret = "DO-NOT-REPORT-ENVIRONMENT-CONTENT";
     const assertion = Object.assign(new Error(secret), {
@@ -50,7 +137,7 @@ describe("native psmux fixture isolation", () => {
     const parentRoot = process.env.PSMUX_DATA_DIR;
     const calls: Parameters<NativeFixtureExec>[] = [];
     let fixture: ReturnType<typeof createWindowsPsmuxNativeFixture>;
-    fixture = createWindowsPsmuxNativeFixture({ binary: "unused", environment: { PSMUX_DATA_DIR: "owner-root", USERPROFILE: "owner-profile" }, execute: async (...args) => {
+    fixture = createWindowsPsmuxNativeFixture({ binary: "unused", observeServer: exitedServer, environment: { PSMUX_DATA_DIR: "owner-root", USERPROFILE: "owner-profile" }, execute: async (...args) => {
       calls.push(args);
       const [, command, options] = args;
       expect(options.env.PSMUX_DATA_DIR).toBe(fixture.dataDir);
@@ -73,7 +160,7 @@ describe("native psmux fixture isolation", () => {
       const receiptFile = readdirSync(fixture.dir).find(file => file.endsWith(".receipt.json"))!;
       expect(JSON.parse(readFileSync(path.join(fixture.dir, receiptFile), "utf8"))).toMatchObject({ version: 1, root: fixture.dataDir, name: "owned", pane: pane.id });
       await fixture.stop(pane.id);
-      expect(fixture.diagnostics().ownedReceipts).toEqual([]);
+      expect(fixture.diagnostics().ownedReceipts).toHaveLength(1);
       expect(fixture.diagnostics().acknowledgedStopReceipts).toHaveLength(1);
       expect(calls.map(([, command]) => command[0])).toEqual(["checked-create", "kill-session"]);
       expect(process.env.PSMUX_DATA_DIR).toBe(parentRoot);
@@ -108,7 +195,7 @@ describe("native psmux fixture isolation", () => {
   it("does not stop a collision winner and preserves failed checked-stop evidence", async () => {
     let collision = true;
     const calls: string[][] = [];
-    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused", execute: async (_binary, command) => {
+    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused", observeServer: exitedServer, execute: async (_binary, command) => {
       calls.push(command);
       if (command[0] === "checked-create") {
         const request: CreationRequest = JSON.parse(readFileSync(command[2]!, "utf8"));
@@ -127,7 +214,7 @@ describe("native psmux fixture isolation", () => {
       await expect(fixture.close()).rejects.toThrow("cleanup unverified; preserved");
       expect(existsSync(fixture.dir)).toBe(true);
       expect(readdirSync(fixture.dir).filter(file => file.endsWith(".receipt.json"))).toHaveLength(1);
-      expect(calls.map(command => command[0])).toEqual(["checked-create", "checked-create", "kill-session", "kill-session"]);
+      expect(calls.map(command => command[0])).toEqual(["checked-create", "checked-create", "kill-session"]);
     } finally { fixture.removeFiles(); } // Only injected processes existed.
   });
   it("replaces inherited registry/config selectors for every client without replacing the OS profile", async () => {

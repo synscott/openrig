@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { renderWindowsLaunch } from "../src/adapters/windows-launch.js";
 import { pathToFileURL } from "node:url";
-import { createWindowsPsmuxNativeFixture, withWindowsPsmuxNativeFixture } from "./helpers/windows-psmux-native-fixture.js";
+import { createWindowsPsmuxNativeFixture, withWindowsPsmuxNativeFixture, SERVER_OBSERVER_BUDGET_MS } from "./helpers/windows-psmux-native-fixture.js";
 
 const enabled = process.platform === "win32" && !!process.env.OPENRIG_TEST_PSMUX;
 const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
@@ -17,9 +17,9 @@ const CREATE_MS = 35_000;
 const COMMAND_MS = 5_000;
 const MARKER_5S_MS = 5_000 + 50 + COMMAND_MS;
 const HARNESS_RESERVE_MS = 10_000;
-const MULTILINE_MS = CREATE_MS + (5 + 1) * COMMAND_MS + 2 * MARKER_5S_MS + HARNESS_RESERVE_MS;
-const ARGV_MS = 2 * CREATE_MS + (7 + 2) * COMMAND_MS + (12_000 + 50 + COMMAND_MS) + HARNESS_RESERVE_MS;
-const STALE_EPOCH_MS = 3 * CREATE_MS + (12 + 3) * COMMAND_MS + 2 * MARKER_5S_MS + HARNESS_RESERVE_MS;
+const MULTILINE_MS = CREATE_MS + (5 + 1) * COMMAND_MS + 2 * MARKER_5S_MS + HARNESS_RESERVE_MS + SERVER_OBSERVER_BUDGET_MS;
+const ARGV_MS = 2 * CREATE_MS + (7 + 2) * COMMAND_MS + (12_000 + 50 + COMMAND_MS) + HARNESS_RESERVE_MS + 3 * SERVER_OBSERVER_BUDGET_MS;
+const STALE_EPOCH_MS = 3 * CREATE_MS + (12 + 3) * COMMAND_MS + 2 * MARKER_5S_MS + HARNESS_RESERVE_MS + 4 * SERVER_OBSERVER_BUDGET_MS;
 
 function nativeFixture() {
   const binary = process.env.OPENRIG_TEST_PSMUX!;
@@ -106,8 +106,10 @@ describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
 
       expect(await adapter.killSession(original.id)).toMatchObject({
         ok: false,
-        code: "guard_target_changed",
-        message: expect.stringContaining("checked stop identity rejected"),
+        code: "kill_unverified",
+        // The original SID route was removed. This is a specific pre-actor
+        // refusal, not an observation of the replacement actor's epoch guard.
+        message: expect.stringContaining("checked stop route unavailable"),
       });
       expect((await adapter.listPanes(session))[0]?.id).toBe(replacement.id);
       expect((await adapter.listPanes(siblingName))[0]?.id).toBe(sibling.id);
