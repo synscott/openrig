@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { renderWindowsLaunch } from "../src/adapters/windows-launch.js";
 import { pathToFileURL } from "node:url";
-import { createWindowsPsmuxNativeFixture } from "./helpers/windows-psmux-native-fixture.js";
+import { createWindowsPsmuxNativeFixture, withWindowsPsmuxNativeFixture } from "./helpers/windows-psmux-native-fixture.js";
 
 const enabled = process.platform === "win32" && !!process.env.OPENRIG_TEST_PSMUX;
 const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
@@ -28,14 +28,7 @@ function nativeFixture() {
 }
 
 async function withNativeFixture(run: (fixture: ReturnType<typeof nativeFixture>) => Promise<void>) {
-  const fixture = nativeFixture();
-  let failure: unknown;
-  try { await run(fixture); } catch (error) { failure = error; }
-  try { await fixture.close(); } catch (error) {
-    if (failure) throw new AggregateError([failure, error], "Native assertion and checked cleanup failed");
-    throw error;
-  }
-  if (failure) throw failure;
+  return withWindowsPsmuxNativeFixture(nativeFixture(), run);
 }
 
 async function waitForFile(file: string, adapter: TmuxAdapter, target: string, timeout = 5_000) {

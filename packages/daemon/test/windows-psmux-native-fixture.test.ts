@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { createWindowsPsmuxNativeFixture, type NativeFixtureExec } from "./helpers/windows-psmux-native-fixture.js";
+import { createWindowsPsmuxNativeFixture, withWindowsPsmuxNativeFixture, type NativeFixtureExec } from "./helpers/windows-psmux-native-fixture.js";
 
 type CreationRequest = { attempt: string; name: string; env: Record<string, string> };
 function created(request: CreationRequest) {
@@ -9,6 +9,43 @@ function created(request: CreationRequest) {
 }
 
 describe("native psmux fixture isolation", () => {
+  it("serializes bounded refusal and cleanup diagnostics while preserving both original errors", async () => {
+    const secret = "DO-NOT-REPORT-ENVIRONMENT-CONTENT";
+    const assertion = Object.assign(new Error(secret), {
+      name: "AssertionError", actual: { ok: false, code: "kill_unverified", message: `checked stop route unavailable ${secret}` },
+      expected: { ok: false, code: "guard_target_changed" },
+    });
+    const cleanup = Object.assign(new Error(secret), { code: "EPERM" });
+    const fixture = {
+      close: async () => { throw cleanup; },
+      diagnostics: () => ({ root: "fixture-root", pendingAttempts: ["pending-attempt"], ownedReceipts: [], acknowledgedStopReceipts: [] }),
+    };
+    const result = await withWindowsPsmuxNativeFixture(fixture, async () => { throw assertion; }).catch(error => error);
+    expect(result).toBeInstanceOf(AggregateError);
+    expect(result.errors).toEqual([assertion, cleanup]);
+    expect(result.message).toContain("kill_unverified");
+    expect(result.message).toContain("guard_target_changed");
+    expect(result.message).toContain("route_unavailable");
+    expect(result.message).toContain("EPERM");
+    expect(result.message).toContain("pending-attempt");
+    expect(result.message).not.toContain(secret);
+    expect(result.message.length).toBeLessThanOrEqual(8192);
+  });
+
+  it("keeps body-only, cleanup-only and falsy failures failing at the lifetime boundary", async () => {
+    const body = new Error("body");
+    const cleanup = Object.assign(new Error("cleanup"), { code: "EPERM" });
+    for (const [bodyFails, bodyError, cleanupError] of [[true, body, undefined], [false, undefined, cleanup], [true, undefined, undefined]] as const) {
+      const fixture = {
+        close: async () => { if (cleanupError) throw cleanupError; },
+        diagnostics: () => ({ root: "fixture-root", pendingAttempts: [], ownedReceipts: [], acknowledgedStopReceipts: [] }),
+      };
+      const result = await withWindowsPsmuxNativeFixture(fixture, async () => { if (bodyFails) throw bodyError; }).catch(error => error);
+      expect(result).toBeInstanceOf(AggregateError);
+      expect(result.errors).toEqual([bodyFails ? bodyError : cleanupError]);
+      expect(result.message).toContain(bodyFails ? '"body"' : '"cleanup"');
+    }
+  });
   it("creates through the current checked-create protocol", async () => {
     const parentRoot = process.env.PSMUX_DATA_DIR;
     const calls: Parameters<NativeFixtureExec>[] = [];
@@ -36,6 +73,8 @@ describe("native psmux fixture isolation", () => {
       const receiptFile = readdirSync(fixture.dir).find(file => file.endsWith(".receipt.json"))!;
       expect(JSON.parse(readFileSync(path.join(fixture.dir, receiptFile), "utf8"))).toMatchObject({ version: 1, root: fixture.dataDir, name: "owned", pane: pane.id });
       await fixture.stop(pane.id);
+      expect(fixture.diagnostics().ownedReceipts).toEqual([]);
+      expect(fixture.diagnostics().acknowledgedStopReceipts).toHaveLength(1);
       expect(calls.map(([, command]) => command[0])).toEqual(["checked-create", "kill-session"]);
       expect(process.env.PSMUX_DATA_DIR).toBe(parentRoot);
       await fixture.close();
