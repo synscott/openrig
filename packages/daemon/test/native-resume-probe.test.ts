@@ -825,6 +825,22 @@ describe("native resume probe", () => {
     });
   });
 
+  it("recognizes the live GPT-6-Astra footer behind a managed shell wrapper after the header scrolls out", () => {
+    expect(assessNativeResumeProbe({
+      runtime: "codex",
+      paneCommand: "sh",
+      paneContent: [
+        "From: dev-owner@dione-refactoring To: quality-analyst@software-testing",
+        "• Ran rig whoami --json",
+        "",
+        "› Ask Codex to do anything",
+        "",
+        "  GPT-6-Astra default · ~/code/software-testing/analyst · Recovery",
+        "  ? for shortcuts                   ⚠ 1 warning · f2 to view",
+      ].join("\n"),
+    })).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
   it("keeps a foreground Codex process without a native prompt unverified", () => {
     expect(
       assessNativeResumeProbe({
