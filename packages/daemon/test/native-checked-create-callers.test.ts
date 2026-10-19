@@ -1,5 +1,8 @@
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TmuxAdapter, type TmuxFileOps, type ArgvExecFn } from "../src/adapters/tmux.js";
+import { TmuxAdapter, defaultTmuxFileOps, type TmuxFileOps, type ArgvExecFn } from "../src/adapters/tmux.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
@@ -149,4 +152,31 @@ describe("native checked creation through NodeLauncher", () => {
     } finally { f.db.close(); }
   });
 
+});
+
+describe("explicit immutable native backend root", () => {
+  it("uses its real canonical selected root without changing inherited environment", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "openrig-root-boundary-"));
+    try {
+      const selected = realpathSync(dir), before = process.env.PSMUX_DATA_DIR;
+      const backend = { psmuxDataDir: selected };
+      const calls: unknown[] = [];
+      const adapter = new TmuxAdapter(async () => { throw Error("no shell"); }, defaultTmuxFileOps(), async (argv, options) => {
+        calls.push({ argv: argv.slice(0, 3), options });
+        return JSON.stringify({ version: 1, status: "created", attempt, name: "seat@fixture", sid: "7", pid: "10", birth: "11", pane: "%1" }) + "\n";
+      }, "psmux", backend);
+      backend.psmuxDataDir = join(selected, "different-root");
+      expect(adapter.nativeCreationRoot()).toBe(selected);
+      expect(await adapter.createSession("seat@fixture", selected, {}, { attempt, root: selected })).toMatchObject({ ok: true, creation: { root: selected, pane } });
+      expect(calls).toEqual([{ argv: ["tmux", "checked-create", "--file"], options: { timeoutMs: 35000, psmuxDataDir: selected } }]);
+      expect(process.env.PSMUX_DATA_DIR).toBe(before);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it("refuses an uncanonical selected root before staging or dispatch", async () => {
+    const argv = vi.fn();
+    const adapter = new TmuxAdapter(async () => "", defaultTmuxFileOps(), argv, "psmux", { psmuxDataDir: "relative-root" });
+    expect(adapter.nativeCreationRoot()).toBeNull();
+    expect(await adapter.createSession("seat@fixture", "/fixture", {}, { attempt, root: "relative-root" })).toMatchObject({ ok: false, code: "native_creation_context_required" });
+    expect(argv).not.toHaveBeenCalled();
+  });
 });

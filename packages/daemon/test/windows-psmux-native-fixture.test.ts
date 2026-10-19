@@ -1,8 +1,96 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createWindowsPsmuxNativeFixture, type NativeFixtureExec } from "./helpers/windows-psmux-native-fixture.js";
 
+type CreationRequest = { attempt: string; name: string; env: Record<string, string> };
+function created(request: CreationRequest) {
+  return JSON.stringify({ version: 1, status: "created", attempt: request.attempt, name: request.name, sid: "7", pid: "100", birth: "123456", pane: "%1" }) + "\n";
+}
+
 describe("native psmux fixture isolation", () => {
+  it("creates through the current checked-create protocol", async () => {
+    const parentRoot = process.env.PSMUX_DATA_DIR;
+    const calls: Parameters<NativeFixtureExec>[] = [];
+    let fixture: ReturnType<typeof createWindowsPsmuxNativeFixture>;
+    fixture = createWindowsPsmuxNativeFixture({ binary: "unused", environment: { PSMUX_DATA_DIR: "owner-root", USERPROFILE: "owner-profile" }, execute: async (...args) => {
+      calls.push(args);
+      const [, command, options] = args;
+      expect(options.env.PSMUX_DATA_DIR).toBe(fixture.dataDir);
+      expect(options.env.PSMUX_CONFIG_FILE).toBe(fixture.configFile);
+      expect(options.env.PSMUX_NO_WARM).toBe("1");
+      if (command[0] === "checked-create") {
+        const request: CreationRequest = JSON.parse(readFileSync(command[2]!, "utf8"));
+        const ledger = JSON.parse(readFileSync(path.join(fixture.dir, `creation-${request.attempt}.attempt.json`), "utf8"));
+        expect(ledger).toEqual({ version: 1, attempt: request.attempt, name: "owned", root: fixture.dataDir });
+        expect(Object.keys(request.env).some(key => /^(?:psmux|tmux)(?:_|$)/i.test(key))).toBe(false);
+        expect(options.timeout).toBe(35000);
+        return { stdout: created(request) };
+      }
+      expect(command).toEqual(["kill-session", "-t", "$7", "-G", "100:123456"]);
+      return { stdout: "CHECKED-STOP COMPLETE\n" };
+    } });
+    try {
+      const pane = await fixture.createSession("owned");
+      expect(pane.id).toBe("psmux:v2:b3duZWQ:%1:7:100:123456");
+      const receiptFile = readdirSync(fixture.dir).find(file => file.endsWith(".receipt.json"))!;
+      expect(JSON.parse(readFileSync(path.join(fixture.dir, receiptFile), "utf8"))).toMatchObject({ version: 1, root: fixture.dataDir, name: "owned", pane: pane.id });
+      await fixture.stop(pane.id);
+      expect(calls.map(([, command]) => command[0])).toEqual(["checked-create", "kill-session"]);
+      expect(process.env.PSMUX_DATA_DIR).toBe(parentRoot);
+      await fixture.close();
+      expect(existsSync(fixture.dir)).toBe(false);
+    } finally { fixture.removeFiles(); }
+  });
+
+  it("honors the checked-create deadline and refuses a different root before dispatch", async () => {
+    const calls: Parameters<NativeFixtureExec>[] = [];
+    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused", execute: async (...args) => { calls.push(args); return { stdout: "ok" }; } });
+    try {
+      await fixture.invoke(["tmux", "checked-create", "--file", "owned.json"], { timeoutMs: 35000, psmuxDataDir: fixture.dataDir });
+      expect(calls[0]![2].timeout).toBe(35000);
+      await expect(fixture.invoke(["tmux", "checked-create"], { psmuxDataDir: "other-root" })).rejects.toThrow("root");
+      expect(calls).toHaveLength(1);
+    } finally { fixture.removeFiles(); }
+  });
+
+  it("preserves an uncertain attempt without name lookup or cleanup", async () => {
+    const calls: string[][] = [];
+    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused", execute: async (_binary, command) => { calls.push(command); return { stdout: "unverified" }; } });
+    try {
+      await expect(fixture.createSession("uncertain")).rejects.toThrow("native_create_unknown");
+      await expect(fixture.close()).rejects.toThrow("cleanup unverified; preserved");
+      expect(existsSync(fixture.dir)).toBe(true);
+      expect(readdirSync(fixture.dir).filter(file => file.endsWith(".attempt.json"))).toHaveLength(1);
+      expect(calls.map(command => command[0])).toEqual(["checked-create"]);
+    } finally { fixture.removeFiles(); } // Inert transport proves no process was created.
+  });
+
+  it("does not stop a collision winner and preserves failed checked-stop evidence", async () => {
+    let collision = true;
+    const calls: string[][] = [];
+    const fixture = createWindowsPsmuxNativeFixture({ binary: "unused", execute: async (_binary, command) => {
+      calls.push(command);
+      if (command[0] === "checked-create") {
+        const request: CreationRequest = JSON.parse(readFileSync(command[2]!, "utf8"));
+        if (collision) throw Object.assign(new Error("collision"), { code: 2, stdout: JSON.stringify({ version: 1, status: "collision", attempt: request.attempt, name: request.name }) + "\n" });
+        return { stdout: created(request) };
+      }
+      expect(command).toEqual(["kill-session", "-t", "$7", "-G", "100:123456"]);
+      return { stdout: "not verified" };
+    } });
+    try {
+      await expect(fixture.createSession("collision")).rejects.toThrow("duplicate_session");
+      expect(calls.map(command => command[0])).toEqual(["checked-create"]);
+      collision = false;
+      const pane = await fixture.createSession("owned");
+      await expect(fixture.stop(pane.id)).rejects.toThrow("kill_unverified");
+      await expect(fixture.close()).rejects.toThrow("cleanup unverified; preserved");
+      expect(existsSync(fixture.dir)).toBe(true);
+      expect(readdirSync(fixture.dir).filter(file => file.endsWith(".receipt.json"))).toHaveLength(1);
+      expect(calls.map(command => command[0])).toEqual(["checked-create", "checked-create", "kill-session", "kill-session"]);
+    } finally { fixture.removeFiles(); } // Only injected processes existed.
+  });
   it("replaces inherited registry/config selectors for every client without replacing the OS profile", async () => {
     const parent = {
       USERPROFILE: "C:\\Users\\owner",

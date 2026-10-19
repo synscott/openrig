@@ -98,6 +98,8 @@ export type TmuxResult =
   | { ok: true; warnings?: string[] }
   | { ok: false; code: string; message: string };
 
+/** The immutable selected backend root; filesystem qualification still applies. */
+export interface NativeBackendOptions { readonly psmuxDataDir: string }
 export interface NativeCreationContext { attempt: string; root: string }
 export interface NativeCreationReceipt extends NativeCreationContext { name: string; pane: string }
 export interface NativeCreationAttempt extends NativeCreationContext { name: string; pid: string | null; birth: string | null }
@@ -529,12 +531,17 @@ export class TmuxAdapter {
     return this.deliveryGuard ? this.deliveryGuard.operation(target, fn) : fn();
   }
 
+  private readonly selectedNativeRoot: string | undefined;
+
   constructor(
     private exec: ExecFn,
     private fileOps: TmuxFileOps = defaultTmuxFileOps(),
     private argvExec?: ArgvExecFn,
     private terminalKind: "tmux" | "psmux" = "tmux",
-  ) {}
+    backend?: Readonly<NativeBackendOptions>,
+  ) {
+    this.selectedNativeRoot = backend?.psmuxDataDir ?? process.env.PSMUX_DATA_DIR;
+  }
 
   /**
    * Run a multiplexer command. `argv` is what is EXECUTED on both paths:
@@ -704,7 +711,7 @@ export class TmuxAdapter {
   usesCheckedCreation(): boolean { return this.terminalKind === "psmux"; }
 
   nativeCreationRoot(): string | null {
-    const root = process.env.PSMUX_DATA_DIR;
+    const root = this.selectedNativeRoot;
     return root ? this.fileOps.canonicalDirectory?.(root) ?? null : null;
   }
 

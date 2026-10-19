@@ -2,56 +2,29 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { TmuxAdapter, defaultTmuxFileOps } from "../src/adapters/tmux.js";
+import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { renderWindowsLaunch } from "../src/adapters/windows-launch.js";
 import { pathToFileURL } from "node:url";
 import { createWindowsPsmuxNativeFixture } from "./helpers/windows-psmux-native-fixture.js";
 
 const enabled = process.platform === "win32" && !!process.env.OPENRIG_TEST_PSMUX;
-const qualifiedPane = /^psmux:v2:[A-Za-z0-9_-]+:%\d+:\d+:\d+:\d+$/;
 const quote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
+// Protocol budget fit: checked-create allows 35s; each other backend command
+// allows 5s. Include serial body commands, every potentially owned cleanup,
+// marker polling + failure capture, and 10s filesystem/harness reserve.
+// These are outer deadlines, not retries or relaxed delivery assertions.
+const CREATE_MS = 35_000;
+const COMMAND_MS = 5_000;
+const MARKER_5S_MS = 5_000 + 50 + COMMAND_MS;
+const HARNESS_RESERVE_MS = 10_000;
+const MULTILINE_MS = CREATE_MS + (5 + 1) * COMMAND_MS + 2 * MARKER_5S_MS + HARNESS_RESERVE_MS;
+const ARGV_MS = 2 * CREATE_MS + (7 + 2) * COMMAND_MS + (12_000 + 50 + COMMAND_MS) + HARNESS_RESERVE_MS;
+const STALE_EPOCH_MS = 3 * CREATE_MS + (12 + 3) * COMMAND_MS + 2 * MARKER_5S_MS + HARNESS_RESERVE_MS;
 
 function nativeFixture() {
   const binary = process.env.OPENRIG_TEST_PSMUX!;
   if (!path.isAbsolute(binary)) throw new Error("OPENRIG_TEST_PSMUX must name an absolute qualified binary path");
-  const files = createWindowsPsmuxNativeFixture({ binary });
-  const fileOps = { ...defaultTmuxFileOps(), tmpName: () => path.join(files.dir, `openrig-tmux-send-${process.pid}-${randomUUID()}.txt`) };
-  const adapter = new TmuxAdapter(async () => { throw new Error("No POSIX transport"); }, fileOps, files.invoke, "psmux");
-  const owned = new Set<string>();
-  const unqualified = new Set<string>();
-  return {
-    ...files,
-    adapter,
-    async createSession(name: string) {
-      unqualified.add(name);
-      expect(await adapter.createSession(name, files.dir, files.sessionEnv)).toEqual({ ok: true });
-      const panes = await adapter.listPanes(name);
-      expect(panes).toHaveLength(1);
-      const pane = panes[0]!;
-      expect(pane.id).toMatch(qualifiedPane);
-      owned.add(pane.id);
-      unqualified.delete(name);
-      return pane;
-    },
-    async stop(ref: string) {
-      expect(await adapter.killSession(ref)).toEqual({ ok: true });
-      owned.delete(ref);
-    },
-    async close() {
-      const failures: string[] = [];
-      for (const ref of owned) {
-        try {
-          const result = await adapter.killSession(ref);
-          if (result.ok) owned.delete(ref);
-          else failures.push(`${ref}: ${result.code}: ${result.message}`);
-        } catch (error) { failures.push(`${ref}: ${String(error)}`); }
-      }
-      if (unqualified.size || failures.length) {
-        throw new Error(`Native fixture cleanup unverified; preserved ${files.dir}; unqualified sessions: ${[...unqualified].join(", ")}; ${failures.join("; ")}`);
-      }
-      files.removeFiles();
-    },
-  };
+  return createWindowsPsmuxNativeFixture({ binary });
 }
 
 async function withNativeFixture(run: (fixture: ReturnType<typeof nativeFixture>) => Promise<void>) {
@@ -93,7 +66,7 @@ describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
       expect(await adapter.sendKeys(pane.id, ["Enter"])).toEqual({ ok: true });
       expect(JSON.parse(await waitForFile(output, adapter, pane.id))).toBe(message);
     });
-  }, 20_000);
+  }, MULTILINE_MS);
 
   it("delivers exact native argv and environment through a real pane", async () => {
     await withNativeFixture(async fixture => {
@@ -125,7 +98,7 @@ describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
       expect((await adapter.listPanes(decoy))[0]?.id).toBe(other.id);
       expect((await adapter.probeSession(decoy)).state).toBe("present");
     });
-  }, 20_000);
+  }, ARGV_MS);
 
   it("rejects a stopped server epoch after same-name replacement while both live sessions remain responsive", async () => {
     await withNativeFixture(async fixture => {
@@ -156,5 +129,5 @@ describe.skipIf(!enabled)("native psmux PowerShell staging", () => {
       expect((await adapter.listPanes(session))[0]?.id).toBe(replacement.id);
       expect((await adapter.listPanes(siblingName))[0]?.id).toBe(sibling.id);
     });
-  }, 30_000);
+  }, STALE_EPOCH_MS);
 });
