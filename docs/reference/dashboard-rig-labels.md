@@ -2,7 +2,9 @@
 
 A dashboard label changes how a rig is shown, without changing its identity.
 The TUI shows `Label (canonical-name)` in the rig sidebar, table and headers.
-Two rigs may share a label; their canonical names remain visible. Commands,
+In constrained table/list cells, the canonical name comes first when the full
+label and name would be clipped. Two rigs may share a label; their canonical
+identity takes priority over cosmetic text. Commands,
 filters, links, queue addresses, history and health scope still use canonical
 names and IDs. A label is not a command alias.
 

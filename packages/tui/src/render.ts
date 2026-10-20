@@ -1,4 +1,4 @@
-import { formatRigDisplayName } from "@openrig/daemon/rig-display-labels";
+import { formatRigDisplayName, readRigDisplayLabel } from "@openrig/daemon/rig-display-labels";
 import { helpScreen } from "./commands/help.js";
 import { commandFocusVisible } from "./motion.js";
 import { attentionLines } from "./attention/attention-model.js";
@@ -55,6 +55,14 @@ function pad(text: string | number | null | undefined, width: number): string {
   if (t.length <= width) return t + " ".repeat(width - t.length);
   // never hard-clip mid-word: any truncation reads as an ellipsis (glance honesty)
   return t.slice(0, Math.max(width - 1, 0)) + "…";
+}
+
+/** In clipped cells, keep the canonical discriminator ahead of cosmetic text. */
+function rigCellName(rig: { name: string; displayLabel?: unknown }, width: number): string {
+  const display = formatRigDisplayName(rig);
+  if (display.length <= width) return display;
+  const label = readRigDisplayLabel(rig.displayLabel);
+  return label && label !== rig.name ? `${rig.name} (${label})` : rig.name;
 }
 
 function padLeft(text: string | number | null | undefined, width: number): string {
@@ -619,7 +627,7 @@ function instanceContentLines(
           title: "rigs",
           lines: host.rigs.length > 0
             ? host.rigs.map((rig) => listItem(
-                alignedRow([[formatRigDisplayName(rig), 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
+                alignedRow([[rigCellName(rig, 20), 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
                 { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
               ))
             : [{ text: "  (no local rigs served — proven empty)" }],
@@ -672,7 +680,7 @@ function instanceContentLines(
     const rigAction: Action = { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } };
     if (agents.length === 0) {
       lines.push({
-        text: tableRow(columns, { rig: formatRigDisplayName(rig), pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
+        text: tableRow(columns, { rig: rigCellName(rig, columns[0]![2]), pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
         action: rigAction,
       });
       continue;
@@ -690,7 +698,7 @@ function instanceContentLines(
       openCount += queue.count;
       lines.push({
         text: tableRow(columns, {
-          rig: formatRigDisplayName(rig),
+          rig: rigCellName(rig, columns[0]![2]),
           pod: firstInPod ? pod : "",
           seat: `${stateCell.mark} ${seatName(pod, agent.name)}`,
           runtime: runtimeShort(agent.runtime),

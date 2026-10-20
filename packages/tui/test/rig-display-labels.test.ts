@@ -36,6 +36,27 @@ describe("dashboard rig display labels preserve canonical navigation", () => {
     expect(view.get().drill).toEqual([{ kind: "host", name: "vm-host" }]);
   });
 
+  it.each([84, 120, 180])("keeps empty rigs distinguishable under duplicate long labels at %s columns", (cols) => {
+    const snap = demoSnapshot();
+    const host = snap.hosts[0]!;
+    host.rigs = ["alpha", "beta"].map((name) => ({ name, displayLabel: "Shared build team", lifecycleState: "running", pods: [] }));
+    const view = createViewState({ instanceId: "bounded-labels", getSnapshot: () => snap });
+    view.dispatch(parseCommand(`host ${host.name}`));
+    const screen = renderScreen(view.get(), snap, { cols, rows: 60, colorMode: "none" });
+    const rows = ["alpha", "beta"].map((name) => {
+      const target = screen.contentTargets.find((t) => t.action.type === "drill" && t.action.resource === "rig" && t.action.name === name);
+      expect(target?.action).toEqual({ type: "drill", resource: "rig", name, target: { host: host.name } });
+      const row = screen.lines[target!.y - 1]!.slice(target!.x1 - 1);
+      expect(row).toContain(name);
+      expect(row).toContain("(no seats)");
+      view.dispatch(target!.action);
+      expect(view.get().drill.at(-1)).toEqual({ kind: "rig", name });
+      view.dispatch({ type: "back" });
+      return row;
+    });
+    expect(rows[0]).not.toBe(rows[1]);
+  });
+
   it("disambiguates duplicate and canonical-looking labels without alias routing", () => {
     const snap = demoSnapshot();
     const first = snap.hosts[0]!.rigs[0]!;
