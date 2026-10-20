@@ -10,11 +10,18 @@
 // folded-but-unadopted distinction via a real tmp git repo, a wave-map-v1 data
 // row, and slice frontmatter carrying EC-1 depends_on + approved-spec-dial.
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
+
+// Native ESM namespace exports are immutable. Keep real filesystem behavior
+// except when the mission-only fixture explicitly supplies its disk sample.
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, statfsSync: vi.fn(actual.statfsSync) };
+});
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -284,7 +291,16 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
   });
 
   describe("mission-only queue projection", () => {
-    beforeEach(() => { db.prepare("UPDATE queue_items SET tags = '[]', body = ''").run(); });
+    let restoreDiskSample: (() => void) | undefined;
+    beforeEach(() => {
+      db.prepare("UPDATE queue_items SET tags = '[]', body = ''").run();
+      // Paired queue reads compare all Q6 fields. Unrelated filesystem writes
+      // must not change their disk input between the before/after snapshots.
+      const diskSample = fs.statfsSync(missionsRoot);
+      const disk = vi.mocked(fs.statfsSync).mockReturnValue(diskSample);
+      restoreDiskSample = () => disk.mockReset();
+    });
+    afterEach(() => { restoreDiskSample?.(); restoreDiskSample = undefined; });
     function add(id: string, tags: string[] = ["mission:OPR.9.9", "project:demo"], state = "in-progress", body = "", blocker: string | null = null) {
       db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session,
         state, priority, tags, summary, body, claimed_at, blocked_on) VALUES (?, ?, ?, 'lead@exec-fixture', ?, ?, 'normal', ?, ?, ?, ?, ?)`)
