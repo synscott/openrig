@@ -485,7 +485,8 @@ export async function hydrateSnapshot(
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
-  const healthRequested = broadReads || viewContext?.viewTab === "health";
+  // The names-only landing has no health banner; drilled Table pages do.
+  const healthRequested = broadReads || viewContext?.viewTab === "health" || (wantsTopologyScope && !!topologyLeaf && viewContext?.viewTab === "table");
   const wantsGraph = wantsTopologyScope && (!viewContext || viewContext.viewTab === "graph");
   // A pending pod/agent address needs every rig's seats to resolve.
   const pendingInventory = viewContext?.pendingDrill?.resource === "pod" || viewContext?.pendingDrill?.resource === "agent";
