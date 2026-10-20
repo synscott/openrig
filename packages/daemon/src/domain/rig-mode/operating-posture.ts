@@ -74,7 +74,10 @@ export class OperatingPostureService {
   context(input: OperatorContextReadContext): OperatingContext {
     const ctx: OperatingContext = { ...input, phase: { value: null, source: null }, sources: [] };
     const rigIdentity = (value: string) => {
-      const rigs = this.db.prepare("SELECT id FROM rigs WHERE id = ? OR name = ?").all(value, value) as Array<{ id: string }>;
+      const exact = this.db.prepare("SELECT id FROM rigs WHERE id = ?").get(value) as { id: string } | undefined;
+      if (exact) return exact.id;
+      // Names follow normal seat-ref resolution; archived predecessors are not live aliases.
+      const rigs = this.db.prepare("SELECT id FROM rigs WHERE name = ? AND archived_at IS NULL").all(value) as Array<{ id: string }>;
       if (rigs.length !== 1) throw new Error("rig identity missing or ambiguous: " + value);
       return rigs[0]!.id;
     };
@@ -145,7 +148,9 @@ export class OperatingPostureService {
       }
       const projectPath = join(projectRoot, "project.yaml");
       const project = yamlFile(projectPath)!;
-      const projectId = project.metadata?.id ?? project.metadata?.name ?? project.project;
+      // Match project-read's canonical manifest identity, never its display name.
+      const projectId = project.id ?? project.metadata?.id;
+      if (typeof projectId !== "string" || !projectId) throw new Error("project identity missing");
       merge("projectId", projectId, projectPath);
       if (!ctx.projectId) throw new Error("project identity missing");
       requiredSegment(ctx.projectId, "project");

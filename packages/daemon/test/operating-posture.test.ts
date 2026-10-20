@@ -70,6 +70,54 @@ it("defaults a resolved new rig to human-led; explicit public transitions retain
   expect(t.send).not.toHaveBeenCalled();
 });
 
+it("resolves the live canonical rig despite an archived same-name predecessor without inventing qitem linkage", async () => {
+  const t = await setup();
+  t.db.prepare("UPDATE rigs SET archived_at = '2026-10-04 23:22:26' WHERE id = ?").run(t.rig.id);
+  const live = t.rigs.createRig("demo");
+  expect(t.service.resolve({ rigId: "demo" })).toMatchObject({
+    posture: "human-led", source: "product-default", context: { rigId: live.id }, grantsAuthority: false,
+  });
+  expect(t.service.resolve({ qitemId: "unlinked" })).toMatchObject({
+    posture: "unknown", reason: expect.stringContaining("qitem project/mission linkage is missing"), grantsAuthority: false,
+  });
+  expect(t.service.resolve({ rigId: t.rig.id }).context?.rigId).toBe(t.rig.id);
+});
+
+it("keeps exact stable rig IDs deterministic and ambiguous live or archived-only names unknown", async () => {
+  const t = await setup();
+  t.rigs.createRig(t.rig.id);
+  expect(t.service.resolve({ rigId: t.rig.id })).toMatchObject({ posture: "human-led", context: { rigId: t.rig.id } });
+  t.rigs.createRig("demo");
+  expect(t.service.resolve({ rigId: "demo" })).toMatchObject({ posture: "unknown", reason: expect.stringContaining("ambiguous") });
+  const archived = t.rigs.createRig("archived-only");
+  t.db.prepare("UPDATE rigs SET archived_at = '2026-10-04 23:22:26' WHERE id = ?").run(archived.id);
+  expect(t.service.resolve({ rigId: "archived-only" })).toMatchObject({ posture: "unknown" });
+  expect(t.service.resolve({ rigId: "missing" })).toMatchObject({ posture: "unknown" });
+});
+
+it.each([["openrig", "OpenRig"], ["agent-memory", "Agent Memory"]])("resolves canonical top-level project id %s independently of its display name", async (id, displayName) => {
+  const t = await setup();
+  t.write("workspace.yaml", `projects: [{id: ${id}, root: ${id}}]\n`);
+  t.write(`${id}/project.yaml`, `id: ${id}\nmetadata: {name: "${displayName}"}\n`);
+  await t.queue.create({ qitemId: "project-only", sourceSession: "author@demo", destinationSession: "owner@demo", body: "Project planning", tags: [`project:${id}`], nudge: false });
+  expect(t.service.resolve({ qitemId: "project-only" })).toMatchObject({
+    posture: "human-led", source: "product-default", context: { projectId: id, phase: { value: null } }, grantsAuthority: false,
+  });
+  expect(t.service.resolve({ qitemId: "project-only" }).context?.missionId).toBeUndefined();
+  t.write(`${id}/project.yaml`, `id: ${id}\nmetadata: {name: "Renamed display"}\n`);
+  expect(t.service.resolve({ qitemId: "project-only" }).context?.projectId).toBe(id);
+});
+
+it("rejects real canonical project conflicts and display-only identities while keeping metadata.id compatibility", async () => {
+  const t = await setup();
+  t.write("alpha/project.yaml", "id: wrong-project\nmetadata: {name: alpha}\n");
+  expect(t.service.resolve({ qitemId: "alpha" })).toMatchObject({ posture: "unknown", reason: expect.stringContaining("conflicting projectId") });
+  t.write("alpha/project.yaml", "metadata: {name: alpha}\n");
+  expect(t.service.resolve({ qitemId: "alpha" })).toMatchObject({ posture: "unknown", reason: expect.stringContaining("project identity missing") });
+  t.write("alpha/project.yaml", "metadata: {id: alpha, name: Arbitrary display}\n");
+  expect(t.service.resolve({ qitemId: "alpha" }).context?.projectId).toBe("alpha");
+});
+
 it("joins project, mission, authored workstream and qitem; the most specific explicit choice wins without leaking across projects", async () => {
   const t = await setup();
   for (const [scope, qualifier] of [["project", "alpha"], ["mission", "beta/release"]] as const) expect((await t.put("delegated", scope, qualifier)).status).toBe(200);
