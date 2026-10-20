@@ -3,6 +3,7 @@ import { parse as parseYaml } from "yaml";
 import { describe, expect, it } from "vitest";
 import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
+import { parseCommand } from "../src/grammar.js";
 import { renderScreen } from "../src/render.js";
 import { createViewState } from "../src/state.js";
 
@@ -162,9 +163,10 @@ const FIXTURES: Record<string, unknown> = {
   "/api/queue/recent-transitions?scope=rig&rig=myrig&limit=20": [],
 };
 
-function fixtureClient(overrides: Record<string, { status: number } | undefined> = {}, responses: Record<string, unknown> = {}): DaemonClient {
+function fixtureClient(overrides: Record<string, { status: number } | undefined> = {}, responses: Record<string, unknown> = {}, requests: string[] = []): DaemonClient {
   const fetchImpl = (async (url: unknown) => {
     const route = String(url).replace("http://x", "");
+    requests.push(route);
     const failure = overrides[route];
     if (failure) return { ok: false, status: failure.status, json: async () => ({}) } as Response;
     if (route in responses) return { ok: true, json: async () => responses[route] } as Response;
@@ -217,8 +219,23 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(snap.health).toMatchObject({ availability: "loaded", total: 1 });
     expect(snap.health?.records[0]?.id).toBe("health-context-dev-impl");
   });
-  it("leaves health unassessed when a focused view skips the projection read", async () => {
-    const context = { section: "topology" as const, viewTab: "table" as const, drill: [] };
+  it("loads the focused Table health banner without broad fleet reads", async () => {
+    const requests: string[] = [];
+    const context = { section: "topology" as const, viewTab: "table" as const, drill: [{ kind: "rig" as const, name: "myrig" }] };
+    const snap = await hydrateSnapshot(fixtureClient({}, {}, requests), undefined, undefined, undefined, "myrig", context);
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch(parseCommand("rig myrig"));
+    const text = renderScreen(view.get(), snap, { cols: 180, rows: 60, colorMode: "none" }).lines.join("\n");
+
+    expect(text).toMatch(/HEALTH\s+ACTIVE.*WARN 1/);
+    expect(text).not.toContain("health has not been loaded");
+    expect(requests).toContain("/api/health?limit=200");
+    expect(requests).not.toContain("/api/queue/attention-aggregate");
+    expect(requests).not.toContain("/api/review/fleet");
+    expect(requests).not.toContain("/api/scopes?detail=1");
+  });
+  it("leaves health unassessed when the graph view skips the projection read", async () => {
+    const context = { section: "topology" as const, viewTab: "graph" as const, drill: [] };
     const snap = await hydrateSnapshot(fixtureClient(), undefined, undefined, undefined, undefined, context);
     expect(snap.health).toBeUndefined();
   });
@@ -233,10 +250,44 @@ describe("snapshot hydration over the §4.A reads (Phase 2)", () => {
     expect(snap.pending.map((q) => q.qitemId)).toEqual(["qp1"]);
     expect(snap.recentlyFinished).toEqual([]);
   });
-  it("marks health unavailable when the selected health view read fails", async () => {
-    const context = { section: "topology" as const, viewTab: "health" as const, drill: [] };
-    const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }), undefined, undefined, undefined, undefined, context);
+  it.each(["table", "health"] as const)("marks health unavailable when the selected %s view read fails", async (viewTab) => {
+    const context = { section: "topology" as const, viewTab, drill: [{ kind: "rig" as const, name: "myrig" }] };
+    const snap = await hydrateSnapshot(fixtureClient({ "/api/health?limit=200": { status: 503 } }), undefined, undefined, undefined, "myrig", context);
     expect(snap.health).toMatchObject({ availability: "unavailable", records: [] });
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch(parseCommand("rig myrig"));
+    view.dispatch(parseCommand(`tab ${viewTab}`));
+    const text = renderScreen(view.get(), snap, { cols: 180, rows: 60, colorMode: "none" }).lines.join("\n");
+    expect(text).toContain("Unavailable · canonical health records could not be read");
+    expect(text).not.toContain("health has not been loaded");
+    expect(text).not.toContain("no findings served");
+  });
+  it("keeps partial empty findings assessed when returning from Health to Table", async () => {
+    const requests: string[] = [];
+    const client = fixtureClient({}, {
+      "/api/health?limit=200": {
+        schema: "openrig.health-list/v0alpha1",
+        evaluatedAt: "2026-09-05T12:00:00.000Z",
+        total: 0, limit: 200, truncated: false, records: [],
+        coverage: [{ source: "passive-ceremony", evaluatedAt: "2026-09-05T12:00:00.000Z", partial: true, evaluated: 200, total: 617, omitted: 417,
+          unit: "handoff families", limit: 200, order: "most queue transitions in the observation window, then lineage ID" }],
+      },
+    }, requests);
+    const context = { section: "topology" as const, viewTab: "health" as const, drill: [{ kind: "rig" as const, name: "myrig" }] };
+    let snap = await hydrateSnapshot(client, undefined, undefined, undefined, "myrig", context);
+    const view = createViewState({ instanceId: "t", getSnapshot: () => snap });
+    view.dispatch(parseCommand("rig myrig"));
+    view.dispatch(parseCommand("tab health"));
+    expect(renderScreen(view.get(), snap, { cols: 180, rows: 60, colorMode: "none" }).lines.join("\n")).toContain("PARTIAL");
+
+    view.dispatch(parseCommand("tab table"));
+    snap = await hydrateSnapshot(client, undefined, undefined, undefined, "myrig", view.get());
+    const text = renderScreen(view.get(), snap, { cols: 180, rows: 60, colorMode: "none" }).lines.join("\n");
+    expect(text).toContain("EMPTY FOR RIG · PARTIAL · no findings served; not a healthy verdict");
+    expect(text).not.toContain("health has not been loaded");
+    expect(requests.filter((route) => route === "/api/health?limit=200")).toHaveLength(2);
+    expect(requests).not.toContain("/api/queue/attention-aggregate");
+    expect(requests).not.toContain("/api/review/fleet");
   });
   it("requests the currently selected mission rather than reusing the daemon default", async () => {
     const mission = "release-next";
