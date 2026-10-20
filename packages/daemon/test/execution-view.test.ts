@@ -32,6 +32,8 @@ import { ViewProjector, ViewProjectorError } from "../src/domain/view-projector.
 import { Hono } from "hono";
 import { viewsRoutes } from "../src/routes/views.js";
 
+import { executionContentLines, type ExecutionViewSnap } from "../../tui/src/execution/execution-model.js";
+
 const MISSION = "release-9.9";
 const SEAT_A = "builder-a@exec-fixture";
 const SEAT_B = "builder-b@exec-fixture";
@@ -253,6 +255,113 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     } catch { /* fixture teardown best-effort */ }
     fs.rmSync(tmp, { recursive: true, force: true });
     db.close();
+  });
+
+  it("shows a claimed mission-only obligation through the real server to original TUI NOW path", async () => {
+    fs.rmSync(path.join(missionsRoot, MISSION, "slices"), { recursive: true });
+    fs.rmSync(path.join(missionsRoot, MISSION, "mission.yaml"));
+    fs.writeFileSync(path.join(missionsRoot, MISSION, "SPEC.md"), "---\nid: MEM.0.2\n---\n# Engineering design\n");
+    db.prepare("UPDATE queue_items SET tags = '[]'").run();
+    db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session,
+      destination_session, state, priority, tags, summary, body, claimed_at)
+      VALUES ('mission-only', ?, ?, 'lead@exec-fixture', ?, 'in-progress', 'normal', ?, 'Design the memory approach', 'No fabricated slice', ?)`)
+      .run(fixedNow.toISOString(), fixedNow.toISOString(), SEAT_A,
+        JSON.stringify(["project:demo", "mission:MEM.0.2"]), fixedNow.toISOString());
+    const doc = await buildExecutionView({ db, slicesRoot: () => missionsRoot, rigsRoot: () => rigsRoot,
+      now: () => fixedNow, seatActivity: { getSeatStateBySession: name => arbitratedBySession.get(name) ?? null } },
+      { mission: "MEM.0.2", project: "demo" });
+    const execution = doc as unknown as ExecutionViewSnap;
+    const lines = executionContentLines(execution, [], [], null, 120);
+    expect(lines.find(line => line.text.includes("NOW"))?.text).toContain(SEAT_A);
+    expect(lines.find(line => line.text.includes("NOW"))?.text).toContain("claimed");
+    expect(doc.q1_lanes).toEqual([]);
+    expect(doc.q4_ladder).toEqual([]);
+    expect(doc.q6_parallelism).toMatchObject({ lanes_live: 0 });
+    const action = lines.find(line => line.text.includes("Design the memory approach"));
+    expect(action).toBeDefined();
+    const detail = executionContentLines(execution, [], [], "mission-work:mission-only", 120);
+    expect(detail.map(line => line.text).join("\n")).toContain("mission-only");
+  });
+
+  describe("mission-only queue projection", () => {
+    beforeEach(() => { db.prepare("UPDATE queue_items SET tags = '[]', body = ''").run(); });
+    function add(id: string, tags: string[] = ["mission:OPR.9.9", "project:demo"], state = "in-progress", body = "", blocker: string | null = null) {
+      db.prepare(`INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session,
+        state, priority, tags, summary, body, claimed_at, blocked_on) VALUES (?, ?, ?, 'lead@exec-fixture', ?, ?, 'normal', ?, ?, ?, ?, ?)`)
+        .run(id, fixedNow.toISOString(), fixedNow.toISOString(), SEAT_A, state, JSON.stringify(tags), `Summary ${id}`, body,
+          state === "pending" ? null : fixedNow.toISOString(), blocker);
+    }
+    async function read(mission = MISSION, project: string | undefined = "demo", oracle = true) {
+      return buildExecutionView({ db, slicesRoot: () => missionsRoot, rigsRoot: () => rigsRoot, now: () => fixedNow,
+        ...(oracle ? { seatActivity: { getSeatStateBySession: (name: string) => arbitratedBySession.get(name) ?? null } } : {}) },
+        { mission, ...(project ? { project } : {}) });
+    }
+    function work(doc: Record<string, unknown>) { return doc.mission_work as NonNullable<ExecutionViewSnap["mission_work"]>; }
+    it("canonicalizes mission aliases and deduplicates tags without losing explicit multi-mission membership", async () => {
+      fs.mkdirSync(path.join(missionsRoot, "other"));
+      fs.writeFileSync(path.join(missionsRoot, "other", "SPEC.md"), "---\nid: OTHER\n---\n");
+      add("dual", ["project:demo", "mission:OPR.9.9", `mission:${MISSION}`, "mission:OTHER"]);
+      expect(work(await read()).items.map(row => row.qitem_id)).toEqual(["dual"]);
+      expect(work(await read("OPR.9.9"))).toEqual(work(await read()));
+      expect(work(await read("OTHER")).items.map(row => row.qitem_id)).toEqual(["dual"]);
+    });
+    it("filters projects and exact mission tags before counts, keeping body-only coverage qualified", async () => {
+      add("wrong-project", ["project:other", "mission:OPR.9.9"]);
+      add("longer", ["project:demo", "mission:OPR.9.99"]);
+      add("other-tag", ["project:demo", "mission:OTHER"], "in-progress", `See ${MISSION}`);
+      add("legacy", ["project:demo"], "in-progress", `Mission: ${MISSION}`);
+      add("unscoped", ["mission:OPR.9.9"]);
+      add("correct", ["project:demo", "mission:opr.9.9"]);
+      const result = work(await read());
+      expect(result.items.map(row => row.qitem_id)).toEqual(["correct"]);
+      expect(result.unresolved.map(row => row.qitem_id)).toEqual(["legacy"]);
+      expect(work(await read(MISSION, "")).project_scope).toContain("legacy unscoped");
+    });
+    it("keeps alias-equivalent slice work out of mission-only work and qualifies malformed declarations", async () => {
+      add("slice", ["project:demo", "mission:OPR.9.9", "slice:OPR.9.9.31", "slice:31-alpha"]);
+      add("conflict", ["project:demo", "mission:OPR.9.9", "slice:31-alpha", "slice:32-beta"]);
+      add("missing", ["project:demo", "mission:OPR.9.9", "slice:missing"]);
+      add("empty", ["project:demo", "mission:OPR.9.9", "slice:"]);
+      add("body-conflict", undefined, "pending", "Slice: 31-alpha\nSlice: 32-beta");
+      add("mission");
+      const result = work(await read());
+      expect(result.items.map(row => row.qitem_id)).toEqual(["mission"]);
+      expect(result.unresolved.map(row => row.qitem_id).sort()).toEqual(["body-conflict", "conflict", "empty", "missing"]);
+    });
+    it.each(["pending", "in-progress", "blocked", "future-state"])("preserves raw %s state, blocker and activity independently", async state => {
+      add("row", undefined, state, "", "auth:operator");
+      const item = work(await read()).items[0]!;
+      expect(item).toMatchObject({ state, blocked_on: "auth:operator", owner: SEAT_A,
+        state_known: state !== "future-state", activity: { activity: "working" } });
+      if (state === "future-state") expect(item.pickup).toMatchObject({ state: "unknown" });
+      expect(work(await read(MISSION, "demo", false)).items[0]).toMatchObject({ activity: { activity: "INDETERMINATE", needs_input: null } });
+    });
+    it.each(["done", "handed-off", "canceled", "failed", "denied"])("counts terminal %s without an open task or proof promotion", async state => {
+      const before = await read(); add("closed", undefined, state);
+      const after = await read();
+      expect(work(after).items).toEqual([]);
+      expect(work(after).terminal_counts[state]).toBe(1);
+      for (const field of ["q1_lanes", "q2_sequencing", "q3_care", "q4_ladder", "q6_parallelism", "readiness"]) expect(after[field]).toEqual(before[field]);
+    });
+    it("returns unknown for missing or ambiguous authored identity instead of reassuring empty", async () => {
+      add("row");
+      expect(work(await read("missing")).state).toBe("unknown");
+      fs.mkdirSync(path.join(missionsRoot, "duplicate"));
+      fs.writeFileSync(path.join(missionsRoot, "duplicate", "SPEC.md"), "---\nid: OPR.9.9\n---\n");
+      expect(work(await read("OPR.9.9"))).toMatchObject({ state: "unknown", items: [] });
+    });
+    it("does not turn a failed queue read into a successful empty projection", async () => {
+      const failing = { prepare: () => { throw new Error("synthetic database unavailable"); } } as unknown as Database.Database;
+      await expect(buildExecutionView({ db: failing, slicesRoot: () => missionsRoot }, { mission: MISSION })).rejects.toThrow("synthetic database unavailable");
+    });
+    it("keeps multiple obligations on one seat separate from slice lanes and seat counts", async () => {
+      const before = await read(); add("a"); add("b");
+      const after = await read();
+      expect(work(after).items).toHaveLength(2);
+      expect(new Set(work(after).items.map(row => row.owner)).size).toBe(1);
+      expect(after.q1_lanes).toEqual(before.q1_lanes);
+      expect(after.q6_parallelism).toEqual(before.q6_parallelism);
+    });
   });
 
   async function show(): Promise<Record<string, unknown>> {

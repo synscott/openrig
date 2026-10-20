@@ -787,6 +787,72 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     return bodySlices.length === 1 ? bodySlices[0]! : null;
   };
 
+  // Mission obligations are queue work, not authored slice outcomes or Q1 lanes.
+  const missionMatches = missionsRoot && mission !== INDETERMINATE
+    ? resolveWorkNodeDirs(missionsRoot, mission) : [];
+  let missionAuthored = false;
+  if (missionMatches.length === 1 && missionsRoot) {
+    const node = resolveNodeFile(path.join(missionsRoot, missionMatches[0]!.dir));
+    try {
+      if (node) { fs.readFileSync(node, "utf8"); missionAuthored = true; }
+    } catch { /* unreadable identity is unknown, not an empty queue */ }
+  }
+  const missionWork = {
+    state: missionAuthored ? "available" : "unknown",
+    mission,
+    derived_at: derivedAt,
+    basis: missionAuthored ? "explicit exact mission tags; no declared slice; queue rows at read time"
+      : "mission identity missing, ambiguous, or unauthored",
+    project_scope: opts?.project ? `exact project:${opts.project}` : "legacy unscoped read; not project-isolated",
+    items: [] as Array<Record<string, unknown>>,
+    terminal_counts: { done: 0, "handed-off": 0, canceled: 0, failed: 0, denied: 0 },
+    unresolved: [] as Array<{ qitem_id: string; basis: string }>,
+  };
+  if (missionAuthored) {
+    const seen = new Set<string>();
+    for (const row of rows) {
+      if (seen.has(row.qitem_id)) continue;
+      seen.add(row.qitem_id);
+      if (!missionTags(row.tags).some(tag => namesMission(tag, missionRefs))) {
+        missionWork.unresolved.push({ qitem_id: row.qitem_id, basis: "legacy body-only membership; explicit mission tag required" });
+        continue;
+      }
+      const declarations = [
+        ...parseTags(row.tags).filter(tag => tag.startsWith("slice:")).map(tag => tag.slice(6).trim()),
+        ...[...(row.body?.matchAll(/^Slice:[ \t]*(.*?)[ \t]*$/gm) ?? [])].map(match => match[1]!.trim()),
+      ];
+      if (declarations.length) {
+        const resolved = declarations.map(value => slices.filter(slice =>
+          namesMission(value, [slice.dir, slice.id])));
+        if (resolved.every(matches => matches.length === 1)
+          && new Set(resolved.map(matches => matches[0]!.dir)).size === 1) continue;
+        missionWork.unresolved.push({ qitem_id: row.qitem_id, basis: "slice declaration unresolved or conflicting; not mission-only work" });
+        continue;
+      }
+      if (Object.hasOwn(missionWork.terminal_counts, row.state)) {
+        missionWork.terminal_counts[row.state as keyof typeof missionWork.terminal_counts]++;
+        continue;
+      }
+      const activity = deps.seatActivity?.getSeatStateBySession(row.destination_session) ?? null;
+      const transition = lastMeaningfulTransition(deps.db, row.qitem_id);
+      missionWork.items.push({
+        qitem_id: row.qitem_id, mission, state: row.state, summary: row.summary ?? null,
+        owner: row.destination_session, blocked_on: row.blocked_on, claimed_at: row.claimed_at,
+        binding_basis: "explicit exact mission tag; no slice declaration",
+        state_known: ["pending", "in-progress", "blocked"].includes(row.state),
+        pickup: ["pending", "in-progress", "blocked"].includes(row.state) ? derivePickup({ state: row.state, claimedAt: row.claimed_at, lastHeartbeat: row.last_heartbeat,
+          lastMeaningfulAt: transition?.at, postClaimMotionCount: Number(row.post_claim_motion ?? 0),
+          activity: activity?.activity, needsInput: activity?.needsInput.count, now: now() })
+          : { state: "unknown", evidence: "unrecognized queue state" },
+        activity: activity ? { activity: activity.activity, needs_input: activity.needsInput,
+          decided_by: activity.decidedBy, changed_at: activity.changedAt,
+          source: "SeatActivityService arbitrated seat state" }
+          : { activity: INDETERMINATE, basis: "no arbitrated seat activity available", needs_input: null },
+        source: { qitem_id: row.qitem_id },
+      });
+    }
+  }
+
   // ---- Q1: who is on what, where ----
   const lanes: Record<string, unknown>[] = [];
   // Repo context for the ladder's git legs: the first REACHABLE worktree_path
@@ -1320,6 +1386,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       },
     },
     lifecycle_instances: lifecycleExecutions,
+    mission_work: missionWork,
     q1_lanes: lanes,
     q2_sequencing: q2,
     q3_care: q3,
