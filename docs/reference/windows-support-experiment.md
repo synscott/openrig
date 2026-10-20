@@ -49,8 +49,15 @@ Windows, Node 24.14.1, psmux 3.3.8, Codex 0.153.4 and Pi 0.87.1:
 
 The first isolated-profile harness failed because ConPTY did not start with a
 redirected USERPROFILE. Keep the real OS profile and isolate product/provider
-homes instead. A copied Pi OAuth refresh token was stale after another instance
-rotated it; use independently established sign-ins for persistent installations.
+homes instead. On Windows the daemon selects its product/provider home from an
+explicit absolute `HOME` when present; `USERPROFILE` remains the OS profile
+passed to native children. Provider defaults and history/resume lookup use that
+selected home; set `CODEX_HOME` and `CLAUDE_CONFIG_DIR` explicitly when those
+provider stores need separate roots. OpenRig instance state remains rooted at
+`OPENRIG_HOME` (or its legacy setting), so isolated runs must bind that root
+explicitly too. A copied Pi OAuth refresh token was stale after another
+instance rotated it; use independently established sign-ins for persistent
+installations.
 
 Acceptance boundaries: no physical reboot/suspend or GUI terminal acceptance;
 no kernel/operator or other runtime acceptance; no upstream merge/review claim.

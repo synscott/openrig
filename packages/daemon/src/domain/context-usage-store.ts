@@ -16,6 +16,8 @@ export const FRESHNESS_THRESHOLD_MS = 600_000; // 10 minutes per PM spec
 
 export interface ContextUsageStoreOpts {
   stateDir: string;
+  /** Selected daemon HOME for default provider-state discovery. */
+  homeDir?: string;
   codexHomeDir?: string | null;
   /** Explicit CODEX_HOME. codexHomeDir above is the legacy OS-home input. */
   codexHome?: string;
@@ -96,7 +98,7 @@ export class ContextUsageStore {
   constructor(db: Database.Database, opts: ContextUsageStoreOpts) {
     this.db = db;
     this.stateDir = opts.stateDir;
-    this.codexHomeDir = opts.codexHomeDir ?? safeHomeDir();
+    this.codexHomeDir = opts.codexHomeDir ?? safeHomeDir(opts.homeDir);
     this.codexHome = opts.codexHome;
     this.resolveOccupantBootAt = opts.resolveOccupantBootAt;
   }
@@ -510,9 +512,9 @@ function clampPercentage(value: number): number {
   return Math.min(100, Math.max(0, value));
 }
 
-function safeHomeDir(): string | null {
+function safeHomeDir(homeDir?: string): string | null {
   try {
-    return os.homedir();
+    return homeDir ?? os.homedir();
   } catch {
     return null;
   }

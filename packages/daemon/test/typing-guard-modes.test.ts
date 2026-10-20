@@ -9,15 +9,7 @@ import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js"
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 import { typingGuardModesSchema } from "../src/db/migrations/100_typing_guard_modes.js";
 
-const nativeConsole = vi.hoisted(() => ({ write: undefined as (() => void) | undefined }));
-vi.mock("node:child_process", async importOriginal => {
-  const actual = await importOriginal<typeof import("node:child_process")>();
-  return { ...actual, execFile: (...args: unknown[]) => {
-    nativeConsole.write?.();
-    (args.at(-1) as (error: null, stdout: string, stderr: string) => void)(null, "", "");
-    return {};
-  } };
-});
+const nativeConsole = { write: undefined as (() => void) | undefined };
 
 const cleanup: Array<() => void> = [];
 afterEach(() => cleanup.splice(0).reverse().forEach(fn => fn()));
@@ -33,13 +25,17 @@ function fixture(terminalKind: "tmux" | "psmux" = "tmux") {
   db.exec("CREATE TABLE nodes(id TEXT PRIMARY KEY); INSERT INTO nodes VALUES ('a'),('b');");
   db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql); db.exec(typingGuardModesSchema.sql);
   const targets: Record<string, GuardTarget> = {
-    a: { nodeId: "a", session: "a", occupant: "g1", pane: "%1" },
-    b: { nodeId: "b", session: "b", occupant: "g2", pane: "%2" },
+    a: { nodeId: "a", session: "a", occupant: "g1", pane: terminalKind === "psmux" ? "psmux:v2:YQ:%1:7:10:11" : "%1" },
+    b: { nodeId: "b", session: "b", occupant: "g2", pane: terminalKind === "psmux" ? "psmux:v2:Yg:%2:8:20:21" : "%2" },
   };
   const guard = new SeatDeliveryGuard(db, name => Object.values(targets).find(t => t.nodeId === name || t.session === name || t.pane === name) ?? null);
   const panes: Record<string, ComposerSnapshot | null> = { a: screen(""), b: screen("") };
   const writes: string[] = [];
   let staged = "";
+  let serial = 0;
+  let nativeAck = "CHECKED-INPUT COMPLETE\n";
+  const files = new Map<string, string>();
+  const nativeInputs: Array<{ argv: string[]; payload: string }> = [];
   let onLoad: (() => void) | undefined;
   let renderPaste: ((text: string) => string) | undefined;
   const tmux = new TmuxAdapter(async command => {
@@ -50,7 +46,36 @@ function fixture(terminalKind: "tmux" | "psmux" = "tmux") {
     }
     if (command.includes("send-keys")) writes.push(command);
     return "";
-  }, { writeFile: async (_path, text) => { staged = text; }, unlink: async () => {}, tmpName: () => "/fixture/input", bufferName: () => "fixture-buffer" }, undefined, terminalKind);
+  }, {
+    writeFile: async (path, text, options) => {
+      if (terminalKind === "psmux") expect(options).toEqual({ mode: 0o600, flag: "wx" });
+      staged = text; files.set(path, text);
+      if (terminalKind === "psmux") onLoad?.();
+    },
+    unlink: async path => { files.delete(path); },
+    tmpName: () => terminalKind === "psmux" ? `/fixture/input-${++serial}` : "/fixture/input",
+    bufferName: () => "fixture-buffer",
+  }, terminalKind === "psmux" ? async argv => {
+    if (argv[1] !== "checked-input") throw new Error("Unexpected native command");
+    const arg = (key: string) => argv[argv.indexOf(key) + 1];
+    const name = arg("--session") === "7" ? "a" : "b";
+    const expected = name === "a" ? ["7", "10:11", "%1"] : ["8", "20:21", "%2"];
+    if (JSON.stringify([arg("--session"), arg("--server"), arg("--pane")]) !== JSON.stringify(expected)) {
+      throw new Error("Original native epoch rejected");
+    }
+    const payload = files.get(arg("--file")!);
+    if (payload === undefined) throw new Error("Missing staged native payload");
+    nativeInputs.push({ argv: [...argv], payload });
+    if (arg("--mode") === "keys") {
+      expect(JSON.parse(payload)).toEqual(["Enter"]);
+      writes.push(`checked-input:${name}:Enter`);
+    } else {
+      expect(arg("--mode")).toBe("auto");
+      if (nativeConsole.write) nativeConsole.write();
+      else { writes.push(`checked-input:${name}:${payload}`); panes[name] = screen(payload); }
+    }
+    return nativeAck;
+  } : undefined, terminalKind);
   tmux.deliveryGuard = guard;
   if (terminalKind === "psmux") vi.spyOn(tmux, "getPaneCommand").mockResolvedValue("powershell");
   vi.spyOn(tmux, "listPanes").mockImplementation(async name => {
@@ -60,7 +85,8 @@ function fixture(terminalKind: "tmux" | "psmux" = "tmux") {
   vi.spyOn(tmux, "captureComposerSnapshot").mockImplementation(async name => panes[guard.target(name).nodeId] ?? null);
   vi.spyOn(tmux, "probeSession").mockResolvedValue({ state: "present" });
   vi.spyOn(tmux, "isPaneDead").mockResolvedValue(false);
-  return { db, guard, targets, panes, writes, tmux,
+  return { db, guard, targets, panes, writes, tmux, nativeInputs,
+    nativeAck: (ack: string) => { nativeAck = ack; },
     onLoad: (fn: () => void) => { onLoad = fn; }, renderPaste: (fn: (text: string) => string) => { renderPaste = fn; } };
 }
 
@@ -86,6 +112,8 @@ describe("typing guard modes", () => {
           expect(pasted).toEqual({ ok: true });
           expect(await f.tmux.sendKeys("a", ["Enter"])).toEqual({ ok: true });
           expect(f.writes[0]).toBe("console paste");
+          expect(f.nativeInputs.map(input => [input.argv[input.argv.indexOf("--mode") + 1], input.payload]))
+            .toEqual([["auto", "message"], ["keys", '["Enter"]']]);
         }
       });
     } finally {
@@ -98,9 +126,44 @@ describe("typing guard modes", () => {
     const f = fixture("psmux");
     await f.guard.set("a", { mode: "draft-aware" }, "operator", "protect native draft");
     f.onLoad(() => { f.panes.a = screen("human text"); });
-    expect(await f.tmux.sendShellCommand("a", "Write-Output inert", () => {})).toMatchObject({ ok: false });
+    const beforeInput = vi.fn();
+    expect(await f.tmux.sendShellCommand("a", "Write-Output inert", beforeInput)).toMatchObject({ ok: false });
+    expect(beforeInput).not.toHaveBeenCalled();
+    expect(f.nativeInputs).toEqual([]);
     expect(f.writes).toEqual([]);
     expect(f.panes.a).toEqual(screen("human text"));
+  });
+
+  it("keeps literal UTF-8 native input out of command arguments", async () => {
+    const f = fixture("psmux");
+    const text = "literal 中文;$HOME\nsecond line";
+    expect(await f.tmux.sendText("a", text)).toEqual({ ok: true });
+    expect(f.nativeInputs).toHaveLength(1);
+    expect(f.nativeInputs[0]!.payload).toBe(text);
+    expect(f.nativeInputs[0]!.argv).toEqual(["tmux", "checked-input", "--session", "7",
+      "--server", "10:11", "--pane", "%1", "--mode", "auto", "--file", "/fixture/input-1"]);
+  });
+
+  it("refuses a changed native epoch without writing to the original actor", async () => {
+    const f = fixture("psmux");
+    f.targets.a = { ...f.targets.a!, pane: "psmux:v2:YQ:%1:7:10:12" };
+    expect(await f.tmux.sendText("a", "literal 中文;$HOME")).toMatchObject({ ok: false, code: "native_input_unverified" });
+    expect(f.writes).toEqual([]);
+    expect(f.nativeInputs).toEqual([]);
+  });
+
+  it("requires exact native completion and never submits or retries an uncertain paste", async () => {
+    const f = fixture("psmux");
+    f.nativeAck("CHECKED-INPUT COMPLETE");
+    const beforeInput = vi.fn();
+    expect(await f.tmux.sendShellCommand("a", "Write-Output 'literal 中文;$HOME'", beforeInput))
+      .toMatchObject({ ok: false, code: "native_input_unverified" });
+    expect(f.nativeInputs).toHaveLength(1);
+    expect(f.nativeInputs[0]!.argv).toContain("auto");
+    expect(f.nativeInputs[0]!.argv).toContain("10:11");
+    expect(f.nativeInputs[0]!.payload).toContain("ReadAllText");
+    expect(f.writes).toHaveLength(1); // queue may accept the paste; no Enter/retry follows a bad ACK
+    expect(beforeInput).toHaveBeenCalledTimes(1);
   });
 
   it.each(["unchanged", "on", "off", "off-on"])("keeps rollback protection and honors the last legacy write (%s)", async setting => {

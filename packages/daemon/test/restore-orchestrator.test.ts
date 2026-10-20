@@ -3178,7 +3178,8 @@ describe("RestoreOrchestrator", () => {
       // A1 premise: DELIBERATE fresh (fresh-listed).
       const result = await orch.restore(snap.id, { freshLogicalIds: ["worker"] });
       expect(result.ok).toBe(true);
-      expect(createSessionSpy).toHaveBeenCalledWith(expect.any(String), tmpDir, expect.any(Object));
+      expect(createSessionSpy).toHaveBeenCalledTimes(1);
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.any(String), tmpDir, expect.any(Object), undefined);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

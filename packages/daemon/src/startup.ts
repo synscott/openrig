@@ -297,7 +297,13 @@ export function collectAllowlistedProviderAuthEnv(
 
 /** Assemble the daemon services and runtime adapters using the selected installation assets. */
 export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> {
-  const daemonHome = os.homedir();
+  // HOME is OpenRig's selected product/provider home. On Windows, Node's
+  // os.homedir() follows USERPROFILE, which must remain the real OS profile
+  // for native children such as ConPTY. Keep those two paths independent.
+  const daemonHome = process.env.HOME || os.homedir();
+  if (!nodePath.isAbsolute(daemonHome)) {
+    throw new Error(`HOME must be an absolute path for daemon startup: ${daemonHome}`);
+  }
   const configuredCodexHome = process.env.CODEX_HOME || undefined;
   if (configuredCodexHome && !nodePath.isAbsolute(configuredCodexHome)) {
     throw new Error(`CODEX_HOME must be an absolute path for managed seats: ${configuredCodexHome}`);
@@ -529,7 +535,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // S19 — the Claude self-report rung (pid.json), consulted per sweep for seats whose
     // declared inventory staffs it; unreadable = null = the ladder falls, never errors.
     selfReportReader: (sessionName, seatNodeId) => {
-      const sessionsDir = nodePath.join(process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(os.homedir(), ".claude"), "sessions");
+      const sessionsDir = nodePath.join(process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(daemonHome, ".claude"), "sessions");
       return readClaudeSelfReportEvidence({ sessionsDir, sessionName, seatNodeId });
     },
   });
@@ -822,7 +828,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
   const startupOrchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter, readFile: (p: string) => fs.readFileSync(p, "utf-8") });
   const runtimeSettings = new ContextPackSettingsStore().resolveConfig();
-  const claudeAdapter = new ClaudeCodeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, claudeManagedLaunch, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), copyFile: replaceFile, listFiles: (dir: string) => { const r: string[] = []; /** Collect relative file paths recursively. */ function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, readdir: (dir: string) => fs.readdirSync(dir), statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: os.homedir() }, stateDir: OPENRIG_HOME, collectorAssetPath: nodePath.resolve(import.meta.dirname, "../assets/claude-statusline-context.cjs"), autoDriveProviderPrompts: runtimeSettings.recoveryAutoDriveProviderPrompts, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"), claudeHooksManifestPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/claude.json"), recordProjection: (targetPath: string, content: string) => projectionManifestStore.record({ targetPath, lastHash: hashContent(content), writtenAt: new Date().toISOString() }) });
+  const claudeAdapter = new ClaudeCodeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, claudeManagedLaunch, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), copyFile: replaceFile, listFiles: (dir: string) => { const r: string[] = []; /** Collect relative file paths recursively. */ function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, readdir: (dir: string) => fs.readdirSync(dir), statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: daemonHome }, stateDir: OPENRIG_HOME, collectorAssetPath: nodePath.resolve(import.meta.dirname, "../assets/claude-statusline-context.cjs"), autoDriveProviderPrompts: runtimeSettings.recoveryAutoDriveProviderPrompts, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"), claudeHooksManifestPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/claude.json"), recordProjection: (targetPath: string, content: string) => projectionManifestStore.record({ targetPath, lastHash: hashContent(content), writtenAt: new Date().toISOString() }) });
   const codexAdapter = new CodexRuntimeAdapter({ prepareTeamWorkspace, tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; /** Collect relative file paths recursively. */ function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: daemonHome }, codexHome: configuredCodexHome, launchPath: process.env.PATH, detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome), readNetworkDefault: readCodexNetworkDefault, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs"), resolveHooksEnabled: async () => {
     const { SettingsStore } = await import("./domain/user-settings/settings-store.js");
     return new SettingsStore().resolveOne("runtime.codex.hooks_enabled").value as boolean;
@@ -916,8 +922,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     for (const skill of ["openrig-skills", "refocusing"]) {
       try {
         vendorService.ensureSkillGlobally("openrig-core", skill, [
-          nodePath.join(os.homedir(), ".claude", "skills"),
-          nodePath.join(os.homedir(), ".agents", "skills"),
+          nodePath.join(daemonHome, ".claude", "skills"),
+          nodePath.join(daemonHome, ".agents", "skills"),
         ]);
       } catch (err) {
         console.error(`[openrig] global ${skill} skill setup warning: ${(err as Error).message}`);
@@ -930,8 +936,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     try {
       const { getDaemonVersion } = await import("./domain/daemon-version.js");
       vendorService.ensureSkillDirGlobally(nodePath.resolve(import.meta.dirname, "../assets/skills/rigs"), "rigs", getDaemonVersion(), [
-        nodePath.join(os.homedir(), ".claude", "skills"),
-        nodePath.join(os.homedir(), ".agents", "skills"),
+        nodePath.join(daemonHome, ".claude", "skills"),
+        nodePath.join(daemonHome, ".agents", "skills"),
       ]);
     } catch (err) {
       console.error(`[openrig] global rigs skill setup warning: ${(err as Error).message}`);
@@ -1016,7 +1022,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         | undefined;
       const token = row?.resume_token;
       if (!token) return null;
-      const claudeRoot = process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(os.homedir(), ".claude");
+      const claudeRoot = process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(daemonHome, ".claude");
       return findClaudeTranscriptByToken(nodePath.join(claudeRoot, "projects"), token);
     },
   );
@@ -1099,6 +1105,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // "cwd is inside the OpenRig installation". Use the resolved
       // workspace.root setting as the per-operator default.
       cwdOverride: runtimeSettings.workspaceRoot,
+      codexHome,
       degradedTimeoutMs,
     });
     try {
@@ -1133,6 +1140,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const { ContextUsageStore } = await import("./domain/context-usage-store.js");
   const contextUsageStore = new ContextUsageStore(db, {
     stateDir: OPENRIG_HOME,
+    homeDir: daemonHome,
     codexHome: configuredCodexHome,
     // GHOST-STAGE (c-id): reject context readings from before the live occupant booted (prior
     // generation) so a frozen pre-handover sample can't drive the threshold. null = UNKNOWN (inert).
@@ -1165,7 +1173,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // #421 — the pane's current Claude process start time; a sidecar sampled earlier is not this
   // process's, so capture and null-fill skip it.
   const claudeProcessStartedAt = (sessionName: string) => observeClaudePaneStartedAt({ target: sessionName, tmux: tmuxAdapter });
-  const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt, codexHome: configuredCodexHome });
+  const resumeMetadataRefresher = new ResumeMetadataRefresher({ sessionRegistry, tmuxAdapter, contextUsageStore, claudeProcessStartedAt, homeDir: daemonHome, codexHome: configuredCodexHome, claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(daemonHome, ".claude") });
   const claimService = new ClaimService({
     db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter, transcriptStore,
     claudeContextProvisioner: claudeAdapter,
@@ -1419,6 +1427,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           ? (transcriptsPath ?? getCompatibleOpenRigPath("transcripts"))
           : getCompatibleOpenRigPath("transcripts"),
         exec: execDep,
+        claudeProjectsRoot: nodePath.join(process.env.CLAUDE_CONFIG_DIR ?? nodePath.join(daemonHome, ".claude"), "projects"),
         chatSearchFn: (rigId: string, pattern: string) =>
           chatRepoForAsk.searchChat(rigId, pattern).map((m) => ({
             sender: m.sender,
@@ -1477,7 +1486,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // Provider caches belong to their selected provider homes, not OPENRIG_HOME.
     pluginDiscoveryService: new PluginDiscoveryService({
       openrigPluginsDir: getDefaultOpenRigPath("plugins"),
-      claudeCacheDir: nodePath.join(os.homedir(), ".claude", "plugins", "cache"),
+      claudeCacheDir: nodePath.join(daemonHome, ".claude", "plugins", "cache"),
       codexCacheDir: nodePath.join(codexHome, "plugins", "cache"),
       specLibraryDir: userSpecLibraryRoot,
       additionalSpecLibraryDirs: [
@@ -2283,7 +2292,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const { readCurrentPiOccupantModel, resolveIdentityVerifiedClaudeRecord, resolveLiveCodexThreadId } = await import("./domain/model-divergence/current-generation-record.js");
       const { defaultListProcesses } = await import("./domain/resume-metadata-refresher.js");
       const { readCodexThreadIdFromCandidateHomes, defaultResolveHomeDirByPid } = await import("./domain/codex-thread-id.js");
-      const nodeOs = await import("node:os");
       const nodeFs = await import("node:fs");
       const seatIdentityStore = new SeatIdentityStore(db);
       // OPR.0.5.3.10 — ONE shared census + ONE PID-home resolver for the whole
@@ -2292,7 +2300,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       const { ProcessCensus } = await import("./domain/process-census.js");
       const { CodexThreadIdResolver } = await import("./domain/codex-thread-id.js");
       const divergenceCensus = new ProcessCensus();
-      const codexThreadIdResolver = new CodexThreadIdResolver({ defaultHome: nodeOs.homedir(), codexHome: configuredCodexHome });
+      const codexThreadIdResolver = new CodexThreadIdResolver({ defaultHome: daemonHome, codexHome: configuredCodexHome });
       const currentGenDeps = {
         getPanePid: async (sessionTarget: string) => tmuxAdapter.getPanePid ? tmuxAdapter.getPanePid(sessionTarget) : null,
         listProcesses: () => divergenceCensus.list(),

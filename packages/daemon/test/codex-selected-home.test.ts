@@ -107,6 +107,11 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
   const f = fixture(), before = fs.readFileSync(f.firstConfig);
   vi.spyOn(os, 'homedir').mockReturnValue(f.home);
   for (const [k, v] of Object.entries(f.env)) vi.stubEnv(k, v);
+  // Simulate Windows: Node's OS home comes from the real USERPROFILE while
+  // the daemon receives a distinct selected HOME. OpenRig state stays on its
+  // separately explicit OPENRIG_HOME.
+  vi.stubEnv('HOME', f.selected);
+  vi.stubEnv('USERPROFILE', f.home);
   vi.stubEnv('OPENRIG_DB', path.join(f.root, 'instance.sqlite')); vi.stubEnv('OPENRIG_NO_KERNEL', '1');
   vi.stubEnv('OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED', 'true'); vi.stubEnv('OPENRIG_URL', undefined); vi.stubEnv('OPENRIG_PORT', undefined);
   const { createDaemon } = await import('../src/startup.js');
@@ -114,6 +119,11 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
   const first = await start();
   try {
     expect(first.db.prepare('SELECT count(*) AS n FROM nodes').get()).toEqual({ n: 0 });
+    expect((first.deps.contextUsageStore as any).codexHomeDir).toBe(f.selected);
+    expect((first.deps.resumeMetadataRefresher as any).homeDir).toBe(f.selected);
+    expect((first.deps.resumeMetadataRefresher as any).claudeConfigDir).toBe(path.join(f.selected, '.claude'));
+    expect((first.deps.askService as any).deps.historyQuery.claudeProjectsRoot).toBe(path.join(f.selected, '.claude', 'projects'));
+    expect(process.env.USERPROFILE).toBe(f.home);
     const config = path.join(f.selected, 'config.toml');
     expect(fs.existsSync(config)).toBe(false);
     const a = first.deps.runtimeAdapters!.codex as CodexRuntimeAdapter;

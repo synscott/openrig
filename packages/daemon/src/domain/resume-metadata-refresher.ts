@@ -506,7 +506,7 @@ function readCodexThreadIdFromLogs(
   resolvedHome: string | undefined,
   homeDir: string
 ): string | undefined {
-  return readCodexThreadIdFromCandidateHomes(pid, [resolvedHome, homeDir, os.homedir()]);
+  return readCodexThreadIdFromCandidateHomes(pid, [resolvedHome, homeDir]);
 }
 
 function commandLooksLikeCodex(command: string): boolean {
