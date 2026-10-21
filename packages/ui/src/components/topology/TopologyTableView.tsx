@@ -341,6 +341,12 @@ function TopologyActionsCell({ row }: { row: AgentRow }) {
   );
 }
 
+// Query result wrappers change on local renders; combine structurally shares only
+// the inventory data so filtering/sorting can reuse the derived table rows.
+function combineNodeInventories(results: { data: NodeInventoryEntry[] | undefined }[]) {
+  return results.map((result) => result.data);
+}
+
 export function TopologyTableView({ rigIdScope, podNameScope }: { rigIdScope?: string; podNameScope?: string }) {
   // V1 polish slice Phase 5.1 P5.1-7: row click navigates to seat-scope
   // center page (parity with graph node click + Explorer tree click +
@@ -360,21 +366,21 @@ export function TopologyTableView({ rigIdScope, podNameScope }: { rigIdScope?: s
   // P0-1 fix: useQueries replaces the .map(useNodeInventory) loop. Single
   // hook call regardless of scopedRigs length. React's hook order stays
   // stable across renders even when rigs grows from undefined to [N].
-  const inventoryResults = useQueries({
+  const inventories = useQueries({
     queries: scopedRigs.map((r) => ({
       queryKey: ["rig", r.id, "nodes", hostId] as const,
       queryFn: () => fetchNodeInventory(r.id, hostId),
       refetchInterval: 30_000,
     })),
+    combine: combineNodeInventories,
   });
 
   const data: AgentRow[] = useMemo(() => {
     const rows: AgentRow[] = [];
     for (let i = 0; i < scopedRigs.length; i++) {
       const rig = scopedRigs[i];
-      const result = inventoryResults[i];
-      if (!rig || !result) continue;
-      const nodes: NodeInventoryEntry[] = result.data ?? [];
+      if (!rig) continue;
+      const nodes: NodeInventoryEntry[] = inventories[i] ?? [];
       const scopedNodes = podNameScope
         ? nodes.filter((n) => (n.podNamespace ?? n.podId) === podNameScope)
         : nodes;
@@ -398,7 +404,7 @@ export function TopologyTableView({ rigIdScope, podNameScope }: { rigIdScope?: s
       }
     }
     return rows;
-  }, [scopedRigs, inventoryResults, podNameScope]);
+  }, [scopedRigs, inventories, podNameScope]);
 
   const sessionIndex = useMemo(() => buildTopologySessionIndex(data.map((row) => ({
     nodeId: `${row.rigId}::${row.logicalId}`,
