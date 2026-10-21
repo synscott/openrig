@@ -454,12 +454,20 @@ describe("PUBLIC bin ownership (guard finding 1 — the wrapper is the real fron
   //  "PRODUCTION PATH … REAL probeFrontDoor" test earlier, with no real TUI spawned.)
 
   it.skipIf(!existsSync(binWrapper))("piped PUBLIC bin keeps the commander usage baseline (no TUI, fast exit)", () => {
+    const started = performance.now();
     const result = spawnSync(process.execPath, [binWrapper], {
       input: "x\n",
       timeout: 5000,
       encoding: "utf-8",
     });
-    expect(result.status).toBe(0);
+    const error = result.error as (Error & { code?: string }) | undefined;
+    const diagnostic = JSON.stringify({ status: result.status, signal: result.signal, elapsedMs: performance.now() - started,
+      errorName: error ? (["Error", "TypeError", "RangeError"].includes(error.name) ? error.name : "other") : null,
+      errorCode: error?.code && /^[A-Z0-9_]{1,32}$/.test(error.code) ? error.code : null,
+      stdoutBytes: Buffer.byteLength(result.stdout ?? ""), stderrBytes: Buffer.byteLength(result.stderr ?? ""),
+      stdoutUsage: /Usage: rig/.test(result.stdout ?? ""), stderrUsage: /Usage: rig/.test(result.stderr ?? ""),
+      ttyIndicator: /TTY|mission control|EXPLORER/i.test(`${result.stderr}${result.stdout}`) });
+    expect(result.status, diagnostic).toBe(0);
     expect(`${result.stderr}${result.stdout}`).toMatch(/Usage: rig/);
   });
 
