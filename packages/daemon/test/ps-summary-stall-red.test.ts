@@ -164,7 +164,9 @@ describe("slice-04 ps/summary event-loop regression", () => {
     let readyStatus = 0;
     const psStatuses: number[] = [];
     const sumStatuses: number[] = [];
-    const health: { ms: number; status: number }[] = [];
+    const health: { ms: number; status: number; startEpochMs: number; offsetMs: number; paceOvershootMs: number | null;
+      childRequestId: string | null; cpuMicros: NodeJS.CpuUsage; elu: ReturnType<typeof performance.eventLoopUtilization> }[] = [];
+    let probeOrigin = 0, previousProbeEnd = 0;
     let pidGone = false;
     let portClosed = false;
 
@@ -211,13 +213,21 @@ describe("slice-04 ps/summary event-loop regression", () => {
 
       // one sequential paced health-probe loop, awaited after the burst
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+      probeOrigin = performance.now();
       probe = (async () => {
         while (!stop) {
+          const cpu = process.cpuUsage(), elu = performance.eventLoopUtilization();
           const t = performance.now();
           let status = 0;
-          try { const r = await fetch(base + "/healthz", { signal: probeAbort.signal }); status = r.status; await r.text().catch(() => {}); }
+          let response: Response | undefined;
+          try { const r = await fetch(base + "/healthz", { signal: probeAbort.signal }); response = r; status = r.status; await r.text().catch(() => {}); }
           catch { status = 0; }
-          health.push({ ms: +(performance.now() - t).toFixed(1), status });
+          const end = performance.now(); // Same RTT boundary: immediately after fetch + body drain.
+          health.push({ ms: +(end - t).toFixed(1), status, startEpochMs: performance.timeOrigin + t,
+            offsetMs: t - probeOrigin, paceOvershootMs: previousProbeEnd ? Math.max(0, t - previousProbeEnd - 100) : null,
+            childRequestId: response?.headers.get("x-stall-request-id") ?? null,
+            cpuMicros: process.cpuUsage(cpu), elu: performance.eventLoopUtilization(elu) });
+          previousProbeEnd = end;
           if (!stop) await sleep(100);
         }
       })();
@@ -262,6 +272,24 @@ describe("slice-04 ps/summary event-loop regression", () => {
         : "no probes completed";
       console.log(`[ps-summary D2] worst /healthz ${measured} (budget ${HEALTHZ_RESPONSIVENESS_BUDGET_MS} ms; `
         + `ps 200s ${psStatuses.filter((st) => st === 200).length}/24, summary 200s ${sumStatuses.filter((st) => st === 200).length}/24)`);
+      if (health.some((h) => h.ms >= HEALTHZ_RESPONSIVENESS_BUDGET_MS || h.status !== 200)
+        || health.length === 0 || readyStatus !== 200 || psStatuses.length !== 24 || sumStatuses.length !== 24
+        || psStatuses.some((s) => s !== 200) || sumStatuses.some((s) => s !== 200) || !pidGone || !portClosed) {
+        // Failure evidence only. No extra request, retry, worker/config change,
+        // or timing assertion. A missing/truncated child trace is explicit.
+        let childTrace: unknown = "missing_or_truncated";
+        const trace = out.match(/^D2_TRACE (.+)$/m);
+        if (trace) { try { childTrace = JSON.parse(trace[1]!); } catch { childTrace = "invalid_json"; } }
+        const worstProbe = health.reduce<(typeof health)[number] | null>((a, h) => !a || h.ms > a.ms ? h : a, null);
+        const report = { version: 1,
+          parentTimeOrigin: performance.timeOrigin, parentPid: process.pid,
+          probes: health.slice(0, 128), droppedProbes: Math.max(0, health.length - 128), worstProbe,
+          childStdoutTruncated: outTrunc, childStderrTruncated: errTrunc, childTrace,
+          clockCaveat: "Epoch overlap is approximate; childRequestId is the exact route join. CPU/ELU are process-local, not host attribution." };
+        const encoded = JSON.stringify(report);
+        console.log("[ps-summary D2 diagnostics] " + (Buffer.byteLength(encoded) <= 96 * 1024 ? encoded
+          : JSON.stringify({ ...report, probes: [], droppedProbes: health.length, byteBoundExceeded: true })));
+      }
     }
 
     // Teardown is guaranteed done above; now assert (the budget pin is the LAST assertion).
