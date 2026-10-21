@@ -74,6 +74,7 @@ Keys:
   health.context_pressure.*        context-pressure warning/critical percentages (defaults 95/99)
   files.allowlist        name:/abs/path,name:/abs/path
   progress.scan_roots    name:/abs/path,name:/abs/path
+  dashboard.rig_labels.<rigId>  cosmetic rig label (1–64 inline characters; canonical identity unchanged)
   ui.timezone            TUI IANA timezone (default America/Los_Angeles; reopen TUI after changing)
   ui.enabled             serve the web UI and its terminal WebSocket (default off; restart the daemon)
   ui.preview.*           refresh_interval_seconds, max_pins, default_lines
