@@ -203,6 +203,7 @@ describe("managed refocus and trace results", () => {
 
   it.each([false, true])("startup seeds a loadable bare refocusing skill for both harnesses (router seed fails: %s)", async (failRouterSeed) => {
     const f = fixture();
+    vi.stubEnv("HOME", f.root);
     vi.stubEnv("OPENRIG_HOME", f.root);
     vi.stubEnv("OPENRIG_NO_KERNEL", "1");
     vi.spyOn(os, "homedir").mockReturnValue(f.root);

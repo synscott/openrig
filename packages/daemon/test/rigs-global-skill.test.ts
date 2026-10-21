@@ -43,6 +43,7 @@ describe("the rigs skill installed globally", () => {
     const skillsSh = join(root, ".agents/skills/rigs");
     mkdirSync(skillsSh, { recursive: true });
     writeFileSync(join(skillsSh, "SKILL.md"), "# rigs, installed by skills.sh\n");
+    vi.stubEnv("HOME", root);
     vi.stubEnv("OPENRIG_HOME", root);
     vi.stubEnv("OPENRIG_NO_KERNEL", "1");
     vi.spyOn(os, "homedir").mockReturnValue(root);
