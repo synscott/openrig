@@ -1,3 +1,4 @@
+import { parseRigDisplayLabelKey, readRigDisplayLabel, requireRigDisplayLabel } from "../../rig-display-labels.js";
 // User Settings v0 — daemon-side settings store.
 //
 // The CLI's @openrig/cli ConfigStore is the canonical write surface
@@ -1173,6 +1174,16 @@ export class SettingsStore {
   }
 
   set(key: string, value: string): void {
+    const rigLabel = parseRigDisplayLabelKey(key);
+    if (rigLabel) {
+      const label = requireRigDisplayLabel(value);
+      const config = this.readConfigFile();
+      setNestedValue(config, ["dashboard", "rigLabels", rigLabel.rigId], label);
+      mkdirSync(path.dirname(this.configPath), { recursive: true });
+      this.writeConfig(JSON.stringify(config, null, 2) + "\n");
+      this.verifyPersisted(["dashboard", "rigLabels", rigLabel.rigId], label);
+      return;
+    }
     const removedMessage = removedContextSettingMessage(key);
     if (removedMessage) throw new Error(removedMessage);
     // OPR.0.4.4.15: the ONE registered dynamic class is accepted here;
@@ -1207,6 +1218,29 @@ export class SettingsStore {
     mkdirSync(path.dirname(this.configPath), { recursive: true });
     this.writeConfig(JSON.stringify(fc, null, 2) + "\n");
     this.verifyPersisted(KEY_TO_PATH[key], coerced);
+  }
+
+  /** Resolve a cosmetic stable-ID label without changing rig identity. */
+  resolveRigDisplayLabel(key: string): ResolvedSetting | null {
+    const rigLabel = parseRigDisplayLabelKey(key);
+    if (!rigLabel) return null;
+    const value = readRigDisplayLabel(getNestedValue(this.readConfigFile(), ["dashboard", "rigLabels", rigLabel.rigId]));
+    return { value: value ?? "", source: value === null ? "default" : "file", defaultValue: "" };
+  }
+
+  /** Read valid labels independently; malformed siblings cannot hide rig navigation. */
+  readRigDisplayLabels(): { labels: Map<string, string>; invalid: boolean } {
+    const labels = new Map<string, string>();
+    const raw = getNestedValue(this.readConfigFile(), ["dashboard", "rigLabels"]);
+    if (raw === undefined) return { labels, invalid: false };
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { labels, invalid: true };
+    let invalid = false;
+    for (const [rigId, value] of Object.entries(raw)) {
+      const label = readRigDisplayLabel(value);
+      if (parseRigDisplayLabelKey(`dashboard.rig_labels.${rigId}`) && label !== null) labels.set(rigId, label);
+      else invalid = true;
+    }
+    return { labels, invalid };
   }
 
   /** OPR.0.4.4.15 — resolve one dynamic feed-host subscription key.
@@ -1250,6 +1284,15 @@ export class SettingsStore {
   }
 
   reset(key?: string): void {
+    const rigLabel = key && parseRigDisplayLabelKey(key);
+    if (rigLabel) {
+      if (!existsSync(this.configPath)) return;
+      const config = this.readConfigFile();
+      const labels = getNestedValue(config, ["dashboard", "rigLabels"]) as Record<string, unknown> | undefined;
+      if (labels && typeof labels === "object" && !Array.isArray(labels)) delete labels[rigLabel.rigId];
+      this.writeConfig(JSON.stringify(config, null, 2) + "\n");
+      return;
+    }
     if (key === undefined) {
       try { unlinkSync(this.configPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

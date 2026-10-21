@@ -59,6 +59,8 @@ export interface PodNode {
 }
 
 export interface RigNode {
+  /** Cosmetic label only; name remains the canonical navigation/address key. */
+  displayLabel?: string;
   /** Observed running/idle agent presence from summary; null/absent means unknown. */
   hasLiveAgents?: boolean | null;
   inventoryNotLoaded?: boolean;

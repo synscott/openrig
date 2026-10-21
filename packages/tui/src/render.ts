@@ -1,3 +1,4 @@
+import { formatRigDisplayName, readRigDisplayLabel } from "@openrig/daemon/rig-display-labels";
 import { helpScreen } from "./commands/help.js";
 import { commandFocusVisible } from "./motion.js";
 import { attentionLines } from "./attention/attention-model.js";
@@ -15,7 +16,7 @@ import { costLines } from "./cost/cost-model.js";
 // agent-refs, Needs-You items) — so a mouse click anywhere resolves to the
 // SAME semantic actions commands produce (PIN 1). Isolated seam: a substrate
 // swap touches only this module (spike verdict revisit trigger).
-import { computeExplorerRows, findAgent, findSpec, findAgentBySession, agentsRunningSpec, agentsRunningSpecTargets, specDetailArrowsScroll } from "./state.js";
+import { computeExplorerRows, findRig, findAgent, findSpec, findAgentBySession, agentsRunningSpec, agentsRunningSpecTargets, specDetailArrowsScroll } from "./state.js";
 import { scopesContentLines } from "./scopes/scopes-model.js";
 import { executionContentLines, executionSliceStripLines } from "./execution/execution-model.js";
 import { navigatorDisplay } from "./navigator.js";
@@ -54,6 +55,14 @@ function pad(text: string | number | null | undefined, width: number): string {
   if (t.length <= width) return t + " ".repeat(width - t.length);
   // never hard-clip mid-word: any truncation reads as an ellipsis (glance honesty)
   return t.slice(0, Math.max(width - 1, 0)) + "…";
+}
+
+/** In clipped cells, keep the canonical discriminator ahead of cosmetic text. */
+function rigCellName(rig: { name: string; displayLabel?: unknown }, width: number): string {
+  const display = formatRigDisplayName(rig);
+  if (display.length <= width) return display;
+  const label = readRigDisplayLabel(rig.displayLabel);
+  return label && label !== rig.name ? `${rig.name} (${label})` : rig.name;
 }
 
 function padLeft(text: string | number | null | undefined, width: number): string {
@@ -334,7 +343,7 @@ function agentDetailLines(
         title: "SEAT",
         fields: [
           { label: "host", value: found.host.name },
-          { label: "rig", value: rig.name },
+          { label: "rig", value: formatRigDisplayName(rig) },
           { label: "pod", value: pod.name },
         ],
         lines: [
@@ -618,7 +627,7 @@ function instanceContentLines(
           title: "rigs",
           lines: host.rigs.length > 0
             ? host.rigs.map((rig) => listItem(
-                alignedRow([[rig.name, 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
+                alignedRow([[rigCellName(rig, 20), 20], [rig.lifecycleState ?? "unknown", 20], [rig.inventoryUnavailable ? "inventory unavailable" : `${rig.pods.length} pods · ${rig.pods.reduce((n, pod) => n + pod.agents.length, 0)} seats`, 24]]),
                 { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
               ))
             : [{ text: "  (no local rigs served — proven empty)" }],
@@ -628,7 +637,7 @@ function instanceContentLines(
   }
   if (state.viewTab === "graph") {
     for (const rig of host.rigs) {
-      lines.push({ text: "" }, sectionRule(`rig ${rig.name} · ${rig.lifecycleState ?? "unknown"}`, contentWidth));
+      lines.push({ text: "" }, sectionRule(`rig ${formatRigDisplayName(rig)} · ${rig.lifecycleState ?? "unknown"}`, contentWidth));
       if (!rig.graph) {
         if (motion.loading) {
           if (!motion.reduced) motion.used = true;
@@ -671,7 +680,7 @@ function instanceContentLines(
     const rigAction: Action = { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } };
     if (agents.length === 0) {
       lines.push({
-        text: tableRow(columns, { rig: rig.name, pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
+        text: tableRow(columns, { rig: rigCellName(rig, columns[0]![2]), pod: "—", seat: rig.inventoryUnavailable ? "(read failed)" : "(no seats)", status: rig.lifecycleState ?? "unknown" }),
         action: rigAction,
       });
       continue;
@@ -689,7 +698,7 @@ function instanceContentLines(
       openCount += queue.count;
       lines.push({
         text: tableRow(columns, {
-          rig: rig.name,
+          rig: rigCellName(rig, columns[0]![2]),
           pod: firstInPod ? pod : "",
           seat: `${stateCell.mark} ${seatName(pod, agent.name)}`,
           runtime: runtimeShort(agent.runtime),
@@ -739,7 +748,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
             seats.length === 0
               ? [{ text: "  (no seats currently run it)" }]
               : seats.map((seat) =>
-                  listItem(`${seat.agent.name}  ·  ${seat.rig.name} / ${seat.pod.name}  ·  ${seat.agent.status}`, {
+                  listItem(`${seat.agent.name}  ·  ${formatRigDisplayName(seat.rig)} / ${seat.pod.name}  ·  ${seat.agent.status}`, {
                     type: "drill",
                     resource: "agent",
                     name: seat.agent.name,
@@ -784,14 +793,14 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       }
       return [{ text: "(no rigs served — proven empty, not fabricated)" }];
     }
-    if (rig.inventoryNotLoaded) return [{ text: `Reading ${rig.name}…` }];
-    if (rig.inventoryUnavailable) return [{ text: `Inventory unavailable for ${rig.name} · refresh to Retry` }];
+    if (rig.inventoryNotLoaded) return [{ text: `Reading ${formatRigDisplayName(rig)}…` }];
+    if (rig.inventoryUnavailable) return [{ text: `Inventory unavailable for ${formatRigDisplayName(rig)} · refresh to Retry` }];
     const podFilter = leaf?.kind === "pod" ? leaf.name : null;
     const all = rig.pods.flatMap((p) => p.agents.map((a) => ({ pod: p.name, ...a })));
     const rows = all
       .filter((a) => !podFilter || a.pod === podFilter)
       .filter((a) => !state.filter || a.name.includes(state.filter) || a.pod.includes(state.filter));
-    const suffix = `rig ${rig.name}${podFilter ? ` · pod ${podFilter}` : ""}${state.filter ? ` · filter "${state.filter}"` : ""}`;
+    const suffix = `rig ${formatRigDisplayName(rig)}${podFilter ? ` · pod ${podFilter}` : ""}${state.filter ? ` · filter "${state.filter}"` : ""}`;
     lines.push(...tabsLine(state, suffix));
     // Keep the explicit desktop action above the rig's grid.
     if (!podFilter) lines.push(fieldLine({ label: "terminal", value: `Open terminals ▸ rig ${rig.name}`, link: { type: "act", act: "open-terminal", view: `rig:${rig.name}` } }));
@@ -853,7 +862,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     lines.push({ text: state.filter ? `/ filter agents: ${state.filter} · / replace · esc clear` : "/ filter agents…" });
     if (state.viewTab === "overview") {
       lines.push(
-        ...detailPage({ text: `rig ${rig.name}` }, [
+        ...detailPage({ text: `rig ${formatRigDisplayName(rig)}` }, [
           {
             title: "rig",
             fields: [
@@ -1486,7 +1495,9 @@ function renderPulseScreen(state: ViewState, snap: FleetSnapshot, options: Rende
 
   lines.push(paneRule(cols, explW, "bottom"));
   lines.push(pad(keybindHints(state), cols));
-  const drillPath = state.drill.map((d) => d.name).join(" → ");
+  const drillHost = state.drill.find((d) => d.kind === "host")?.name;
+  const drillPath = state.drill.map((d) => d.kind === "rig"
+    ? formatRigDisplayName(findRig(snap, d.name, drillHost)?.rig ?? { name: d.name }) : d.name).join(" → ");
   const readWarn = snap.readErrors.length > 0 ? `  ⚠ ${snap.readErrors.length} read(s) failed: ${snap.readErrors[0]}` : "";
   // Honest first-load lifecycle: while the refresh owner's FIRST hydrate is in
   // flight (!settled) show a spinner-tagged "loading" — distinguishing "still
@@ -1846,7 +1857,9 @@ function renderBody(state: ViewState, snap: FleetSnapshot, options: RenderOption
   }
 
   if (footer) lines.push(pad(`≋ ${displayTime(footer.tsEmitted, state.timeZone)} ${footer.sourceSession}: ${footer.body}`, cols));
-  const drillPath = state.drill.map((d) => d.name).join(" → ");
+  const drillHost = state.drill.find((d) => d.kind === "host")?.name;
+  const drillPath = state.drill.map((d) => d.kind === "rig"
+    ? formatRigDisplayName(findRig(snap, d.name, drillHost)?.rig ?? { name: d.name }) : d.name).join(" → ");
   const readWarn = snap.readErrors.length > 0 ? `  ⚠ ${snap.readErrors.length} read(s) failed: ${snap.readErrors[0]}` : "";
   lines.push(fullReading ? "━".repeat(cols) : paneRule(cols, explW, "bottom"));
   lines.push(pad(fullReading ? "↑↓ scroll / links · → links · Enter open · Esc Back · refresh · v copy" : keybindHints(state), cols));

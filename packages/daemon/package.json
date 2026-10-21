@@ -5,6 +5,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
+    "./rig-display-labels": { "types": "./dist/rig-display-labels.d.ts", "import": "./dist/rig-display-labels.js" },
     "./bundle-behaviour": { "types": "./dist/bundle-behaviour-surface.d.ts", "import": "./dist/bundle-behaviour-surface.js" },
     "./spec-validation": {
       "types": "./dist/spec-validation-surface.d.ts",
