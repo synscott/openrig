@@ -1,3 +1,4 @@
+import type { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
 import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
 import { Hono } from "hono";
@@ -228,6 +229,17 @@ rigsRoutes.get("/summary", (c) => {
   //   - Live per request; NO cache/staleness (getRigSummaries + fold read live db).
   return projectionLane.run(() => {
     const summaries = repo.getRigSummaries({ includeArchived, archivedOnly });
+    const settings = c.get("settingsStore" as never) as SettingsStore | undefined;
+    let labels = new Map<string, string>();
+    let labelError = false;
+    try {
+      if (settings) {
+        const read = settings.readRigDisplayLabels();
+        labels = read.labels;
+        labelError = read.invalid;
+      }
+    } catch { labelError = true; }
+
     const invByRig = getNodeInventoryForRigs(repo.db, new Set(summaries.map((s) => s.id)));
     const enriched = summaries.map((s) => {
       const inventory = invByRig.get(s.id) ?? [];
@@ -238,7 +250,10 @@ rigsRoutes.get("/summary", (c) => {
       // Presence is separate from lifecycle/attention, and uses this same inventory fold.
       const hasLiveAgents = agents.some((e) => e.sessionStatus === "running" || e.sessionStatus === "idle")
         ? true : agents.every((e) => e.sessionStatus === null || e.sessionStatus === "stopped" || e.sessionStatus === "exited") ? false : null;
-      return { ...s, lifecycleState, restoreLifecycleState, hasLiveAgents };
+      return { ...s, lifecycleState, restoreLifecycleState, hasLiveAgents,
+        ...(labels.has(s.id) ? { displayLabel: labels.get(s.id)! } : {}),
+        ...(labelError ? { displayLabelError: true } : {}),
+      };
     });
     return c.json(enriched);
   });

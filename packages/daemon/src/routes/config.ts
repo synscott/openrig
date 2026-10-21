@@ -1,3 +1,4 @@
+import { parseRigDisplayLabelKey } from "../rig-display-labels.js";
 // User Settings v0 — daemon HTTP route for the UI System drawer
 // Settings panel.
 //
@@ -70,14 +71,13 @@ export function configRoutes(opts: { home?: string } = {}): Hono {
     const key = c.req.param("key");
     const removedMessage = removedContextSettingMessage(key);
     if (removedMessage) return c.json({ error: removedMessage, replacement: "context.root" }, 400);
-    // OPR.0.4.4.15: the ONE registered dynamic class resolves here; every
-    // other unknown key keeps the 400 below byte-for-byte.
-    const dynamic = store.resolveFeedHostSubscription(key);
-    if (dynamic) return c.json(dynamic);
-    if (!isSettingsValidKey(key)) {
-      return c.json({ error: `Unknown config key '${key}'`, validKeys: SETTINGS_VALID_KEYS }, 400);
-    }
+    // Registered dynamic settings resolve here; other unknown keys stay rejected.
     try {
+      const dynamic = store.resolveFeedHostSubscription(key) ?? store.resolveRigDisplayLabel(key);
+      if (dynamic) return c.json(dynamic);
+      if (!isSettingsValidKey(key)) {
+        return c.json({ error: `Unknown config key '${key}'`, validKeys: SETTINGS_VALID_KEYS }, 400);
+      }
       return c.json(store.resolveOne(key));
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
@@ -90,7 +90,7 @@ export function configRoutes(opts: { home?: string } = {}): Hono {
     const key = c.req.param("key");
     const removedMessage = removedContextSettingMessage(key);
     if (removedMessage) return c.json({ error: removedMessage, replacement: "context.root" }, 400);
-    const isDynamic = parseFeedHostSubscriptionKey(key) !== null;
+    const isDynamic = parseFeedHostSubscriptionKey(key) !== null || parseRigDisplayLabelKey(key) !== null;
     if (!isDynamic && !isSettingsValidKey(key)) {
       return c.json({ error: `Unknown config key '${key}'`, validKeys: SETTINGS_VALID_KEYS }, 400);
     }
@@ -100,7 +100,7 @@ export function configRoutes(opts: { home?: string } = {}): Hono {
     }
     try {
       store.set(key, body.value);
-      return c.json({ ok: true, key, resolved: isDynamic ? store.resolveFeedHostSubscription(key) : store.resolveOne(key as never) });
+      return c.json({ ok: true, key, resolved: isDynamic ? (store.resolveFeedHostSubscription(key) ?? store.resolveRigDisplayLabel(key)) : store.resolveOne(key as never) });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
     }
@@ -112,13 +112,13 @@ export function configRoutes(opts: { home?: string } = {}): Hono {
     const key = c.req.param("key");
     const removedMessage = removedContextSettingMessage(key);
     if (removedMessage) return c.json({ error: removedMessage, replacement: "context.root" }, 400);
-    const isDynamic = parseFeedHostSubscriptionKey(key) !== null;
+    const isDynamic = parseFeedHostSubscriptionKey(key) !== null || parseRigDisplayLabelKey(key) !== null;
     if (!isDynamic && !isSettingsValidKey(key)) {
       return c.json({ error: `Unknown config key '${key}'`, validKeys: SETTINGS_VALID_KEYS }, 400);
     }
     try {
       store.reset(key);
-      return c.json({ ok: true, key, resolved: isDynamic ? store.resolveFeedHostSubscription(key) : store.resolveOne(key as never) });
+      return c.json({ ok: true, key, resolved: isDynamic ? (store.resolveFeedHostSubscription(key) ?? store.resolveRigDisplayLabel(key)) : store.resolveOne(key as never) });
     } catch (err) {
       return c.json({ error: (err as Error).message }, 400);
     }

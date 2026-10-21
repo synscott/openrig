@@ -1,3 +1,4 @@
+import { formatRigDisplayName } from "@openrig/daemon/rig-display-labels";
 import { fileTargetForPath } from "./reading.js";
 import { terminalExplorerRows } from "./terminals/terminal-model.js";
 import { CONFIG_CATEGORIES } from "./config/config-model.js";
@@ -673,7 +674,7 @@ export function computeExplorerRows(state: ViewState, snap: FleetSnapshot): Expl
         for (const rig of host.rigs) {
           const stateSuffix = rig.lifecycleState && rig.lifecycleState !== "running" ? ` (${rig.lifecycleState})` : "";
           rows.push({
-            label: `    ▾ ${rig.name}${stateSuffix}`,
+            label: `    ▾ ${formatRigDisplayName(rig)}${stateSuffix}`,
             action: { type: "drill", resource: "rig", name: rig.name, target: { host: host.name } },
             key: `rig:${host.name}/${rig.name}`,
           });

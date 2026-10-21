@@ -1,3 +1,4 @@
+import { readRigDisplayLabel } from "@openrig/daemon/rig-display-labels";
 import { composeHumanUpdates, type DeliveredHumanUpdates } from "./attention/attention-model.js";
 import { readTerminals } from "./terminals/terminal-model.js";
 import { fileTargetForPath } from "./reading.js";
@@ -26,6 +27,8 @@ import { isHumanSeatSession } from "./pulse/pulse-model.js";
 // Narrow read-shapes: just the served fields this module consumes (names match
 // the daemon's serialized output — see the Phase-2 endpoint-shape survey).
 interface RigSummaryRead {
+  displayLabel?: unknown;
+  displayLabelError?: boolean;
   id: string;
   name: string;
   lifecycleState?: string;
@@ -485,7 +488,8 @@ export async function hydrateSnapshot(
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
-  const healthRequested = broadReads || viewContext?.viewTab === "health";
+  // The names-only landing has no health banner; drilled Table pages do.
+  const healthRequested = broadReads || viewContext?.viewTab === "health" || (wantsTopologyScope && !!topologyLeaf && viewContext?.viewTab === "table");
   const wantsGraph = wantsTopologyScope && (!viewContext || viewContext.viewTab === "graph");
   // A pending pod/agent address needs every rig's seats to resolve.
   const pendingInventory = viewContext?.pendingDrill?.resource === "pod" || viewContext?.pendingDrill?.resource === "agent";
@@ -564,6 +568,11 @@ export async function hydrateSnapshot(
   // one entry per agent seat WITH a canonical session (infra seats have none).
   const seatActivity: SeatActivitySummary[] = [];
   for (const rig of summaries ?? []) {
+    const displayLabel = readRigDisplayLabel(rig.displayLabel);
+    if (rig.displayLabelError || (rig.displayLabel != null && displayLabel === null)) {
+      const warning = "display-labels: configuration unavailable or invalid; canonical fallbacks used";
+      if (!readErrors.includes(warning)) readErrors.push(warning);
+    }
     const readInventory = wantsConnections ? connectionsRead?.configuration?.inboundDestination?.split("@")[1] === rig.name
       : !focusedTopology || topologyLeaf?.kind === "host" || currentRigName === rig.name || pendingInventory;
     const nodes = readInventory ? await safe<NodeInventoryRead[]>(`nodes(${rig.name})`, () => client.rigNodes(rig.id)) : null;
@@ -588,6 +597,7 @@ export async function hydrateSnapshot(
     const rigRow = {
       id: rig.id,
       name: rig.name,
+      ...(displayLabel !== null ? { displayLabel } : {}),
       pods: nodes ? groupPods(nodes) : [],
       ...(!readInventory ? { inventoryNotLoaded: true } : nodes === null ? { inventoryUnavailable: true } : {}),
       ...(graph ? { graph } : {}),

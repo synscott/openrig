@@ -1,3 +1,4 @@
+import { parseRigDisplayLabelKey, readRigDisplayLabel, requireRigDisplayLabel } from "@openrig/daemon/rig-display-labels";
 import { readFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
 import { writeTextAtomically } from "./atomic-text-write.js";
 import { join, dirname, resolve } from "node:path";
@@ -1254,6 +1255,11 @@ export class ConfigStore {
    * default).
    */
   resolveWithSource(key: string): ResolvedSetting {
+    const rigLabel = parseRigDisplayLabelKey(key);
+    if (rigLabel) {
+      const value = readRigDisplayLabel(getNestedValue(this.readConfigFile(), ["dashboard", "rigLabels", rigLabel.rigId]));
+      return { value: value ?? "", source: value === null ? "default" : "file", defaultValue: "" };
+    }
     const removedMessage = removedContextSettingMessage(key);
     if (removedMessage) throw new Error(removedMessage);
     // OPR.0.4.4.15: dynamic class resolves file-or-default (no env in v1).
@@ -1356,6 +1362,16 @@ export class ConfigStore {
   }
 
   set(key: string, value: string): void {
+    const rigLabel = parseRigDisplayLabelKey(key);
+    if (rigLabel) {
+      const label = requireRigDisplayLabel(value);
+      const config = this.readConfigFile();
+      setNestedValue(config, ["dashboard", "rigLabels", rigLabel.rigId], label);
+      mkdirSync(dirname(this.configPath), { recursive: true });
+      this.writeConfig(JSON.stringify(config, null, 2) + "\n");
+      this.verifyPersisted(["dashboard", "rigLabels", rigLabel.rigId], label);
+      return;
+    }
     const removedMessage = removedContextSettingMessage(key);
     if (removedMessage) throw new Error(removedMessage);
     // OPR.0.4.4.15: the registered dynamic class is accepted; every other
@@ -1399,6 +1415,15 @@ export class ConfigStore {
    * from the config file.
    */
   reset(key?: string): void {
+    const rigLabel = key && parseRigDisplayLabelKey(key);
+    if (rigLabel) {
+      if (!existsSync(this.configPath)) return;
+      const config = this.readConfigFile();
+      const labels = getNestedValue(config, ["dashboard", "rigLabels"]) as Record<string, unknown> | undefined;
+      if (labels && typeof labels === "object" && !Array.isArray(labels)) delete labels[rigLabel.rigId];
+      this.writeConfig(JSON.stringify(config, null, 2) + "\n");
+      return;
+    }
     if (key === undefined) {
       try { unlinkSync(this.configPath); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
