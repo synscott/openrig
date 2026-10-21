@@ -142,6 +142,8 @@ export type RigEvent =
   | { type: "node.policy_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; launchPosture: "floor" | "full_bypass" | "auto"; reason: string; operator: string }
   | { type: "session.stopped"; rigId: string; nodeId: string; sessionName: string; reason: string; operator: string | null }
   | { type: "session.cleaned"; rigId: string; nodeId: string; sessionName: string | null; reason: string; operator: string | null; actions: { sessionsExited: string[]; bindingCleared: boolean } }
+  | { type: "native.creation_attempt"; rigId: string; nodeId: string; attempt: string; name: string; root: string }
+  | { type: "native.creation_result"; rigId: string; nodeId: string; attempt: string; name: string; root: string; status: "created" | "bound" | "collision" | "not_started" | "unknown" | "stopped"; pane: string | null; pid: string | null; birth: string | null }
   | { type: "node.launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string }
   | { type: "topology.roster_recorded"; rigId: string; intendedNodeIds: string[]; source: "materialized_topology" }
   // OPR.0.7.0.5 — in-place restart (same conversation, same pane). Started is persisted before any signal, so

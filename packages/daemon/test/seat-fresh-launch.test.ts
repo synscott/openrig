@@ -657,6 +657,74 @@ describe("SeatLifecycleService.launchFresh", () => {
     });
   });
 
+
+  describe("checked-create lifecycle", () => {
+    function checkedBackend(outcome: "created" | "unknown") {
+      Object.assign(tmux, {
+        usesCheckedCreation: () => true,
+        nativeCreationRoot: () => "/fixture/private-psmux",
+        stopCreatedSession: vi.fn(async () => ({ ok: true })),
+      });
+      vi.mocked(tmux.createSession).mockImplementation(async (name, _cwd, _env, context) => {
+        expect(invalidations).toEqual([]);
+        if (outcome === "unknown") return { ok: false, code: "native_create_unknown", message: "unknown", creationOutcome: "unknown" };
+        const pane = `psmux:v2:${Buffer.from(name).toString("base64url")}:%1:7:10:11`;
+        alive.add(name); livePanes.set(name, pane);
+        return { ok: true, creation: { ...context!, name, pane } };
+      });
+      vi.mocked(tmux.probeSession).mockResolvedValue({ state: "transport_unavailable", cause: "native missing name is indeterminate" });
+    }
+    it.each(["created", "unknown"] as const)("after an explicit stop, %s uses atomic creation without treating unknown as absence", async outcome => {
+      const seat = seedSeat();
+      expect(await service.stopSeat({ seatRef: seat.sessionName, reason: "deliberate stop" })).toMatchObject({ ok: true });
+      checkedBackend(outcome);
+      const before = db.prepare("SELECT status FROM sessions WHERE id=?").get(seat.session!.id);
+      const result = await service.launchFresh({ seatRef: seat.sessionName, fresh: true, reason: "native fresh" });
+      expect(tmux.createSession).toHaveBeenCalledTimes(1);
+      if (outcome === "unknown") {
+        expect(result).toMatchObject({ ok: false, code: "launch_failed" });
+        expect(invalidations).toEqual([]);
+        expect(db.prepare("SELECT status FROM sessions WHERE id=?").get(seat.session!.id)).toEqual(before);
+        expect(sessionRegistry.getBindingForNode(seat.node.id)).toBeNull();
+        expect(tmux.stopCreatedSession).not.toHaveBeenCalled();
+      } else {
+        expect(result).toMatchObject({ ok: true, status: "ready" });
+        expect(sessionRegistry.getBindingForNode(seat.node.id)?.tmuxPane).toContain(":%1:7:10:11");
+        expect(invalidations).toHaveLength(1);
+      }
+    });
+    it("retires old name-state before committing or notifying the successor binding", async () => {
+      const seat = seedSeat();
+      expect(await service.stopSeat({ seatRef: seat.sessionName, reason: "deliberate stop" })).toMatchObject({ ok: true });
+      checkedBackend("created");
+      const order: string[] = [];
+      const update = sessionRegistry.updateBinding.bind(sessionRegistry);
+      vi.spyOn(sessionRegistry, "updateBinding").mockImplementation((...args) => {
+        order.push(invalidations.length === 1 ? "retired-before-binding" : "binding-before-retirement");
+        return update(...args);
+      });
+      eventBus.subscribe(event => { if (event.type === "node.launched") order.push(invalidations.length === 1 ? "retired-before-notify" : "notify-before-retirement"); });
+      expect(await service.launchFresh({ seatRef: seat.sessionName, fresh: true, reason: "ordered native fresh" })).toMatchObject({ ok: true });
+      expect(order.slice(0, 2)).toEqual(["retired-before-binding", "retired-before-notify"]);
+      expect(order).not.toContain("binding-before-retirement");
+      expect(order).not.toContain("notify-before-retirement");
+    });
+    it("compensates failed startup with the created epoch instead of name cleanup", async () => {
+      const seat = seedSeat();
+      expect(await service.stopSeat({ seatRef: seat.sessionName, reason: "deliberate stop" })).toMatchObject({ ok: true });
+      checkedBackend("created"); harnessResult = { ok: false, error: "fixture startup failure" };
+      await service.launchFresh({ seatRef: seat.sessionName, fresh: true, reason: "failed native startup" });
+      expect(tmux.stopCreatedSession).toHaveBeenCalledWith(expect.objectContaining({ name: seat.sessionName, pane: expect.stringContaining(":%1:7:10:11") }), seat.node.id);
+      expect(killed).toEqual([seat.sessionName]); // only the earlier explicit stop used this legacy fixture
+    });
+    it("does not bypass an indeterminate probe for an unowned fresh seat", async () => {
+      seedSeat({ clean: true }); checkedBackend("created");
+      expect(await service.launchFresh({ seatRef: "dev.impl", fresh: true, reason: "unknown initial seat" })).toMatchObject({ ok: false, code: "tmux_probe_failed" });
+      expect(tmux.createSession).not.toHaveBeenCalled();
+      expect(invalidations).toEqual([]);
+    });
+  });
+
   // Real tmux ends its server when the last session goes (exit-empty), and a
   // probe then fails "no server running": transport_unavailable, never absence.
   // new-session and startServer() each bring a server back.

@@ -80,12 +80,25 @@ export const execCommand: ExecFn = async (cmd: string): Promise<string> => {
  * PATH entry with a spawn on the event loop. psmux ships a `tmux` alias on
  * PATH, so Windows passes the bare name to the spawn.
  */
-export const execArgvCommand: ArgvExecFn = async (argv: string[]): Promise<string> => {
+export const execArgvCommand: ArgvExecFn = async (argv, options): Promise<string> => {
   const [bin, ...args] = argv;
   if (!bin) throw new Error("execArgvCommand: empty argv");
   // Nothing ran when no file was found: a shell also finds tmux through an entry the lookup skips, such as a literal
   // `~/bin`, and reports a missing one as the shell transport does.
-  const opts = { windowsHide: true, maxBuffer: TMUX_MAX_BUFFER };
+  const checkedCreate = argv.length === 4 && bin === "tmux" && args[0] === "checked-create" && args[1] === "--file" && isAbsolute(args[2]!);
+  const checkedStop = argv.length === 6 && bin === "tmux" && args[0] === "kill-session" && args[1] === "-t"
+    && /^\$\d+$/.test(args[2]!) && args[3] === "-G" && /^\d+:\d+$/.test(args[4]!);
+  if (options && ((!checkedCreate && !checkedStop) || !options.psmuxDataDir || !isAbsolute(options.psmuxDataDir)
+    || (options.timeoutMs !== undefined && (!checkedCreate || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0)))) {
+    throw new Error("Native transport overrides require a standalone checked creation or receipt-bound stop");
+  }
+  const fixedRootEnv = options?.psmuxDataDir
+    ? Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toUpperCase() !== "PSMUX_DATA_DIR").concat([["PSMUX_DATA_DIR", options.psmuxDataDir]]))
+    : undefined;
+  const opts = { windowsHide: true, maxBuffer: TMUX_MAX_BUFFER,
+    ...(options?.psmuxDataDir ? { env: fixedRootEnv } : {}),
+    ...(options?.timeoutMs ? { timeout: Math.min(Math.floor(options.timeoutMs), 35000) } : {}) };
+
   const run = (file: string | null) => file ? execFileAsync(file, args, opts) : execFileAsync("/bin/sh", ["-c", 'exec "$0" "$@"', bin, ...args], opts);
   try {
     if (process.platform === "win32") return (await execFileAsync(bin, args, opts)).stdout;
@@ -100,6 +113,9 @@ export const execArgvCommand: ArgvExecFn = async (argv: string[]): Promise<strin
       return (await run(null)).stdout;
     }
   } catch (err) {
+    // Checked-create needs the original exit2/3 stdout/code; the caller never
+    // prints request/environment data and treats missing evidence as unknown.
+    if (checkedCreate) throw err;
     throw withExecOutput(err);
   }
 };

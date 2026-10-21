@@ -101,11 +101,11 @@ describe("homeIsolationAdvisory", () => {
 });
 
 describe("daemon startup", () => {
-  async function start(opts: { account: string; home: string; openrigHome: string; codexHome?: string; root: string }) {
+  async function start(opts: { account: string; home: string; homeEnv?: string; openrigHome: string; codexHome?: string; root: string }) {
     vi.resetModules();
     vi.spyOn(os, "homedir").mockReturnValue(opts.home);
     vi.spyOn(os, "userInfo").mockReturnValue({ homedir: opts.account } as os.UserInfo<string>);
-    vi.stubEnv("HOME", opts.home); vi.stubEnv("OPENRIG_HOME", opts.openrigHome); vi.stubEnv("CODEX_HOME", opts.codexHome);
+    vi.stubEnv("HOME", opts.homeEnv ?? opts.home); vi.stubEnv("USERPROFILE", opts.home); vi.stubEnv("OPENRIG_HOME", opts.openrigHome); vi.stubEnv("CODEX_HOME", opts.codexHome);
     vi.stubEnv("OPENRIG_DB", path.join(opts.root, "instance.sqlite")); vi.stubEnv("OPENRIG_NO_KERNEL", "1");
     vi.stubEnv("OPENRIG_URL", undefined); vi.stubEnv("OPENRIG_PORT", undefined);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -131,4 +131,25 @@ describe("daemon startup", () => {
     const d = dirs();
     expect(await start({ root: d.root, account: d.real, home: d.real, openrigHome: path.join(d.real, ".openrig") })).toEqual([]);
   }, 60000);
+
+  it("uses explicit HOME for daemon-owned state while leaving the OS profile available to native children", async () => {
+    const d = dirs();
+    const openrigHome = path.join(d.scratch, ".openrig");
+    const codexHome = path.join(d.scratch, ".codex");
+    const advisories = await start({ root: d.root, account: d.real, home: d.real, homeEnv: d.scratch, openrigHome, codexHome });
+
+    expect(advisories).toEqual([]);
+    expect(process.env.USERPROFILE).toBe(d.real);
+  });
+
+  it("rejects a relative HOME instead of resolving it against the daemon working directory", async () => {
+    const d = dirs();
+    await expect(start({
+      root: d.root,
+      account: d.real,
+      home: d.real,
+      homeEnv: ".relative-home",
+      openrigHome: path.join(d.scratch, ".openrig"),
+    })).rejects.toThrow("HOME must be an absolute path for daemon startup");
+  });
 });

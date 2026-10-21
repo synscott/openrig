@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "name": "OpenRig patched psmux",
+  "version": "3.4.0",
+  "upstream": {
+    "repository": "https://github.com/psmux/psmux.git",
+    "commit": "20aa1d7254ee93f64dafa059ef89341d9767470a"
+  },
+  "patch": {
+    "file": "upstream.patch",
+    "sha256": "3f5b5cce3d7b7b5da5cd1c8e098655d5466f8f061eef254e6c3a7d6e44c2f04a"
+  },
+  "sourceManifest": {
+    "file": "source-manifest.json",
+    "sha256": "cebcd078c1ae25a91be6220bf64d342b5000b74e176408dd1d7bad41722f5432",
+    "files": 1613
+  },
+  "license": {
+    "spdx": "MIT",
+    "copyright": "Copyright (c) 2025 Godwin Sam Josh",
+    "file": "LICENSE",
+    "sha256": "08da43448469783a5b56d903e29c071383d7c201b9644287f98531e76083b959"
+  },
+  "cargoLockSHA256": "36d4f0b7c3a141c1baab7b9d1a1810a654d2438a7d084e4ff28a9657a97b6164",
+  "toolchain": "1.98.0",
+  "target": "x86_64-pc-windows-msvc",
+  "acceptedArtifact": {
+    "bytes": 10171392,
+    "sha256": "2136ec390148154ea0c09ff169f3d50a915fde4bf1189f9c5c17ae54a09d86af",
+    "format": "PE AMD64",
+    "sourceManifestSHA256": "cebcd078c1ae25a91be6220bf64d342b5000b74e176408dd1d7bad41722f5432",
+    "sourceInventorySHA256": "28a963879b1e40f0d4d857f88db7cf3fdb3eac9b41746e67ed1e36e99c40b83c",
+    "qualification": "Source-bound native compiler artifact only; residual unknown. Native APIs not executed. No lifecycle, OpenRig app, provider or user-path acceptance; no byte-reproducibility guarantee.",
+    "bindingReceiptSHA256": "1085eee92b6139e985e9efa7ef1adf2b21e7eb53b026201f7f600ae32d0c500e",
+    "independentReviewSHA256": "a3e91013f179578a73b57017a8ad7b97ada36857ce3a9f6f22dae29925469d85"
+  },
+  "buildArgv": [
+    "rustup",
+    "run",
+    "1.98.0",
+    "cargo",
+    "build",
+    "--frozen",
+    "--offline",
+    "--release",
+    "--jobs",
+    "1",
+    "--target",
+    "x86_64-pc-windows-msvc",
+    "--bin",
+    "psmux"
+  ],
+  "reproducibility": "Exact source reconstruction, not a promise of byte-identical binaries across toolchains/environments.",
+  "artifactStatus": "Current checked-input/checked-create source-bound native compiler artifact accepted for identity verification only. Historical B artifact remains ineligible; local build receipts remain unsigned bookkeeping."
+}

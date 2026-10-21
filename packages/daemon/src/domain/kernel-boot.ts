@@ -50,6 +50,8 @@ export interface KernelBootDeps {
    *  callsite passes the resolved workspace.root setting; tests inject
    *  a fixture path. */
   cwdOverride: string;
+  /** Selected daemon/provider home for default Codex config lookup. */
+  codexHome?: string;
   /** Runtime auth probe — defaults to live shellouts; tests inject. */
   probeRuntimes?: () => Promise<RuntimeProbeResult>;
   /** Logger sink; defaults to console.log/warn so daemon stdout/stderr
@@ -102,7 +104,7 @@ export async function bootKernelIfNeeded(deps: KernelBootDeps): Promise<KernelBo
   }
 
   // 3. Probe runtime auth state to pick a variant.
-  const probe = await (deps.probeRuntimes ?? defaultProbeRuntimes)();
+  const probe = await (deps.probeRuntimes ?? (() => defaultProbeRuntimes(deps.codexHome)))();
 
   if (probe.claudeCode === "unavailable" && probe.codex === "unavailable") {
     const msg = authBlockMessage();
@@ -171,7 +173,7 @@ export function selectVariant(probe: RuntimeProbeResult): string {
 }
 
 /** Default auth probe — shells out to the runtime CLIs. */
-export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
+export async function defaultProbeRuntimes(selectedCodexHome?: string): Promise<RuntimeProbeResult> {
   const { exec } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execAsync = promisify(exec);
@@ -192,7 +194,7 @@ export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
     }
   }
 
-  const codexHome = process.env.CODEX_HOME || nodePath.join(os.homedir(), ".codex");
+  const codexHome = resolveDefaultCodexHome(selectedCodexHome);
   const [claudeCode, codex] = await Promise.all([
     tryProbe("claude auth status"),
     probeCodexReadiness({
@@ -205,6 +207,16 @@ export async function defaultProbeRuntimes(): Promise<RuntimeProbeResult> {
   ]);
 
   return { claudeCode, codex };
+}
+
+/** Resolve Codex's config root consistently with the daemon's selected HOME.
+ * Explicit per-provider roots take precedence; HOME is the fallback when the
+ * process runs with an isolated provider home. */
+export function resolveDefaultCodexHome(selectedCodexHome?: string): string {
+  const configuredHome = selectedCodexHome || process.env.CODEX_HOME;
+  if (configuredHome) return configuredHome;
+  const selectedHome = process.env.HOME || os.homedir();
+  return nodePath.join(selectedHome, ".codex");
 }
 
 /** Issue #194 — how the Codex provider selected in `$CODEX_HOME/config.toml`

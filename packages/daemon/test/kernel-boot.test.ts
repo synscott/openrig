@@ -20,6 +20,7 @@ import {
   authBlockMessage,
   probeCodexReadiness,
   selectCodexProviderAuth,
+  resolveDefaultCodexHome,
   type KernelBootDeps,
   type RuntimeAuthStatus,
 } from "../src/domain/kernel-boot.js";
@@ -107,7 +108,25 @@ beforeEach(() => {
 
 afterEach(() => {
   delete process.env.OPENRIG_NO_KERNEL;
+  vi.unstubAllEnvs();
   if (tmpSpecsDir) rmSync(tmpSpecsDir, { recursive: true, force: true });
+});
+
+describe("resolveDefaultCodexHome", () => {
+  it("uses the selected daemon HOME when CODEX_HOME is not explicitly set", () => {
+    vi.stubEnv("HOME", "/private/home");
+    vi.stubEnv("CODEX_HOME", "");
+
+    expect(resolveDefaultCodexHome()).toBe(join("/private/home", ".codex"));
+  });
+
+  it("prefers the explicit Codex provider root over HOME", () => {
+    vi.stubEnv("HOME", "/private/home");
+    vi.stubEnv("CODEX_HOME", "/private/codex");
+
+    expect(resolveDefaultCodexHome()).toBe("/private/codex");
+    expect(resolveDefaultCodexHome("/selected/codex")).toBe("/selected/codex");
+  });
 });
 
 describe("selectVariant — auth-state → variant mapping", () => {

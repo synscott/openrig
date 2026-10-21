@@ -2,7 +2,7 @@ import { serve, type ServerType } from "@hono/node-server";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { endProbeGroupsOnStartupSignal, stopRuntimeProbes } from "./adapters/bounded-probe-exec.js";
-import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_RECEIPT, trackHttpServerResponses } from "./daemon-shutdown.js";
+import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_RECEIPT, trackHttpServerResponses, startWindowsDaemonControl } from "./daemon-shutdown.js";
 import { readOpenRigEnv, OPENRIG_HOME } from "./openrig-compat.js";
 import { makeOperatorDeliveryEngine } from "./domain/gateway/operator-delivery-engine.js";
 import { resolveDaemonDbPath } from "./daemon-db-path.js";
@@ -243,7 +243,13 @@ async function isTrustedLocalOrTailnetBind(host: string): Promise<boolean> {
   return false;
 }
 
-export async function startServer(port?: number) {
+export interface StartServerOptions {
+  /** Required-control dependency seam; production keeps the real Windows ACL/listen initializer. */
+  windowsControlInitializer?: (home: string, shutdown: () => void, signal?: AbortSignal) => Promise<() => Promise<void>>;
+  signal?: AbortSignal;
+}
+
+export async function startServer(port?: number, options: StartServerOptions = {}) {
   const p = port ?? parseInt(readOpenRigEnv("OPENRIG_PORT", "RIGGED_PORT") ?? "7433", 10);
   // D15 — anchor the default db under OPENRIG_HOME, never a bare CWD-relative
   // filename (which could open the shared fleet db). Explicit OPENRIG_DB wins.
@@ -327,65 +333,34 @@ export async function startServer(port?: number) {
   // P7 — lifecycle heartbeat: advance last-seen every tick while running.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   const servers: ServerType[] = [];
-  for (const host of bindHosts) {
-    const srv = serve({ fetch: app.fetch, port: p, hostname: host }, (info) => {
-      console.log(`OpenRig daemon listening on http://${host}:${info.port}`);
-      if (!monitorsStarted) {
-        monitorsStarted = true;
-        contextMonitor.start();
-        // PL-004 Phase C: start watchdog scheduler. Joins the supervision
-        // tree post-bind so the HTTP surface is ready before the first
-        // tick (matches contextMonitor pattern).
-        deps.watchdogScheduler?.start();
-        deps.sessionTransport?.guardedDelivery?.recover();
-        // S10 — start the gateway subsystem's NETWORK services (replay, outbound poll,
-        // Socket Mode inbound) post-bind, contextMonitor pattern: the composed wire is
-        // already active; only its dial-out half waits for the supervision tree.
-        deps.gatewaySubsystem?.startServices();
-        // Slice 15 — start the seat-activity scheduler (1Hz default).
-        // Polls every running tmux-bound seat's window_activity timestamp so
-        // PsProjectionService + node-inventory enrichment serve
-        // fresh data on each request.
-        deps.seatActivityService?.start(deps.rigRepo.db);
-        // 5b82324b — the structural pane-activity cache, on the same 1Hz cadence.
-        deps.seatStructuralActivityService?.start(deps.rigRepo.db);
-        // OPR.0.4.3.19 — start the liveness identity reconciler (5s default).
-        // Persists the per-seat pane PID/command verdict so node-inventory
-        // gates the running/active projection on verified process identity.
-        deps.seatIdentityReconciler?.start();
-        startPeriodicSnapshotScheduler(deps);
-        // OPR.0.4.6.FS-1 W2 — boot sweep + daily retention tick (bounded,
-        // yields between batches; a sweep failure is logged, never fatal).
-        retentionTimer = startQueueRetentionScheduler(deps);
-        // S02 — the standing stuck sweep: nobody has to remember to run the verbs.
-        stuckSweepTimer = startStuckSweepScheduler(deps);
-        // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
-        // then escalates through recorded rungs; never a silent park.
-        wakeLadderScheduler = startWakeLadderScheduler(deps);
-        // P7 — lifecycle heartbeat (advances last-seen). A write failure logs and
-        // continues (the render degrades to an older last-seen honestly); the
-        // store guards not-stopped so a tick can never pass stopped_at.
-        heartbeatTimer = setInterval(() => {
-          try {
-            deps.daemonLifecycleStore.recordHeartbeat(new Date().toISOString());
-          } catch (err) {
-            console.error("[lifecycle-heartbeat] write failed (non-fatal)", err);
-          }
-        }, HEARTBEAT_INTERVAL_MS);
-      }
-    });
-    injectWebSocket(srv);
-    trackHttpServerResponses(srv, deps.requestPhaseObserver?.observeRequest);
-    servers.push(srv);
-  }
-
+  const requiresWindowsControl = process.platform === "win32" || options.windowsControlInitializer !== undefined;
+  let startupReady = !requiresWindowsControl;
+  let startupComplete = false;
+  let startupFailed = false;
+  let stopping = false;
+  let closeWindowsControl: (() => Promise<void>) | undefined;
+  let controlInitialization: Promise<void> | undefined;
+  const controlAbort = new AbortController();
+  let finishShutdown!: () => void;
+  const shutdownFinished = new Promise<void>((resolve) => { finishShutdown = resolve; });
   // PL-004 Phase C: graceful shutdown — stop scheduler before process
   // exit so any in-flight policy evaluation completes (or is awaited).
   // Multi-bind: close every serve() instance in parallel.
-  deps.healthDiagnosis?.start();
   const shutdown = createDaemonShutdown({
     receiptPath: path.join(OPENRIG_HOME, DAEMON_SHUTDOWN_RECEIPT),
     phases: [
+      ["startup", () => {
+        if (startupFailed) throw new Error("startup did not complete; rollback requested");
+      }],
+      ["windows-control", async () => {
+        // The initializer owns its partial resources until it settles. Its abort
+        // contract prevents publication; a late returned handle is also closed.
+        await controlInitialization?.catch(() => {});
+        const close = closeWindowsControl;
+        closeWindowsControl = undefined;
+        await close?.();
+      }],
+      ["context-monitor", () => contextMonitor.stop()],
       ["timers", () => {
         deps.resumeMetadataRefresher?.stop();
         if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -414,17 +389,132 @@ export async function startServer(port?: number) {
         }
       }],
     ],
+    exit: (code) => {
+      removeShutdownListeners();
+      finishShutdown();
+      // Startup rollback is observable by an embedding caller. The direct-run
+      // caller reports failure below, rather than leaving a rejected promise.
+      if (!startupFailed) process.exit(code);
+    },
     // A service failure, open connection, or lost recorder drain is never clean.
     markClean: () => deps.daemonLifecycleStore.recordStop(deps.daemonBootEpoch, new Date().toISOString()),
   });
-  // Repeated signals join the first shutdown instead of bypassing its evidence.
+  const requestShutdown = (reason: string) => {
+    if (!startupComplete) startupFailed = true;
+    stopping = true;
+    startupReady = false;
+    controlAbort.abort();
+    shutdown(reason);
+  };
+  const onInterrupt = () => requestShutdown("SIGINT");
+  const onTerminate = () => requestShutdown("SIGTERM");
+  const onAbort = () => requestShutdown("startup cancellation");
+  const removeShutdownListeners = () => {
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onTerminate);
+    options.signal?.removeEventListener("abort", onAbort);
+  };
   disarmStartupSignals();
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onTerminate);
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    if (options.signal?.aborted) {
+      requestShutdown("startup cancellation");
+      throw new Error("daemon startup cancelled");
+    }
+    for (const host of bindHosts) {
+      const srv = serve({ fetch: (request, env) => startupReady
+        ? app.fetch(request, env)
+        : new Response("OpenRig daemon startup incomplete", { status: 503 }), port: p, hostname: host }, (info) => {
+        if (stopping) return;
+        console.log(`OpenRig daemon listening on http://${host}:${info.port}`);
+        if (!monitorsStarted) {
+          monitorsStarted = true;
+          contextMonitor.start();
+          // PL-004 Phase C: start watchdog scheduler. Joins the supervision
+          // tree post-bind so the HTTP surface is ready before the first
+          // tick (matches contextMonitor pattern).
+          deps.watchdogScheduler?.start();
+          deps.sessionTransport?.guardedDelivery?.recover();
+          // S10 — start the gateway subsystem's NETWORK services (replay, outbound poll,
+          // Socket Mode inbound) post-bind, contextMonitor pattern: the composed wire is
+          // already active; only its dial-out half waits for the supervision tree.
+          deps.gatewaySubsystem?.startServices();
+          // Slice 15 — start the seat-activity scheduler (1Hz default).
+          // Polls every running tmux-bound seat's window_activity timestamp so
+          // PsProjectionService + node-inventory enrichment serve
+          // fresh data on each request.
+          deps.seatActivityService?.start(deps.rigRepo.db);
+          // 5b82324b — the structural pane-activity cache, on the same 1Hz cadence.
+          deps.seatStructuralActivityService?.start(deps.rigRepo.db);
+          // OPR.0.4.3.19 — start the liveness identity reconciler (5s default).
+          // Persists the per-seat pane PID/command verdict so node-inventory
+          // gates the running/active projection on verified process identity.
+          deps.seatIdentityReconciler?.start();
+          startPeriodicSnapshotScheduler(deps);
+          // OPR.0.4.6.FS-1 W2 — boot sweep + daily retention tick (bounded,
+          // yields between batches; a sweep failure is logged, never fatal).
+          retentionTimer = startQueueRetentionScheduler(deps);
+          // S02 — the standing stuck sweep: nobody has to remember to run the verbs.
+          stuckSweepTimer = startStuckSweepScheduler(deps);
+          // S01 — wake-or-escalate on batons: a failed baton wake retries on schedule,
+          // then escalates through recorded rungs; never a silent park.
+          wakeLadderScheduler = startWakeLadderScheduler(deps);
+          // P7 — lifecycle heartbeat (advances last-seen). A write failure logs and
+          // continues (the render degrades to an older last-seen honestly); the
+          // store guards not-stopped so a tick can never pass stopped_at.
+          heartbeatTimer = setInterval(() => {
+            try {
+              deps.daemonLifecycleStore.recordHeartbeat(new Date().toISOString());
+            } catch (err) {
+              console.error("[lifecycle-heartbeat] write failed (non-fatal)", err);
+            }
+          }, HEARTBEAT_INTERVAL_MS);
+        }
+      });
+      servers.push(srv);
+      injectWebSocket(srv);
+      trackHttpServerResponses(srv, deps.requestPhaseObserver?.observeRequest);
+    }
 
-  // Backward-compatible single-server return (callers that just need a
-  // handle reference; multi-bind shutdown is wired via signal handlers).
-  return servers[0]!;
+    deps.healthDiagnosis?.start();
+    if (requiresWindowsControl) {
+      const initialize = options.windowsControlInitializer ?? startWindowsDaemonControl;
+      controlInitialization = Promise.resolve()
+        .then(() => initialize(OPENRIG_HOME, () => requestShutdown("Windows control"), controlAbort.signal))
+        .then(async (close) => {
+          if (stopping) await close();
+          else closeWindowsControl = close;
+        });
+      await Promise.race([
+        controlInitialization,
+        shutdownFinished.then(() => { throw new Error("daemon startup cancelled"); }),
+      ]);
+    }
+    if (stopping) throw new Error("daemon startup cancelled");
+    startupComplete = true;
+    startupReady = true;
+    // Preserve the existing single-server return; signals drain all owned binds.
+    return servers[0]!;
+  } catch (error) {
+    startupFailed = true;
+    requestShutdown("startup failure");
+    await shutdownFinished;
+    throw error;
+  }
+}
+
+// Direct entry owns this process; embedded callers retain reject-only behavior.
+export async function startServerDirect(port?: number, options: StartServerOptions = {}): Promise<void> {
+  try {
+    await startServer(port, options);
+  } catch (error) {
+    console.error("OpenRig daemon startup failed", error);
+    // startServer has joined bounded rollback and recorded failed/timed-out evidence.
+    // Active handles must not keep the executable alive beyond that boundary.
+    process.exit(1);
+  }
 }
 
 // Only start the server when this file is executed directly (not imported).
@@ -440,5 +530,5 @@ if (isDirectRun) {
   // environment to every seat, so drop the launching session's identity.
   const removed = removeParentSessionEnv(process.env);
   if (removed.length) console.log(`[openrig] Seats will not inherit the launching session's ${removed.join(", ")}.`);
-  startServer();
+  void startServerDirect();
 }
