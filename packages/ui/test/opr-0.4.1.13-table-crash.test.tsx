@@ -66,7 +66,14 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => cleanup());
+let stressDiagnostic: { mark: (phase: string, count?: number) => void; flush: () => void } | undefined;
+afterEach(() => {
+  try { stressDiagnostic?.mark("cleanup:before"); cleanup(); } finally {
+    const diagnostic = stressDiagnostic;
+    stressDiagnostic = undefined;
+    diagnostic?.flush();
+  }
+});
 
 function withQueryClient(ui: ReactNode) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -115,6 +122,23 @@ describe("OPR.0.4.1.13 — table-view crash repro (malformed row + filter)", () 
   });
 
   it("STRESS: many rows with mixed malformed shapes survive filter + sort (no-recur)", async () => {
+    const started = performance.now();
+    const cpuStarted = process.cpuUsage();
+    const marks: { phase: string; wallMs: number; userUs: number; systemUs: number; count: number }[] = [];
+    let last: (typeof marks)[number] | undefined;
+    let lastWork: (typeof marks)[number] | undefined;
+    const mark = (phase: string, count = 0) => {
+      const cpu = process.cpuUsage(cpuStarted);
+      last = { phase, wallMs: performance.now() - started, userUs: cpu.user, systemUs: cpu.system, count };
+      if (!phase.startsWith("cleanup:")) lastWork = last;
+      if (marks.length === 96) marks.shift();
+      marks.push(last);
+    };
+    stressDiagnostic = { mark, flush: () => {
+      mark("cleanup:after");
+      console.info("PR5_TABLE_PHASES", JSON.stringify({ marks, last, lastWork }));
+    } };
+    mark("stress:entry");
     // A large, deliberately-ugly inventory: null name, null/missing logicalId,
     // null runtime/status, missing contextUsage - across many rigs/nodes.
     mockFetch.mockReset();
@@ -139,24 +163,42 @@ describe("OPR.0.4.1.13 — table-view crash repro (malformed row + filter)", () 
       return new Response("[]");
     });
 
+    mark("render:before");
     withQueryClient(<TopologyTableView />);
+    mark("render:after");
+    let attempts = 0;
+    mark("rowwait:before");
     await waitFor(() => {
-      expect(screen.getAllByTestId(/^topology-table-row-/).length).toBeGreaterThan(10);
+      mark("rowwait:attempt", ++attempts);
+      const rows = screen.getAllByTestId(/^topology-table-row-/).length;
+      mark("rowwait:rows", rows);
+      expect(rows).toBeGreaterThan(10);
     });
+    mark("rowwait:after", attempts);
     const search = screen.getByTestId("topology-table-search");
     // Hammer the filter with several queries (each re-runs globalFilterFn over all rows).
     expect(() => {
+      let query = 0;
       for (const q of ["seat", "rig", "codex", "running", "zzz", ""]) {
+        mark("filter:before", query);
         fireEvent.change(search, { target: { value: q } });
+        mark("filter:after", query++);
       }
     }).not.toThrow();
     // Sort by clicking each sortable header (re-runs the sorted-row-model over null fields).
     expect(() => {
+      let header = 0;
       for (const th of Array.from(document.querySelectorAll("thead th"))) {
+        mark("header:first:before", header);
         fireEvent.click(th);
+        mark("header:first:after", header);
+        mark("header:second:before", header);
         fireEvent.click(th);
+        mark("header:second:after", header++);
       }
     }).not.toThrow();
+    mark("assert:before");
     expect(screen.getByTestId("topology-table-view")).toBeTruthy();
+    mark("body:after");
   });
 });
