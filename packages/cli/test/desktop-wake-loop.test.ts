@@ -43,6 +43,13 @@ describe.skipIf(process.platform === "win32")("the skill's opt-in wake loop", ()
   let failLists = 0;
   let failListsAfter = Infinity; // every list request after this many fails, as if the daemon stopped
   let listCalls = 0;
+  let pollStarted = 0;
+  let pollCounts = { ok: 0, failed: 0 };
+  let polls: { atMs: number; elapsedMs: number; status: number }[] = [];
+  const recordPoll = (started: number, status: number) => {
+    pollCounts[status >= 200 && status < 300 ? "ok" : "failed"]++;
+    if (polls.length < 96) polls.push({ atMs: started - pollStarted, elapsedMs: performance.now() - started, status });
+  };
   let queue: QueueRepository;
 
   beforeEach(async () => {
@@ -63,17 +70,24 @@ describe.skipIf(process.platform === "win32")("the skill's opt-in wake loop", ()
     failLists = 0;
     failListsAfter = Infinity;
     listCalls = 0;
+    pollCounts = { ok: 0, failed: 0 };
+    polls = [];
     server = await new Promise<ServerType>((resolve) => {
       const s = serve({
-        fetch: (request: Request) => {
-          if (new URL(request.url).pathname === "/api/queue/list") {
+        fetch: async (request: Request) => {
+          const started = performance.now();
+          const isList = new URL(request.url).pathname === "/api/queue/list";
+          if (isList) {
             listCalls++;
             if (failLists > 0 || listCalls > failListsAfter) {
               if (failLists > 0) failLists--;
+              recordPoll(started, 503);
               return new Response(JSON.stringify({ error: "fixture: daemon busy" }), { status: 503 });
             }
           }
-          return app.fetch(request);
+          const response = await app.fetch(request);
+          if (isList) recordPoll(started, response.status);
+          return response;
         },
         port: 0, hostname: "127.0.0.1",
       }, () => resolve(s));
@@ -95,11 +109,27 @@ describe.skipIf(process.platform === "win32")("the skill's opt-in wake loop", ()
     };
     if (seat) env.OPENRIG_SESSION_NAME = seat;
     const started = Date.now();
-    return new Promise<{ code: number | null; stdout: string; seconds: number }>((resolve) => {
+    pollStarted = performance.now();
+    return new Promise<{ code: number | null; stdout: string; seconds: number; diagnostic: string }>((resolve) => {
       const child = spawn("sh", ["-c", shippedLoop()], { env, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       child.stdout.on("data", (chunk) => { stdout += String(chunk); });
-      child.on("close", (code) => resolve({ code, stdout, seconds: (Date.now() - started) / 1000 }));
+      let stderr: Buffer = Buffer.alloc(0);
+      let stderrBytes = 0;
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrBytes += chunk.length;
+        if (stderr.length < 4096) stderr = Buffer.concat([stderr, chunk.subarray(0, 4096 - stderr.length)]);
+      });
+      child.on("close", (code, signal) => {
+        const seconds = (Date.now() - started) / 1000;
+        const diagnostic = JSON.stringify({ code, signal, seconds, listCalls, failLists, pollCounts, polls,
+          stdoutBytes: Buffer.byteLength(stdout), stderrBytes,
+          stderrUsage: /Usage: rig/.test(stderr.toString()), stderrTimeout: /timeout|timed out/i.test(stderr.toString()),
+          stdoutNoWork: stdout.includes("No new work before the deadline"),
+          stdoutEveryPollFailed: stdout.includes("Couldn't check for work: every poll failed"),
+          stdoutStopped: stdout.includes("Checking stopped working") });
+        resolve({ code, stdout, seconds, diagnostic });
+      });
     });
   }
 
@@ -154,7 +184,7 @@ describe.skipIf(process.platform === "win32")("the skill's opt-in wake loop", ()
   it("stays quiet when a failed poll is followed by a successful one", async () => {
     failLists = 2; // two failures, then the daemon answers again (with no work)
     const result = await runLoop(4);
-    expect(result.code).toBe(0);
+    expect(result.code, result.diagnostic).toBe(0);
     expect(result.stdout).toContain("No new work before the deadline");
     expect(result.stdout).not.toContain("Checking stopped working");
   }, 40_000);

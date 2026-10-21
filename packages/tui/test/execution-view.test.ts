@@ -721,3 +721,89 @@ describe("slice source provenance", () => {
     expect(body).not.toContain("superseded by");
   });
 });
+
+describe("mission queue work stays separate from slice outcomes", () => {
+  function missionFixture(state = "in-progress", activity: string | null = null): NonNullable<FleetSnapshot["execution"]> {
+    const execution = executionFixture(0);
+    execution.mission_work = { state: "available", mission: execution.mission, derived_at: execution.derived_at,
+      basis: "explicit mission tags at read time", project_scope: "exact project:demo", unresolved: [], terminal_counts: {},
+      items: [{ qitem_id: "exact-mission-task", mission: execution.mission, state, owner: "author@fixture",
+        summary: "Useful design work", blocked_on: state === "blocked" ? "external:source-review" : null,
+        claimed_at: state === "pending" ? null : execution.derived_at, pickup: { state: state === "blocked" ? "parked" : "unclaimed" },
+        binding_basis: "explicit mission tag", source: { qitem_id: "exact-mission-task" },
+        activity: activity ? { activity, needs_input: { count: 1, reason: "permission prompt" } }
+          : { activity: "INDETERMINATE", needs_input: null } }],
+    };
+    return execution;
+  }
+  it.each(["pending", "in-progress", "blocked", "future-state"])("shows %s without inferring execution or readiness", state => {
+    const execution = missionFixture(state);
+    const lines = executionContentLines(execution, [], [], null, 120);
+    const now = lines.find(line => line.text.includes("NOW"))!.text;
+    expect(now).toContain(state === "in-progress" ? "claimed" : state);
+    expect(now).not.toContain("working");
+    expect(lines.map(line => line.text).join("\n")).toContain("owner activity: unknown · needs input: unknown");
+    expect(lines.find(line => line.text.includes("PROGRESS"))!.text).toContain("0/0 outcomes complete");
+    expect(lines.find(line => line.text.includes("Useful design work"))?.action).toMatchObject({ type: "execution-open", key: "mission-work:exact-mission-task" });
+  });
+  it("opens the exact qitem, retaining blocked state and owner activity/needs-input independently", () => {
+    const execution = missionFixture("blocked", "working");
+    const lines = executionContentLines(execution, [], [], "mission-work:exact-mission-task", 120);
+    const text = lines.map(line => line.text).join("\n");
+    for (const value of ["exact-mission-task", "blocked", "external:source-review", "author@fixture", "owner activity: working", "permission prompt"]) expect(text).toContain(value);
+    expect(executionContentLines(execution, [], [], "mission-work:missing", 120)[0]!.text).toContain("not in the current snapshot");
+  });
+  it("retains claimed but idle owner truth without labelling the task working", () => {
+    const lines = executionContentLines(missionFixture("in-progress", "idle-at-prompt"), [], [], null, 120);
+    expect(lines.find(line => line.text.includes("NOW"))!.text).toContain("claimed");
+    expect(lines.map(line => line.text).join("\n")).toContain("owner activity: idle-at-prompt");
+    expect(lines.map(line => line.text).join("\n")).not.toContain("owner activity: working");
+  });
+  it("shows mixed slice and mission work without inflating slice progress or duplicating the task", () => {
+    const execution = executionFixture(2);
+    const before = executionContentLines(execution, [], [], null, 120);
+    execution.mission_work = missionFixture().mission_work;
+    const after = executionContentLines(execution, [], [], null, 120);
+    expect(after.find(line => line.text.includes("NOW"))!.text).toContain("mission task");
+    expect(after.find(line => line.text.includes("PROGRESS"))!.text).toBe(before.find(line => line.text.includes("PROGRESS"))!.text);
+    expect(after.filter(line => line.action?.type === "execution-open" && line.action.key === "mission-work:exact-mission-task")).toHaveLength(1);
+    expect(after.map(line => line.text).join("\n")).toContain("OPR.0.5.8.1");
+    execution.mission_work!.project_scope = "legacy unscoped read; not project-isolated";
+    expect(executionContentLines(execution, [], [], null, 120).map(line => line.text).join("\n")).toContain("not project-isolated");
+  });
+  it("keeps old-daemon omission, unknown binding and successful empty reads distinct", () => {
+    const old = executionFixture(0);
+    const text = (execution: typeof old) => executionContentLines(execution, [], [], null, 120).map(line => line.text).join("\n");
+    expect(text(old)).toContain("not supplied by this daemon");
+    expect(text(old)).not.toContain("No open mission tasks");
+    const unknown = missionFixture(); unknown.mission_work!.state = "unknown";
+    expect(text(unknown)).toContain("MISSION QUEUE · unknown");
+    expect(text(unknown)).not.toContain("No open mission tasks");
+    const empty = missionFixture(); empty.mission_work!.items = [];
+    expect(text(empty)).toContain("No open mission tasks in this read");
+    empty.mission_work!.unresolved = [{ qitem_id: "ambiguous", basis: "conflicting slice" }];
+    expect(text(empty)).toContain("binding coverage incomplete");
+    expect(text(empty)).not.toContain("No open mission tasks");
+  });
+  it("counts terminal queue states separately and never promotes outcomes", () => {
+    const execution = missionFixture(); execution.mission_work!.items = [];
+    execution.mission_work!.terminal_counts = { done: 1, "handed-off": 1, failed: 1, denied: 1, canceled: 1 };
+    const lines = executionContentLines(execution, [], [], null, 120);
+    const text = lines.map(line => line.text).join("\n");
+    for (const state of ["done", "handed-off", "failed", "denied", "canceled"]) expect(text).toContain(`1 ${state}`);
+    expect(text).toContain("not outcome proof");
+    expect(text).not.toContain("OUTCOMES COMPLETE");
+    expect(lines.find(line => line.text.includes("NOW"))!.text).not.toContain("mission task");
+  });
+  it("keeps distinct tasks for one owner and supplies an all-tasks drill at narrow width", () => {
+    const execution = missionFixture();
+    const original = execution.mission_work!.items[0]!;
+    execution.mission_work!.items = Array.from({ length: 4 }, (_, i) => ({ ...original, qitem_id: `task-${i}` }));
+    const lines = executionContentLines(execution, [], [], null, 40);
+    expect(lines.map(line => line.text).join("\n")).toContain("1 distinct owner");
+    expect(lines.some(line => line.action?.type === "execution-open" && line.action.key === "mission-work:all")).toBe(true);
+    const detail = executionContentLines(execution, [], [], "mission-work:task-3", 40);
+    expect(detail.every(line => line.text.length <= 40)).toBe(true);
+    expect(detail.map(line => line.text).join("\n")).toContain("task-3");
+  });
+});

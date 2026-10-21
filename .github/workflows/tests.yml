@@ -80,7 +80,8 @@ jobs:
     if: ${{ github.event_name != 'push' }}
     # macOS, the platform OpenRig runs on: several daemon and cli tests read macOS ps columns,
     # file-inode behaviour and release tags.
-    runs-on: macos-latest
+    # Standard public Intel macOS keeps Darwin gates; arm64 qualification remains separate.
+    runs-on: macos-26-intel
     timeout-minutes: 45
     strategy:
       fail-fast: false
