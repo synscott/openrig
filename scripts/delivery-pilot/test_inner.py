@@ -48,6 +48,16 @@ class InnerTests(unittest.TestCase):
     def run_boundary(self, op='ready'):
         return a.boundary(self.b, self.live, op, self.state)
 
+    def test_hash_all_evidence_parse_only_named_role_receipts(self):
+        report = pathlib.Path(self.b['proof_workspace']) / 'review-report.md'
+        report.write_text('# Independent review\nAccepted exact candidate.\n')
+        self.p['items'][-1]['judgment']['evidence'].append(
+            {'ref': report.name, 'sha256': a.digest(report)})
+        self.assertTrue(a.acceptance(self.b, self.live)['accepted'])
+        report.write_text('changed report')
+        with self.assertRaises(a.Rejected):
+            a.acceptance(self.b, self.live)
+
     def test_rejected_repaired_same_selected_task_and_pr(self):
         self.run_boundary('create-draft')
         self.p['state'] = 'not-ready'

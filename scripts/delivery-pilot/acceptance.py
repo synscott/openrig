@@ -162,7 +162,7 @@ def acceptance(b, live):
             path = (root / entry['ref']).resolve()
             require(path.is_relative_to(root), 'evidence outside workspace')
             require(digest(path) == entry['sha256'], 'evidence bytes changed')
-            evidence[entry['ref']] = load(path)
+            evidence[entry['ref']] = path
             require(entry['ref'] not in evidence_items, 'ambiguous evidence ownership')
             actors[entry['ref']] = actor
             evidence_items[entry['ref']] = ident
@@ -173,7 +173,7 @@ def acceptance(b, live):
         require(ref in evidence, 'missing ' + role + ' evidence')
         require(evidence_items[ref] == contract['checks_item' if role == 'checks' else 'review_item'],
                 'receipt bound to wrong proof role')
-        receipt = evidence[ref]
+        receipt = load(evidence[ref])
         for key in ('task_id', 'contract_revision', 'head', 'base', 'merge_base', 'tree'):
             require(receipt[key] == b[key], 'wrong receipt ' + key)
         require(receipt['judge'] == actors[ref], 'receipt actor mismatch')
