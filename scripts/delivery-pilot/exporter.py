@@ -72,7 +72,9 @@ def history_summary(spec):
             'sha256': sha(b'\n'.join(selected)), **counts}
 
 
-def export(task, sources):
+def export(task, sources, contract):
+    if contract.get('task_id') != task:
+        raise ValueError('wrong export contract task')
     identifier(task)
     by_id, attempts, handoffs = {}, [], []
     for source in sources:
@@ -80,8 +82,11 @@ def export(task, sources):
             event = json.loads(line)
             if event['task_id'] != task:
                 raise ValueError('wrong task record')
-            ident = identifier(event['event_id'])
-            identifier(event['attempt_id'])
+            ident = event['event_id']
+            attempt_id = event['attempt_id']
+            if not all(isinstance(value, str) and 0 < len(value) <= 4096
+                       for value in (ident, attempt_id)):
+                raise ValueError('invalid event or attempt identity')
             canonical = json.dumps(event, sort_keys=True)
             if ident in by_id:
                 if by_id[ident] != canonical:
@@ -89,7 +94,7 @@ def export(task, sources):
                 continue
             by_id[ident] = canonical
             if event['kind'] == 'handoff':
-                handoffs.append({'event_id': ident, 'attempt_id': event['attempt_id'],
+                handoffs.append({'event_id': sha(ident.encode()), 'attempt_id': sha(attempt_id.encode()),
                                  'time': timestamp(event.get('time')),
                                  'owner_ref': None, 'coverage_gaps': ['owner-identity-not-exported']})
                 continue
@@ -125,17 +130,31 @@ def export(task, sources):
             timing = {key: timestamp(event.get(key)) for key in ('started_at', 'ended_at')}
             if usage is not None and (not safe_usage or len(safe_usage) != len(usage)):
                 gaps.append('usage-partial')
-            revisions = {k: (identifier(v) if k == 'contract_revision' else code_revision(v))
+            revisions = {k: code_revision(v)
                          for k, v in event.get('revisions', {}).items()
-                         if k in ('head', 'base', 'contract_revision')}
+                         if k in ('head', 'base')}
+            supplied_revision = event.get('revisions', {}).get('contract_revision')
+            if supplied_revision is not None:
+                if supplied_revision == contract['revision']:
+                    revisions['contract_revision'] = contract['revision']
+                else:
+                    gaps.append('contract-revision-outside-fixed-contract')
+            checks = []
+            for check in event.get('checks', []):
+                if check.get('id') not in contract['checks']:
+                    gaps.append('check-outside-fixed-contract')
+                    continue
+                if check.get('outcome') not in {'pass', 'fail', 'skip', 'pending', 'unknown', 'incomplete'}:
+                    gaps.append('unsupported-check-outcome')
+                    continue
+                checks.append({'id': check['id'], 'outcome': check['outcome']})
             if not revisions or any(v is None for v in revisions.values()):
                 gaps.append('revisions')
             if not all(timing.values()):
                 gaps.append('timing')
-            attempts.append({'event_id': ident, 'attempt_id': event['attempt_id'],
+            attempts.append({'event_id': sha(ident.encode()), 'attempt_id': sha(attempt_id.encode()),
                              'outcome': outcome, 'revisions': revisions,
-                             'checks': [{k: identifier(c[k]) for k in ('id', 'outcome') if k in c}
-                                        for c in event.get('checks', [])],
+                             'checks': checks,
                              **timing, 'usage': safe_usage, 'histories': histories,
                              'coverage_gaps': sorted(set(gaps))})
     if len({a['attempt_id'] for a in attempts}) != len(attempts):
@@ -147,11 +166,12 @@ def export(task, sources):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--task', required=True)
+    parser.add_argument('--contract', required=True)
     parser.add_argument('--records', action='append', required=True)
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     try:
-        result = export(args.task, args.records)
+        result = export(args.task, args.records, json.loads(pathlib.Path(args.contract).read_text()))
         target = pathlib.Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix('.tmp')

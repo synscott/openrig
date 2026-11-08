@@ -203,7 +203,7 @@ class PilotTests(unittest.TestCase):
             'usage': 'invalid', 'histories': [None, {'path': None}]}) + '\n' +
             json.dumps({'task_id': 'task-one', 'event_id': 'handoff-one',
             'attempt_id': 'attempt-one', 'kind': 'handoff', 'owner': 'known-person'}) + '\n')
-        result = e.export('task-one', [records])
+        result = e.export('task-one', [records], self.contract)
         self.assertIn('usage-malformed', result['attempts'][0]['coverage_gaps'])
         self.assertIn('history-unavailable', result['attempts'][0]['coverage_gaps'])
         self.assertIsNone(result['handoffs'][0]['owner_ref'])
@@ -240,8 +240,47 @@ class PilotTests(unittest.TestCase):
             record = {'task_id': 'task-one', 'event_id': 'event-one',
                       'attempt_id': 'attempt-one', 'kind': 'attempt', 'outcome': 'failed', **extra}
             records.write_text(json.dumps(record) + '\n')
-            with self.assertRaises(ValueError):
-                e.export('task-one', [records])
+            result = e.export('task-one', [records], self.contract)
+            self.assertNotIn(secret, json.dumps(result))
+            self.assertTrue(result['attempts'][0]['coverage_gaps'])
+
+    def test_export_untrusted_ids_are_opaque_and_contract_fields_are_fixed(self):
+        records = pathlib.Path(self.temp.name) / 'records.jsonl'
+        secrets = ['AKIAABCDEFGHIJKLMNOP', 'xoxb-1234567890-secret',
+                   'glpat-abcdefghijklmnopqrstuvwxyz', 'eyJhbGciOiJIUzI1NiJ9.payload.sig', 'a' * 64]
+        for secret in secrets:
+            record = {'task_id': 'task-one', 'event_id': secret, 'attempt_id': secret,
+                      'kind': 'attempt', 'outcome': 'failed',
+                      'checks': [{'id': 'unit', 'outcome': 'pass'}],
+                      'revisions': {'contract_revision': 'c1'}}
+            handoff = {'task_id': 'task-one', 'event_id': secret + '-handoff',
+                       'attempt_id': secret, 'kind': 'handoff', 'owner': 'private'}
+            records.write_text(json.dumps(record) + '\n' + json.dumps(handoff) + '\n')
+            result = e.export('task-one', [records], self.contract)
+            self.assertNotIn(secret, json.dumps(result))
+            self.assertEqual(result['attempts'][0]['attempt_id'], result['handoffs'][0]['attempt_id'])
+            for field in ('checks', 'revisions'):
+                changed = dict(record)
+                changed[field] = ([{'id': secret, 'outcome': 'pass'}] if field == 'checks'
+                                  else {'contract_revision': secret})
+                records.write_text(json.dumps(changed) + '\n')
+                result = e.export('task-one', [records], self.contract)
+                self.assertNotIn(secret, json.dumps(result))
+                self.assertTrue(result['attempts'][0]['coverage_gaps'])
+
+    def test_old_contract_attempt_retained_with_explicit_gaps(self):
+        records = pathlib.Path(self.temp.name) / 'records.jsonl'
+        records.write_text(json.dumps({'task_id': 'task-one', 'event_id': 'old-event',
+            'attempt_id': 'old-attempt', 'kind': 'attempt', 'outcome': 'failed',
+            'revisions': {'contract_revision': 'old-contract'},
+            'checks': [{'id': 'unrecognized-prior-check', 'outcome': 'fail'}]}) + '\n')
+        result = e.export('task-one', [records], self.contract)
+        attempt = result['attempts'][0]
+        self.assertEqual(attempt['outcome'], 'failed')
+        self.assertNotIn('contract_revision', attempt['revisions'])
+        self.assertEqual(attempt['checks'], [])
+        self.assertIn('contract-revision-outside-fixed-contract', attempt['coverage_gaps'])
+        self.assertIn('check-outside-fixed-contract', attempt['coverage_gaps'])
 
     def test_exporter_independent_sanitized_idempotent_and_failed_attempts(self):
         root = pathlib.Path(self.temp.name)
@@ -254,18 +293,18 @@ class PilotTests(unittest.TestCase):
         records = root / 'attempts.jsonl'
         records.write_text(json.dumps(record) + '\n')
         before = records.read_bytes()
-        result = e.export('task-one', [records, records])
+        result = e.export('task-one', [records, records], self.contract)
         self.assertEqual(len(result['attempts']), 1)
         self.assertEqual(result['attempts'][0]['histories'][0]['workaround_indicators'], 1)
         self.assertNotIn(secret, json.dumps(result))
         self.assertNotIn(str(root), json.dumps(result))
         self.assertEqual(records.read_bytes(), before)
         self.assertIn('usage', result['attempts'][0]['coverage_gaps'])
-        self.assertEqual(e.export('task-one', [records]), result)
+        self.assertEqual(e.export('task-one', [records], self.contract), result)
         record['outcome'] = 'succeeded'
         records.write_text(records.read_text() + json.dumps(record) + '\n')
         with self.assertRaises(ValueError):
-            e.export('task-one', [records])
+            e.export('task-one', [records], self.contract)
 
 
 if __name__ == '__main__':

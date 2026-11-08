@@ -99,7 +99,12 @@ python3 scripts/delivery-pilot/acceptance.py ready --binding /external/binding.j
 
 The exporter reads immutable writer-produced JSONL records. It does not write
 attempt truth, invoke implementation, publish, or emit acceptance. Each record
-has `task_id`, stable `event_id`, `attempt_id`, and `kind`.
+has `task_id`, stable `event_id`, `attempt_id`, and `kind`. Export requires the fixed
+contract. The task must match it. Exported contract revisions must match it, and check
+names must belong to its check list. Unrecognized prior contract revisions or
+check names are omitted with explicit gaps while their terminal attempts remain.
+Raw historical metadata stays local. Check outcomes use a finite enum. Event and attempt identifiers
+are consistently SHA256-hashed, including handoffs; their raw values remain local.
 
 An `attempt` supplies terminal `outcome` from `failed`, `abandoned`, `repaired`,
 `succeeded`, `rejected`, or `infrastructure-failed`; missing terminal outcome is
@@ -120,11 +125,11 @@ Handoff owner identities stay local; exported owner references are null with an
 explicit gap, rather than guessable hashes of names.
 
 ```sh
-python3 scripts/delivery-pilot/exporter.py --task qitem-optin-delivery-pilot-20261108 --records /external/attempts.jsonl --output /external/retrospective.json
+python3 scripts/delivery-pilot/exporter.py --task qitem-optin-delivery-pilot-20261108 --contract /external/fixed-contract.json --records /external/attempts.jsonl --output /external/retrospective.json
 python3 -m unittest discover -s scripts/delivery-pilot -p test_pilot.py -v
 ```
 
 Export retry is independent of ready/publication. Output is a sanitized allowlist;
-metadata identifiers reject token-like patterns and timestamps are validated. Raw histories remain local.
+contract-controlled metadata is allowlisted and timestamps are validated. Raw histories remain local.
 Usage is supplied telemetry, never inferred cost. Scores and improvement proposals
 remain asynchronous and do not alter acceptance rules.
