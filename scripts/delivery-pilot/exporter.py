@@ -73,7 +73,7 @@ def history_summary(spec):
             'sha256': sha(b'\n'.join(selected)), **counts}
 
 
-def export(task, sources, contract):
+def export(task, sources, contract, *, include_purpose=False):
     if contract.get('task_id') != task:
         raise ValueError('wrong export contract task')
     identifier(task)
@@ -182,6 +182,11 @@ def export(task, sources, contract):
                              'native_timing': native,
                              **timing, 'usage': safe_usage, 'histories': histories,
                              'coverage_gaps': sorted(set(gaps))})
+            if include_purpose:
+                expected = isinstance(local, dict) and local.get('expected_mutation_failure') is True
+                attempts[-1]['purpose'] = {
+                    'kind': 'expected-negative-control' if expected else 'unknown',
+                    'basis': 'explicit-producer-marker' if expected else 'not-established'}
     if len({a['attempt_id'] for a in attempts}) != len(attempts):
         raise ValueError('conflicting attempt identity')
     if len({a['attempt_id'] for a in starts}) != len(starts):
@@ -199,9 +204,12 @@ def main():
     parser.add_argument('--contract', required=True)
     parser.add_argument('--records', action='append', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--include-purpose', action='store_true',
+                        help='Project explicit producer negative-control markers; unknown otherwise')
     args = parser.parse_args()
     try:
-        result = export(args.task, args.records, json.loads(pathlib.Path(args.contract).read_text()))
+        result = export(args.task, args.records, json.loads(pathlib.Path(args.contract).read_text()),
+                        include_purpose=args.include_purpose)
         target = pathlib.Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix('.tmp')
