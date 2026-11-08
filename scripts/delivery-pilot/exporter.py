@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Read immutable task records; export sanitized metadata without judging acceptance."""
+import argparse
+import datetime
+import math
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+
+TERMINAL = {'failed', 'abandoned', 'repaired', 'succeeded', 'rejected', 'infrastructure-failed'}
+
+
+def identifier(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', value):
+        raise ValueError('invalid metadata identity')
+    return value
+
+
+def timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return value if parsed.tzinfo is not None else None
+    except ValueError:
+        return None
+
+
+def code_revision(value):
+    return value if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', value) else None
+
+
+def sha(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def history_summary(spec):
+    path = pathlib.Path(spec['path'])
+    start, end = spec['start'], spec['end']
+    if not isinstance(start, int) or not isinstance(end, int) or not (1 <= start <= end and end - start < 10000):
+        raise ValueError('history range unavailable')
+    selected = []
+    with path.open('rb') as stream:
+        for index, line in enumerate(stream, 1):
+            if index > end:
+                break
+            if index >= start:
+                if len(line) > 4 * 1024 * 1024:
+                    raise ValueError('oversize history event')
+                selected.append(line.rstrip(b'\r\n'))
+    if len(selected) != end - start + 1:
+        raise ValueError('history range truncated')
+    counts = {'tool_calls': 0, 'tool_results': 0, 'workaround_indicators': 0}
+    for line in selected:
+        event = json.loads(line)
+        payload = event.get('payload', event)
+        kind = payload.get('type')
+        if kind in ('function_call', 'custom_tool_call'):
+            counts['tool_calls'] += 1
+        if kind in ('function_call_output', 'custom_tool_call_output'):
+            counts['tool_results'] += 1
+        content = event.get('message', {}).get('content', [])
+        if isinstance(content, list):
+            counts['tool_calls'] += sum(c.get('type') == 'tool_use' for c in content if isinstance(c, dict))
+            counts['tool_results'] += sum(c.get('type') == 'tool_result' for c in content if isinstance(c, dict))
+        counts['workaround_indicators'] += int(b'--skip-checks' in line)
+    return {'reference': sha(str(path.resolve()).encode()), 'range': [start, end],
+            'sha256': sha(b'\n'.join(selected)), **counts}
+
+
+def export(task, sources):
+    identifier(task)
+    by_id, attempts, handoffs = {}, [], []
+    for source in sources:
+        for line in pathlib.Path(source).read_text().splitlines():
+            event = json.loads(line)
+            if event['task_id'] != task:
+                raise ValueError('wrong task record')
+            ident = identifier(event['event_id'])
+            identifier(event['attempt_id'])
+            canonical = json.dumps(event, sort_keys=True)
+            if ident in by_id:
+                if by_id[ident] != canonical:
+                    raise ValueError('conflicting event identity')
+                continue
+            by_id[ident] = canonical
+            if event['kind'] == 'handoff':
+                handoffs.append({'event_id': ident, 'attempt_id': event['attempt_id'],
+                                 'time': timestamp(event.get('time')),
+                                 'owner_ref': sha(event['owner'].encode())})
+                continue
+            if event['kind'] != 'attempt':
+                raise ValueError('unsupported event kind')
+            gaps = []
+            outcome = event.get('outcome')
+            if outcome not in TERMINAL:
+                outcome = 'unknown-nonterminal'
+                gaps.append('terminal-outcome')
+            histories = []
+            for spec in event.get('histories', []):
+                try:
+                    histories.append(history_summary(spec))
+                except (OSError, ValueError, KeyError):
+                    gaps.append('history-unavailable')
+            if not histories:
+                gaps.append('native-history')
+            usage = event.get('usage')
+            if usage is None:
+                gaps.append('usage')
+            safe_usage = None if usage is None else {
+                k: v for k, v in usage.items()
+                if k in ('input_tokens', 'output_tokens', 'cached_tokens', 'cost_usd')
+                and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0}
+            timing = {key: timestamp(event.get(key)) for key in ('started_at', 'ended_at')}
+            if usage is not None and (not safe_usage or len(safe_usage) != len(usage)):
+                gaps.append('usage-partial')
+            revisions = {k: (identifier(v) if k == 'contract_revision' else code_revision(v))
+                         for k, v in event.get('revisions', {}).items()
+                         if k in ('head', 'base', 'contract_revision')}
+            if not revisions or any(v is None for v in revisions.values()):
+                gaps.append('revisions')
+            if not all(timing.values()):
+                gaps.append('timing')
+            attempts.append({'event_id': ident, 'attempt_id': event['attempt_id'],
+                             'outcome': outcome, 'revisions': revisions,
+                             'checks': [{k: identifier(c[k]) for k in ('id', 'outcome') if k in c}
+                                        for c in event.get('checks', [])],
+                             **timing, 'usage': safe_usage, 'histories': histories,
+                             'coverage_gaps': sorted(set(gaps))})
+    if len({a['attempt_id'] for a in attempts}) != len(attempts):
+        raise ValueError('conflicting attempt identity')
+    return {'task_id': task, 'attempts': attempts, 'handoffs': handoffs,
+            'acceptance_claim': 'none; exporter does not judge acceptance'}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--task', required=True)
+    parser.add_argument('--records', action='append', required=True)
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
+    try:
+        result = export(args.task, args.records)
+        target = pathlib.Path(args.output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp = target.with_suffix('.tmp')
+        temp.write_text(json.dumps(result, sort_keys=True, indent=2) + '\n')
+        temp.replace(target)
+    except Exception as error:
+        print(type(error).__name__ + ': export failed', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
