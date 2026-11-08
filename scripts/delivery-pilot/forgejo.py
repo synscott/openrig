@@ -48,8 +48,8 @@ class ForgejoLive(Live):
                 'Forgejo transport binding mismatch')
         require(binding.get('base_ref') == 'refactor/discord-messaging-contracts-crate',
                 'selected target mismatch')
-        require(bool(re.fullmatch(r'refactor/[a-z0-9-]+-crate', binding['head_ref'])),
-                'selected source ref invalid')
+        require(binding.get('head_ref') == 'refactor/discord-tool-contracts-crate',
+                'selected source ref mismatch')
         require(binding.get('local_ref') == 'refactor/discord-tool-contracts',
                 'selected local source mapping missing')
         require(binding.get('title') and not re.match(r'(?i)(?:wip|draft)\b', binding['title']),

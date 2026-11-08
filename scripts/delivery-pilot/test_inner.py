@@ -48,6 +48,16 @@ class InnerTests(unittest.TestCase):
     def run_boundary(self, op='ready'):
         return a.boundary(self.b, self.live, op, self.state)
 
+    def test_selected_ref_mapping_is_exact(self):
+        f.ForgejoLive(self.b)
+        for key, value in (
+                ('head_ref', 'refactor/unrelated-fixture-crate'),
+                ('local_ref', 'refactor/unrelated-fixture'),
+                ('base_ref', 'refactor/unrelated-parent-crate')):
+            changed = {**self.b, key: value}
+            with self.subTest(key=key), self.assertRaises(a.Rejected):
+                f.ForgejoLive(changed)
+
     def test_hash_all_evidence_parse_only_named_role_receipts(self):
         report = pathlib.Path(self.b['proof_workspace']) / 'review-report.md'
         report.write_text('# Independent review\nAccepted exact candidate.\n')
