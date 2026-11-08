@@ -11,6 +11,24 @@ import sys
 
 
 class OuterTests(unittest.TestCase):
+    def test_native_result_before_call_rejected_despite_ordered_timestamps(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root)/'native'
+            for native_format in ('codex', 'claude'):
+                with self.subTest(native_format=native_format):
+                    call = {'timestamp': '2026-11-08T19:00:00Z'}
+                    result = {'timestamp': '2026-11-08T19:00:01Z'}
+                    if native_format == 'codex':
+                        call['payload'] = {'type': 'function_call', 'call_id': 'id'}
+                        result['payload'] = {'type': 'function_call_output', 'call_id': 'id'}
+                    else:
+                        call['message'] = {'content': [{'type': 'tool_use', 'id': 'id'}]}
+                        result['message'] = {'content': [{'type': 'tool_result', 'tool_use_id': 'id'}]}
+                    path.write_text('\n'.join(json.dumps(e) for e in (result, call)))
+                    with self.assertRaises(ValueError):
+                        timing.join({'path': str(path), 'start': 1, 'end': 2,
+                                     'call_id': 'id', 'format': native_format})
+
     def test_queue_boundary_with_disposable_subprocess(self):
         with tempfile.TemporaryDirectory() as root:
             root = pathlib.Path(root)

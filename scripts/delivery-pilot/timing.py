@@ -48,6 +48,8 @@ def join(spec):
                 if kind in ('function_call', 'custom_tool_call'):
                     calls.append(stamp)
                 elif kind in ('function_call_output', 'custom_tool_call_output'):
+                    if len(calls) != 1:
+                        raise ValueError('native result precedes call')
                     results.append(stamp)
             else:
                 content = event.get('message', {}).get('content', [])
@@ -57,6 +59,8 @@ def join(spec):
                     if item.get('type') == 'tool_use' and item.get('id') == call:
                         calls.append(stamp)
                     elif item.get('type') == 'tool_result' and item.get('tool_use_id') == call:
+                        if len(calls) != 1:
+                            raise ValueError('native result precedes call')
                         results.append(stamp)
     if len(selected) != end - start + 1 or len(calls) != 1 or len(results) != 1:
         raise ValueError('incomplete or ambiguous native linkage')
