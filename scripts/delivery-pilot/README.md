@@ -82,8 +82,10 @@ slice readiness shape. `configured`, `state`, `issues`, `policy.judges`,
 `policy.revision`, item revisions and retained `judgment` fields are checked.
 Every contract item must be present. The live daemon-attributed actor must be the
 contract-selected judge and differ from the implementer. Check and review judges
-must differ. Whole-file JSON evidence must retain its judgment SHA256. Addressed
-Markdown evidence is deliberately unsupported and fails closed.
+must differ. Every whole-file evidence attachment must retain its judgment SHA256 and item ownership.
+Only the binding-named check and review receipts are parsed as JSON. Supplemental
+Markdown reports are hashed too; changed report bytes invalidate acceptance.
+Addressed section references remain unsupported and fail closed.
 
 `head` is the exact candidate commit H. `base` is the current target branch tip
 B, not a merge base. `merge_base` is Git's separately computed M for B...H review.
@@ -198,3 +200,31 @@ Export retry is independent of ready/publication. Output is a sanitized allowlis
 contract-controlled metadata is allowlisted and timestamps are validated. Raw histories remain local.
 Usage is supplied telemetry, never inferred cost. Scores and improvement proposals
 remain asynchronous and do not alter acceptance rules.
+
+## Prospective outer intake
+
+Writer records may include `attempt-start` before each invocation and a terminal
+`attempt` with the same identity. `recorded_at` is import time, distinct from actual
+`started_at` and `ended_at`. Missing occurrence times remain unknown. A dirty-source
+record keeps its checkout parent and exports no candidate head or tree.
+
+An optional `timing_link` selects a bounded native Codex or Claude history range
+and one call ID. `timing.py` joins actual tool-event timestamps only. These are
+not subprocess start and finish times. Ambiguous or unavailable joins become gaps.
+Raw histories, command arguments and source paths remain local.
+
+After the logical task ends, its owner records a terminal handoff and freezes the
+input record files. `intake.py` exports the sanitized report and creates one
+deterministically identified Research queue item. Its external binding names the
+task, integration, contract, records, output, state, repository and the destination
+`research-lead@ci-research`. Run retries from the same owning endpoint and state.
+
+```sh
+python3 -B scripts/delivery-pilot/intake.py --binding /external/intake.json --terminal-event FINAL_EVENT_ID
+```
+
+The intake persists its intent before the queue effect and reconciles uncertain
+creation by reading the same item back. Unknown reads stay pending; changed inputs
+fail closed. A successful process exit alone does not establish persistence. Retry
+only the intake to recover export or delivery; it never reruns implementation or
+publication and never issues an acceptance claim. Research evaluation is asynchronous.
