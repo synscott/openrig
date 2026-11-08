@@ -8,6 +8,7 @@ import json
 import pathlib
 import re
 import sys
+import timing as native_timing
 
 
 TERMINAL = {'failed', 'abandoned', 'repaired', 'succeeded', 'rejected', 'infrastructure-failed'}
@@ -76,7 +77,7 @@ def export(task, sources, contract):
     if contract.get('task_id') != task:
         raise ValueError('wrong export contract task')
     identifier(task)
-    by_id, attempts, handoffs = {}, [], []
+    by_id, attempts, handoffs, starts = {}, [], [], []
     for source in sources:
         for line in pathlib.Path(source).read_text().splitlines():
             event = json.loads(line)
@@ -93,9 +94,17 @@ def export(task, sources, contract):
                     raise ValueError('conflicting event identity')
                 continue
             by_id[ident] = canonical
+            if event['kind'] == 'attempt-start':
+                starts.append({'event_id': sha(ident.encode()), 'attempt_id': sha(attempt_id.encode()),
+                               'started_at': timestamp(event.get('started_at')),
+                               'recorded_at': timestamp(event.get('recorded_at'))})
+                continue
             if event['kind'] == 'handoff':
                 handoffs.append({'event_id': sha(ident.encode()), 'attempt_id': sha(attempt_id.encode()),
                                  'time': timestamp(event.get('time')),
+                                 'recorded_at': timestamp(event.get('recorded_at')),
+                                 'logical_task_terminal': event.get('logical_task_terminal') is True,
+                                 'outcome': event.get('outcome') if event.get('outcome') in TERMINAL else None,
                                  'owner_ref': None, 'coverage_gaps': ['owner-identity-not-exported']})
                 continue
             if event['kind'] != 'attempt':
@@ -128,12 +137,25 @@ def export(task, sources, contract):
                 if k in ('input_tokens', 'output_tokens', 'cached_tokens', 'cost_usd')
                 and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0}
             timing = {key: timestamp(event.get(key)) for key in ('started_at', 'ended_at')}
+            native = None
+            if event.get('timing_link') is not None:
+                try:
+                    native = native_timing.join(event['timing_link'])
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    gaps.append('native-timing-unavailable')
             if usage is not None and (not safe_usage or len(safe_usage) != len(usage)):
                 gaps.append('usage-partial')
             revisions = {k: code_revision(v)
                          for k, v in event.get('revisions', {}).items()
-                         if k in ('head', 'base')}
+                         if k in ('head', 'base', 'merge_base', 'tree')}
             supplied_revision = event.get('revisions', {}).get('contract_revision')
+            parent_head = None
+            local = event.get('local_only')
+            if isinstance(local, dict) and local.get('dirty') is True:
+                parent_head = revisions.get('head')
+                revisions['head'] = None
+                revisions['tree'] = None
+                gaps.append('dirty-source-unknown-candidate')
             if supplied_revision is not None:
                 if supplied_revision == contract['revision']:
                     revisions['contract_revision'] = contract['revision']
@@ -154,12 +176,20 @@ def export(task, sources, contract):
                 gaps.append('timing')
             attempts.append({'event_id': sha(ident.encode()), 'attempt_id': sha(attempt_id.encode()),
                              'outcome': outcome, 'revisions': revisions,
+                             'checkout_parent': parent_head,
                              'checks': checks,
+                             'recorded_at': timestamp(event.get('recorded_at')),
+                             'native_timing': native,
                              **timing, 'usage': safe_usage, 'histories': histories,
                              'coverage_gaps': sorted(set(gaps))})
     if len({a['attempt_id'] for a in attempts}) != len(attempts):
         raise ValueError('conflicting attempt identity')
+    if len({a['attempt_id'] for a in starts}) != len(starts):
+        raise ValueError('conflicting invocation start')
+    complete = {a['attempt_id'] for a in attempts}
     return {'task_id': task, 'attempts': attempts, 'handoffs': handoffs,
+            'invocation_starts': starts,
+            'incomplete_attempt_refs': [a['attempt_id'] for a in starts if a['attempt_id'] not in complete],
             'acceptance_claim': 'none; exporter does not judge acceptance'}
 
 
