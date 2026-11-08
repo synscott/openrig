@@ -10,6 +10,7 @@ import sys
 import time
 
 import timing
+from exporter import identifier
 
 
 LIMITS = {'scan_bytes': 256 * 1024 * 1024, 'scan_lines': 100000,
@@ -31,7 +32,20 @@ def encoded(value):
     return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + '\n').encode()
 
 
-def extract(index, output_dir, *, limits=None):
+def task_binding(index, *, expected_task=None):
+    if expected_task is not None:
+        identifier(expected_task)
+    task = index.get('task_id')
+    if task is None:
+        return {'task_id': None, 'task_binding': 'unknown'}
+    identifier(task)
+    if expected_task is not None and task != expected_task:
+        raise ValueError('native index task mismatch')
+    return {'task_id': task, 'task_binding': 'explicit-index'}
+
+
+def extract(index, output_dir, *, limits=None, expected_task=None):
+    binding = task_binding(index, expected_task=expected_task)
     bounds = dict(LIMITS)
     for key, value in (limits or {}).items():
         if key not in bounds or type(value) is not int or not 0 < value <= bounds[key]:
@@ -93,8 +107,8 @@ def extract(index, output_dir, *, limits=None):
     # Existing directories are never reused or overwritten. Raw files remain local.
     output.mkdir(mode=0o700)
     source_ref = digest(str(source_path.resolve()).encode())
-    manifest = {'source_reference': source_ref, 'format': index['format'], 'links': []}
-    summary = {'source_reference': source_ref, 'format': index['format'],
+    manifest = {**binding, 'source_reference': source_ref, 'format': index['format'], 'links': []}
+    summary = {**binding, 'source_reference': source_ref, 'format': index['format'],
                'linkage_scope': SCOPE, 'scanned_bytes': scanned,
                'scanned_lines': line_number, 'selected_bytes': written, 'links': [],
                'coverage_gaps': ['inner-process-spans-not-established', 'usage-unattributed']}
@@ -126,6 +140,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--index', required=True)
     parser.add_argument('--output-dir', required=True)
+    parser.add_argument('--task', help='Validate supplied task identity against this expected task; never infer it')
     args = parser.parse_args()
     try:
         descriptor = os.open(args.index, os.O_RDONLY | os.O_NONBLOCK)
@@ -135,7 +150,7 @@ def main():
             raw = stream.read(65537)
         if len(raw) > 65536:
             raise ValueError('oversize native index')
-        summary = extract(json.loads(raw), args.output_dir)
+        summary = extract(json.loads(raw), args.output_dir, expected_task=args.task)
         print(encoded(summary).decode(), end='')
         return 0
     except Exception:
