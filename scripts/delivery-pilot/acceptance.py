@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Opt-in proof-consuming draft/ready boundary. Never merges or deploys."""
 import argparse
+import datetime
 import hashlib
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -98,6 +100,15 @@ def marker(b):
     return '<!-- delivery-task:' + b['task_id'] + ' -->'
 
 
+def repository_authorized(b):
+    if b.get('provider', 'github') == 'github':
+        require(b['repo'] == 'synscott/openrig', 'publisher repository not authorized')
+    else:
+        require(b.get('provider') == 'forgejo' and b['repo'] == 'lacuna/dione'
+                and b['task_id'] == 'qitem-20261108185151-c6251a05',
+                'publisher repository/task not authorized')
+
+
 def refs_valid(b, live):
     for key in ('head', 'base', 'merge_base', 'tree'):
         require(bool(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', b[key])), 'invalid Git identity')
@@ -111,7 +122,7 @@ def refs_valid(b, live):
 
 
 def acceptance(b, live):
-    require(b['repo'] == 'synscott/openrig', 'publisher repository not authorized')
+    repository_authorized(b)
     refs_valid(b, live)
     require(digest(b['contract']) == b['contract_sha256'], 'contract changed')
     contract = load(b['contract'])
@@ -185,7 +196,15 @@ def pr_valid(b, pr):
     require(pr['head']['repo']['full_name'] == b['repo'], 'wrong PR repository')
     require(pr['head']['sha'] == b['head'] and pr['base']['sha'] == b['base'], 'PR refs changed')
     require(marker(b) in (pr.get('body') or ''), 'missing task marker')
-    require(pr['state'] == 'open' and not pr.get('merged_at'), 'PR already closed or merged')
+    require(pr['state'] == 'open' and not pr.get('merged_at') and not pr.get('merged'),
+            'PR already closed or merged')
+    if b.get('provider') == 'forgejo':
+        require(isinstance(pr.get('draft'), bool), 'provider did not expose draft state')
+        require(pr.get('title') == ('WIP: ' if pr['draft'] else '') + b['title'],
+                'provider title/draft mismatch')
+        require(pr['base'].get('repo', {}).get('full_name') == b['repo'],
+                'wrong target repository')
+        require(pr.get('body') == b['body'] + '\n\n' + marker(b), 'PR body changed')
 
 
 def reconcile(b, live):
@@ -207,12 +226,60 @@ def save_state(path, value):
     temp.replace(target)
 
 
+def invocation(b, live, operation, state_path, records_path, attempt_id):
+    """Writer occurrence records; the independent exporter never calls this."""
+    require(bool(re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', attempt_id)), 'invalid attempt ID')
+    path = pathlib.Path(records_path)
+    require(path.resolve() != pathlib.Path(state_path).resolve(), 'records and operation state must differ')
+    root = pathlib.Path(b['repository']).resolve()
+    require(not path.resolve().is_relative_to(root)
+            and not pathlib.Path(state_path).resolve().is_relative_to(root),
+            'operation records/state must stay outside candidate source')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    require(not any(row.get('attempt_id') == attempt_id for row in existing),
+            'attempt already recorded; reconcile state, do not repeat invocation')
+    identity = {key: b[key] for key in ('task_id', 'contract_revision', 'head', 'base',
+                                      'merge_base', 'tree')}
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    def append(kind, **extra):
+        suffix = 'start' if kind == 'attempt-start' else 'terminal'
+        event_id = hashlib.sha256((b['task_id'] + ':' + attempt_id + ':' + suffix).encode()).hexdigest()
+        row = {'task_id': b['task_id'], 'event_id': event_id, 'attempt_id': attempt_id,
+               'kind': kind, 'operation': operation, 'started_at': started,
+               'recorded_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               'revisions': identity, 'checks': [], **extra}
+        with path.open('a') as stream:
+            stream.write(json.dumps(row, sort_keys=True) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    append('attempt-start')
+    try:
+        result = boundary(b, live, operation, state_path)
+    except Exception as error:
+        append('attempt', outcome='rejected' if isinstance(error, Rejected) else 'infrastructure-failed',
+               ended_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+               error_kind=type(error).__name__)
+        raise
+    append('attempt', outcome='succeeded', ended_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+           publication={'provider': b.get('provider', 'github'), 'repo': b['repo'],
+                        **{key: b[key] for key in ('head', 'base', 'merge_base', 'tree')},
+                        **({'number': result['number']} if 'number' in result else {}),
+                        **({'state': 'open'} if result.get('state') in ('draft', 'ready') else {}),
+                        'draft': result.get('state') == 'draft' if 'state' in result else None})
+    return result
+
+
 def boundary(b, live, operation, state_path):
-    require(b['repo'] == 'synscott/openrig', 'publisher repository not authorized')
+    repository_authorized(b)
     refs_valid(b, live)
     if operation == 'check':
         return acceptance(b, live)
     identity = {key: b[key] for key in ('task_id', 'repo', 'head_ref', 'base_ref', 'base')}
+    if b.get('provider') == 'forgejo':
+        identity.update(provider='forgejo', api_base=b['api_base'], git_remote=b['git_remote'])
     previous = load(state_path) if pathlib.Path(state_path).exists() else None
     if previous is not None:
         require(previous.get('operation_identity') == identity, 'publication state identity mismatch')
@@ -267,10 +334,20 @@ def main():
     parser.add_argument('operation', choices=['check', 'create-draft', 'ready'])
     parser.add_argument('--binding', required=True)
     parser.add_argument('--state', required=True)
+    parser.add_argument('--records', help='External append-only writer records, required for selected Forgejo task')
+    parser.add_argument('--attempt-id', help='Fresh stable invocation identity; never reused to rerun effects')
     args = parser.parse_args()
     try:
         b = load(args.binding)
-        print(json.dumps(boundary(b, Live(b), args.operation, args.state)))
+        if b.get('provider') == 'forgejo':
+            from forgejo import ForgejoLive
+            live = ForgejoLive(b)
+            require(args.records and args.attempt_id, 'Forgejo invocation requires writer record identity')
+        else:
+            live = Live(b)
+        result = (invocation(b, live, args.operation, args.state, args.records, args.attempt_id)
+                  if args.records and args.attempt_id else boundary(b, live, args.operation, args.state))
+        print(json.dumps(result))
     except Exception as error:
         print(json.dumps({'accepted': False, 'error': str(error)}), file=sys.stderr)
         return 1

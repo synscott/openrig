@@ -1,5 +1,70 @@
 # Opt-in delivery pilot
 
+## Selected Forgejo episode
+
+The additional `forgejo` adapter is restricted to existing task
+`qitem-20261108185151-c6251a05` in `lacuna/dione`. This is a late prospective
+completion contract: implementation had already started when the task was selected
+at 19:05 UTC on 2026-11-08. It does not retroactively govern earlier work.
+
+Add these fields to the external binding alongside the existing fixed contract,
+daemon policy/item revisions, evidence references and exact H/B/M/tree:
+
+```json
+{
+  "provider": "forgejo",
+  "repo": "lacuna/dione",
+  "api_base": "https://forgejo.svc.echoes/api/v1",
+  "git_remote": "forgejo-echoes:lacuna/dione.git",
+  "local_ref": "refactor/discord-tool-contracts",
+  "head_ref": "refactor/discord-tool-contracts-crate",
+  "base_ref": "refactor/discord-messaging-contracts-crate"
+}
+```
+
+Record this local/remote branch mapping before the existing authorized publisher
+pushes the selected candidate. The local origin is a retained filesystem clone;
+the adapter checks the explicit established SSH remote, not that origin. It does
+not push, merge, dispatch CI, change protections or publish to GitHub. Its protected
+API calls use the existing Windows worker environment privately; no token belongs
+in the binding or evidence. Only the named `acceptance.py` invocation is guarded:
+other clients, direct API calls and source branch pushes remain outside it.
+
+The observed installed Forgejo schema exposes `draft` on reads, but has no
+writable draft field or ready endpoint. Creation uses a `WIP: ` title; ready removes
+that prefix and rollback restores it. Every transition must read back the actual
+boolean draft state and exact title. Unsupported behavior is rejected, not treated
+as readiness. Provider reads also guard authenticated repository/account custody.
+This is a checked title transition, not an atomic server compare-and-swap. A failed
+rollback is unknown and needs reconciliation.
+
+Run this adapter only after independent exact-tooling-head QA and review. Draft
+creation may precede delivery proof acceptance for ordinary CI. Ready consumes the
+same installed daemon judgments as the original pilot; JSON fixtures are not live
+judgments. Required checks and approved skips come from the fixed contract, not
+from the exporter or a successful wrapper exit.
+
+```sh
+python3 -B scripts/delivery-pilot/acceptance.py create-draft --binding /external/binding.json --state /external/publication.json --records /external/attempts.jsonl --attempt-id draft-1
+python3 -B scripts/delivery-pilot/acceptance.py ready --binding /external/binding.json --state /external/publication.json --records /external/attempts.jsonl --attempt-id ready-1
+```
+
+Each selected invocation appends an `attempt-start` before calling the boundary,
+then a terminal `attempt` with the same attempt ID and distinct deterministic event
+IDs. Times describe this actual invocation; `recorded_at` is separate. A start-only
+record remains unknown if execution is interrupted. An already recorded attempt ID
+cannot rerun effects. Reconcile existing operation state using a new invocation
+identity, keeping uncertain-create state and the same PR; the adapter never retries
+an uncertain create POST automatically. Writer records do not assert individual
+check results and do not trigger Research. The owner separately records the final
+logical task handoff for the independent outer intake. Export retry never calls
+this publisher. Records/state stay outside candidate source.
+
+Offline adapter fixtures: `python3 -B -m unittest discover -s scripts/delivery-pilot -p 'test_*.py' -v`.
+They prove deterministic rejection/repair, title/readback, uncertain creation and
+drift recovery in disposable fixtures. They do not prove a live Forgejo transition,
+current daemon readiness, provider health or the selected delivery's acceptance.
+
 These two Python 3.9+ standard-library tools serve task
 `qitem-optin-delivery-pilot-20261108`. They do not register a global gate or change
 OpenRig itself. The parent owns the fixed external contract, binding, proof
