@@ -355,4 +355,6 @@ def main():
 
 
 if __name__ == '__main__':
+    # Forgejo imports this module; keep its exceptions identical in script mode.
+    sys.modules['acceptance'] = sys.modules[__name__]
     sys.exit(main())

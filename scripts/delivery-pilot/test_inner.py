@@ -4,6 +4,7 @@ import json
 import pathlib
 import subprocess
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -47,6 +48,29 @@ class InnerTests(unittest.TestCase):
 
     def run_boundary(self, op='ready'):
         return a.boundary(self.b, self.live, op, self.state)
+
+    def test_script_entry_records_adapter_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            script = root / 'acceptance.py'
+            script.write_text(pathlib.Path(a.__file__).read_text())
+            (root / 'forgejo.py').write_text(
+                'from acceptance import require\n'
+                'class ForgejoLive:\n'
+                '    def __init__(self, binding): pass\n'
+                '    def refs(self): require(False, "fixture adapter rejection")\n')
+            binding = root / 'binding.json'
+            binding.write_text(json.dumps(self.b))
+            records = root / 'attempts.jsonl'
+            result = subprocess.run(
+                [sys.executable, '-B', str(script), 'check', '--binding', str(binding),
+                 '--state', str(root / 'state.json'), '--records', str(records),
+                 '--attempt-id', 'script-rejection'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            rows = [json.loads(line) for line in records.read_text().splitlines()]
+            self.assertEqual([row['kind'] for row in rows], ['attempt-start', 'attempt'])
+            self.assertEqual(rows[-1]['outcome'], 'rejected')
+            self.assertEqual(rows[-1]['error_kind'], 'Rejected')
 
     def test_selected_ref_mapping_is_exact(self):
         f.ForgejoLive(self.b)
