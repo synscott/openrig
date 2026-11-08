@@ -53,6 +53,11 @@ class Live:
                 'merge_base': self.git('merge-base', self.b['head'], self.b['base']),
                 'dirty': bool(self.git('status', '--porcelain'))}
 
+    def actors(self):
+        rows = json.loads(command(['rig', 'ps', '--nodes', '-A', '--json']))
+        return {row['canonicalSessionName'] for row in rows
+                if row.get('runtime') != 'terminal'}
+
     def proof(self):
         return json.loads(command(['rig', 'proof', 'show', self.b['scope'], '--json']))
 
@@ -112,6 +117,9 @@ def acceptance(b, live):
     contract = load(b['contract'])
     require(contract['task_id'] == b['task_id'], 'wrong task')
     require(contract['revision'] == b['contract_revision'], 'wrong contract revision')
+    actors_registered = live.actors()
+    require(contract['implementer'] in actors_registered, 'implementer is not a registered actor')
+    require(set(contract['judges']).issubset(actors_registered), 'judge is not a registered actor')
     proof = live.proof()
     require(proof.get('configured') is True and proof.get('state') == 'ready'
             and not proof.get('issues'), 'proof not ready')
@@ -204,10 +212,17 @@ def boundary(b, live, operation, state_path):
     refs_valid(b, live)
     if operation == 'check':
         return acceptance(b, live)
+    identity = {key: b[key] for key in ('task_id', 'repo', 'head_ref', 'base_ref', 'base')}
+    previous = load(state_path) if pathlib.Path(state_path).exists() else None
+    if previous is not None:
+        require(previous.get('operation_identity') == identity, 'publication state identity mismatch')
     pr = reconcile(b, live)
     if operation == 'create-draft':
         if pr is None:
-            save_state(state_path, {'task_id': b['task_id'], 'state': 'create-unknown'})
+            require(previous is None or previous.get('state') != 'create-unknown',
+                    'create outcome unknown; reconcile-only until existing PR is found')
+            save_state(state_path, {'operation_identity': identity,
+                                    'task_id': b['task_id'], 'state': 'create-unknown'})
             try:
                 live.create()
             except Exception:
@@ -236,11 +251,13 @@ def boundary(b, live, operation, state_path):
                 status = 'rejected-draft'
             except Exception:
                 status = 'unknown-rollback'
-            save_state(state_path, {'task_id': b['task_id'], 'state': status,
+            save_state(state_path, {'operation_identity': identity,
+                                    'task_id': b['task_id'], 'state': status,
                                     'number': pr['number']})
             raise
         result = {'state': 'ready', 'number': current['number'], 'url': current['html_url']}
     result['task_id'] = b['task_id']
+    result['operation_identity'] = identity
     save_state(state_path, result)
     return result
 

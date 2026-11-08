@@ -14,7 +14,8 @@ TERMINAL = {'failed', 'abandoned', 'repaired', 'succeeded', 'rejected', 'infrast
 
 
 def identifier(value):
-    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', value):
+    if (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,160}', value)
+            or re.search(r'(?i)(?:^|[.:_-])(?:sk[-_]|gh[pousr]_|github_pat_|bearer[-_:])', value)):
         raise ValueError('invalid metadata identity')
     return value
 
@@ -90,7 +91,7 @@ def export(task, sources):
             if event['kind'] == 'handoff':
                 handoffs.append({'event_id': ident, 'attempt_id': event['attempt_id'],
                                  'time': timestamp(event.get('time')),
-                                 'owner_ref': sha(event['owner'].encode())})
+                                 'owner_ref': None, 'coverage_gaps': ['owner-identity-not-exported']})
                 continue
             if event['kind'] != 'attempt':
                 raise ValueError('unsupported event kind')
@@ -100,14 +101,21 @@ def export(task, sources):
                 outcome = 'unknown-nonterminal'
                 gaps.append('terminal-outcome')
             histories = []
-            for spec in event.get('histories', []):
+            supplied_histories = event.get('histories', [])
+            if not isinstance(supplied_histories, list):
+                supplied_histories = []
+                gaps.append('history-malformed')
+            for spec in supplied_histories:
                 try:
                     histories.append(history_summary(spec))
-                except (OSError, ValueError, KeyError):
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
                     gaps.append('history-unavailable')
             if not histories:
                 gaps.append('native-history')
             usage = event.get('usage')
+            if usage is not None and not isinstance(usage, dict):
+                usage = None
+                gaps.append('usage-malformed')
             if usage is None:
                 gaps.append('usage')
             safe_usage = None if usage is None else {

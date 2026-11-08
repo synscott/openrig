@@ -33,8 +33,10 @@ GitHub is fixed to `synscott/openrig`, using authenticated `gh api`. Local git
 origin must match that repository. The parent selects title/body and task marker.
 All PR states are read with pagination before creation. Exact branch/base matches
 must have the task marker; closed/merged or duplicate matches block. A timed-out
-create is reconciled before any retry. A found PR is reused. Conclusive absence
-can allow a later retry; failed/ambiguous reads cannot. Operation state belongs
+create is reconciled before any retry. A found PR is reused. After a recorded uncertain create, even a currently empty list remains reconcile-only.
+A delayed matching PR is adopted. The tool never automatically retries that POST.
+Operation state pins task, repository, head branch, target branch and target SHA;
+a mismatched state file fails closed. Failed or ambiguous reads also block. Operation state belongs
 outside source and records unknown outcomes, PR number and URL. One parent owns
 this route at a time; concurrent publishers are unsupported.
 
@@ -81,8 +83,9 @@ Fixed contract shape:
 
 Both receipts contain `task_id`, `contract_revision`, `head`, `base`, `merge_base`,
 `tree` and `judge`. Checks receipt adds `checks` mapping exact required check names
-to `pass`. Review receipt adds `verdict: accept`. The authoritative actor is the
-live proof judgment, not the receipt's asserted name. The corresponding judgment
+to `pass`. Review receipt adds `verdict: accept`. The implementer and selected judges must exist in the live daemon registry
+(`rig ps --nodes -A --json`). Delegates retain their registered owning actor.
+The authoritative actor is the live proof judgment, not the receipt's asserted name. The corresponding judgment
 subject must be exactly `{"kind":"commit","ref":"H"}`. Capture and queue closure
 alone never count as acceptance.
 
@@ -109,10 +112,12 @@ The exporter cannot infer attempts the writer omitted.
 A history range is `{ "path": "/local/native.jsonl", "start": 1, "end": 15 }`.
 Only supplied ranges are read. Native Codex function calls/results and Claude
 message tool-use/results produce counts. Raw prompts, messages, tool arguments,
-results and source paths stay local. Opaque path hashes and range-content hashes
+results and source paths stay local. Opaque history path hashes and range-content hashes
 support local joins. A disposable `--skip-checks` fixture produces a workaround
 indicator, not a conclusion of misconduct. It must never be seeded in live work.
-Missing optional history, usage or timing becomes a coverage gap.
+Missing or malformed optional history, usage or timing becomes a coverage gap.
+Handoff owner identities stay local; exported owner references are null with an
+explicit gap, rather than guessable hashes of names.
 
 ```sh
 python3 scripts/delivery-pilot/exporter.py --task qitem-optin-delivery-pilot-20261108 --records /external/attempts.jsonl --output /external/retrospective.json
@@ -120,6 +125,6 @@ python3 -m unittest discover -s scripts/delivery-pilot -p test_pilot.py -v
 ```
 
 Export retry is independent of ready/publication. Output is a sanitized allowlist;
-metadata identifiers and timestamps are validated. Raw histories remain local.
+metadata identifiers reject token-like patterns and timestamps are validated. Raw histories remain local.
 Usage is supplied telemetry, never inferred cost. Scores and improvement proposals
 remain asynchronous and do not alter acceptance rules.
