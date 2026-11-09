@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 
 const f = vi.hoisted(() => ({ serve: vi.fn(), createDaemon: vi.fn(), fetch: vi.fn(), close: vi.fn(),
-  contextStart: vi.fn(), contextStop: vi.fn(), eventStop: vi.fn(), markStop: vi.fn() }));
+  contextStart: vi.fn(), contextStop: vi.fn(), eventStop: vi.fn(), markStop: vi.fn(), wakeStart: vi.fn() }));
 vi.mock("@hono/node-server", () => ({ serve: f.serve }));
 vi.mock("../src/startup.js", () => ({ createDaemon: f.createDaemon }));
 vi.mock("../src/adapters/bounded-probe-exec.js", async importOriginal => ({
@@ -34,7 +34,7 @@ describe("required Windows control startup completion", () => {
     f.createDaemon.mockResolvedValue({
       app: { fetch: f.fetch }, contextMonitor: { start: f.contextStart, stop: f.contextStop },
       eventLoopMonitor: { stop: f.eventStop }, injectWebSocket: vi.fn(),
-      wakeRecovery: { start: vi.fn(), stop: vi.fn() },
+      wakeRecovery: { start: f.wakeStart, stop: vi.fn() },
       deps: { rigRepo: { db: {} }, settingsStore: { resolveOne: () => ({ value: false }) },
         daemonLifecycleStore: { recordHeartbeat: vi.fn(), recordStop: f.markStop },
         tmuxAdapter: { closeControlClient: vi.fn() } },
@@ -66,10 +66,13 @@ describe("required Windows control startup completion", () => {
     await vi.waitFor(() => expect(f.serve).toHaveBeenCalledTimes(1));
     const response = await f.serve.mock.calls[0]![0].fetch(new Request("http://127.0.0.1:7441/healthz"));
     const completedBeforeControl = complete;
+    const recoveryStartedBeforeControl = f.wakeStart.mock.calls.length;
     control.resolve(closeControl);
     await startup;
     expect(response.status).toBe(503);
     expect(completedBeforeControl).toBe(false);
+    expect(recoveryStartedBeforeControl).toBe(0);
+    expect(f.wakeStart).toHaveBeenCalledTimes(1);
     expect(complete).toBe(true);
     expect(f.fetch).not.toHaveBeenCalled();
     expect((await f.serve.mock.calls[0]![0].fetch(new Request("http://127.0.0.1:7441/healthz"))).status).toBe(200);
@@ -88,6 +91,7 @@ describe("required Windows control startup completion", () => {
     expect(f.contextStop).toHaveBeenCalledTimes(1);
     expect(f.eventStop).toHaveBeenCalledTimes(1);
     expect(f.markStop).not.toHaveBeenCalled();
+    expect(f.wakeStart).not.toHaveBeenCalled();
     expect(f.fetch).not.toHaveBeenCalled();
     const { OPENRIG_HOME } = await import("../src/openrig-compat.js");
     expect(JSON.parse(readFileSync(path.join(OPENRIG_HOME, "daemon-shutdown.json"), "utf8")).outcome).toBe("failed");
