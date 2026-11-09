@@ -6,10 +6,14 @@ import { decodeTime } from "ulid";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { EventBus } from "../src/domain/event-bus.js";
-import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
+import { AgentActivityStore, hookEventState, latestHookWaitsOnPerson } from "../src/domain/agent-activity-store.js";
+import { CLAUDE_ACTIVITY_RUNG_INVENTORY } from "../src/domain/activity-taxonomy.js";
+import { SeatActivityService } from "../src/domain/seat-activity-service.js";
+import { makePromptStateReader } from "../src/domain/queue-wake-ladder.js";
+import { evidenceFromHookActivity } from "../src/routes/activity.js";
 import { SeatAttentionReconciler } from "../src/domain/seat-attention-reconciler.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
-import { getNodeInventory } from "../src/domain/node-inventory.js";
+import { getNodeInventory, seatNeedsAttention } from "../src/domain/node-inventory.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 
 describe("SeatAttentionReconciler", () => {
@@ -85,6 +89,21 @@ describe("SeatAttentionReconciler", () => {
     expect(result.evidence?.state).toBe("idle");
   });
 
+  it.each([
+    { newer: "UserPromptSubmit", older: "StopFailure", ok: true },
+    { newer: "StopFailure", older: "Stop", ok: false },
+  ])("attention clearing uses the newer Claude $newer when $older arrives later", async ({ newer, older, ok }) => {
+    const seat = "worker@r-hook-order";
+    seedAttentionSeat("r-hook-order", seat);
+    const now = Date.now();
+    for (const [index, hookEvent] of [newer, older].entries()) {
+      expect(activityStore.recordHookEvent({ runtime: "claude-code", sessionName: seat, hookEvent,
+        subtype: hookEvent === "StopFailure" ? "rate_limit" : null,
+        occurredAt: new Date(now - (index + 1) * 1000).toISOString() }).ok).toBe(true);
+    }
+    expect(await reconciler.clearAttention(seat)).toMatchObject({ ok, code: ok ? "cleared" : "not_demonstrably_responsive" });
+  });
+
   // needs_input does NOT clear
   it("does NOT clear on needs_input activity", async () => {
     const { rigId, nodeId } = seedAttentionSeat("r3", "worker@r3");
@@ -151,6 +170,94 @@ describe("SeatAttentionReconciler", () => {
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe("not_in_attention");
+  });
+
+  describe("a latest hook that still says the seat waits on a person (a prompt declined or answered with no hook after)", () => {
+    function readySeat(name: string, hookEvent: string, ageMs = 600_000): string {
+      const rig = rigRepo.createRig(name);
+      const node = rigRepo.addNode(rig.id, "worker", { role: "worker", runtime: "claude-code" });
+      const session = sessionRegistry.registerSession(node.id, `worker@${name}`);
+      sessionRegistry.updateStartupStatus(session.id, "ready");
+      activityStore.recordHookEvent({ sessionName: `worker@${name}`, runtime: "claude-code", hookEvent,
+        occurredAt: new Date(Date.now() - ageMs).toISOString() });
+      return `worker@${name}`;
+    }
+
+    it("is an attention class: without --reason it says what to do, not 'not in attention'", async () => {
+      const seat = readySeat("r-hook-1", "PermissionPromptConfirmed");
+      const result = await reconciler.clearAttention(seat);
+      expect(result).toMatchObject({ ok: false, code: "not_demonstrably_responsive" });
+      expect(result.detail).toContain("PermissionPromptConfirmed");
+      expect(result.detail).toContain('rerun with --reason "<what you saw>"');
+    });
+
+    it("with --reason it records the prompt cleared, so the hook no longer reads as a waiting person", async () => {
+      const seat = readySeat("r-hook-2", "PermissionPromptConfirmed");
+      const result = await reconciler.clearAttention(seat, { reason: "declined; composer empty" });
+      expect(result).toMatchObject({ ok: true, code: "cleared", clearedBy: "operator_attestation", clearedClasses: ["needs_input_hook"] });
+      const latest = activityStore.getLatestForNode({ sessionName: seat });
+      expect(latest?.rawEvent).toBe("PermissionPromptCleared");
+      expect(latestHookWaitsOnPerson(latest, "claude-code")).toBe(false);
+      const cleared = db.prepare("SELECT payload FROM events WHERE type = 'seat.attention_cleared' ORDER BY seq DESC LIMIT 1").get() as { payload: string };
+      expect(JSON.parse(cleared.payload)).toMatchObject({ from: "needs_input_hook", clearedBy: "operator_attestation", reason: "declined; composer empty" });
+    });
+
+    it("a ready seat whose latest hook shows work is still not in attention", async () => {
+      const seat = readySeat("r-hook-3", "UserPromptSubmit", 5_000);
+      expect(await reconciler.clearAttention(seat, { reason: "nothing to clear" })).toMatchObject({ ok: false, code: "not_in_attention" });
+    });
+
+    it.each([
+      { newer: "UserPromptSubmit", older: "PermissionPromptConfirmed", code: "not_in_attention" },
+      { newer: "PermissionPromptConfirmed", older: "Stop", code: "not_demonstrably_responsive" },
+    ])("the hook-only attention class keeps $newer over a delayed older $older", async ({ newer, older, code }) => {
+      const seat = readySeat("r-hook-only-order", newer, 1000);
+      expect(activityStore.recordHookEvent({ sessionName: seat, runtime: "claude-code", hookEvent: older,
+        occurredAt: new Date(Date.now() - 2000).toISOString() }).ok).toBe(true);
+      expect(await reconciler.clearAttention(seat)).toMatchObject({ ok: false, code });
+    });
+
+    it("also settles the activity service's pending prompt, so the wake ladder and the inventory agree with the clear", async () => {
+      const rig = rigRepo.createRig("r-hook-4");
+      const node = rigRepo.addNode(rig.id, "worker", { role: "worker", runtime: "claude-code" });
+      const seat = "worker@r-hook-4";
+      sessionRegistry.updateStartupStatus(sessionRegistry.registerSession(node.id, seat).id, "ready");
+      let nowMs = Date.now() - 60_000;
+      let visible: boolean | null = true;
+      const service = new SeatActivityService({
+        tmux: { readPaneLastActivity: async () => null }, defaultWindowSeconds: 3, now: () => new Date(nowMs),
+        permissionPromptReader: async () => visible,
+        // As startup wires it: the poller records what it sees as hooks.
+        permissionPromptChanged: (sessionName, confirmed, runtime) => activityStore.recordHookEvent({ sessionName, runtime,
+          hookEvent: confirmed ? "PermissionPromptConfirmed" : "PermissionPromptCleared", occurredAt: new Date(nowMs).toISOString() }),
+      });
+      service.declareRungInventory({ seatNodeId: node.id, sessionName: seat }, CLAUDE_ACTIVITY_RUNG_INVENTORY);
+      // Claude's permission-prompt hook, and the poller sees the prompt.
+      service.reportEvidence(evidenceFromHookActivity({ seatNodeId: node.id, sessionName: seat, runtime: "claude-code", seq: 1,
+        activity: { state: hookEventState("Notification", "permission_prompt", "claude-code"), reason: "permission_prompt",
+          rawEvent: "Notification", rawSubtype: "permission_prompt", evidenceSource: "runtime_hook",
+          sampledAt: new Date(nowMs).toISOString(), evidence: null } })!);
+      await service.pollSeat(seat);
+      // Declined: the screen after it isn't one the poller recognizes, so the request stays confirmed.
+      visible = null;
+      nowMs += 5_000;
+      await service.pollSeat(seat);
+      expect(service.getSeatState(node.id)!.needsInput.count).toBe(1);
+      const refusedAt = new Date(nowMs).toISOString();
+      const promptState = makePromptStateReader({ db, getSeatState: id => service.getSeatState(id),
+        getLatestHook: sessionName => activityStore.getLatestForNode({ sessionName }) });
+      expect(promptState(seat, refusedAt)).toBe("blocked");
+
+      const withService = new SeatAttentionReconciler({ sessionRegistry, eventBus, agentActivityStore: activityStore,
+        settlePermissionPrompt: sessionName => service.settlePermissionPrompt(sessionName) });
+      expect(await withService.clearAttention(seat, { reason: "declined; composer empty" })).toMatchObject({ ok: true, clearedClasses: ["needs_input_hook"] });
+      expect(service.getSeatState(node.id)!.needsInput.count).toBe(0);
+      expect(promptState(seat, refusedAt)).toBe("clear");
+      // The next poll has no request to re-confirm.
+      nowMs += 5_000;
+      await service.pollSeat(seat);
+      expect(service.getSeatState(node.id)!.needsInput.count).toBe(0);
+    });
   });
 
   it("rebinds a healthy replacement pane and clears the pane-identity attention class", async () => {
@@ -554,18 +661,189 @@ describe("SeatAttentionReconciler", () => {
     expect(payload.nodeId).toBe(nodeId);
   });
 
+  it.each([
+    ["a previous restore attempt", "assisted_startup", true, false],
+    ["another startup failure", "readiness_check", false, false],
+    ["another occupant", "assisted_startup", false, true],
+  ] as const)("doesn't acknowledge full-restore attention from %s as this seat's assisted startup", async (_case, stage, oldAttempt, otherOccupant) => {
+    const { rigId, nodeId, sessionId } = seedAttentionSeat("assisted-control", "worker@assisted-control");
+    sessionRegistry.updateStatus(sessionId, "running");
+    db.prepare("UPDATE nodes SET runtime='synth' WHERE id=?").run(nodeId);
+    sessionRegistry.recordCommunityHarnessSelection(sessionId, "synth");
+    const start = () => eventBus.emit({ type: "restore.started", rigId, snapshotId: "snapshot" });
+    if (!oldAttempt) start();
+    eventBus.emit({ type: "node.startup_failed", rigId, nodeId,
+      sessionId: otherOccupant ? "retired-occupant" : sessionId, stage, error: "Needs attention" });
+    if (oldAttempt) start();
+    eventBus.emit({ type: "restore.completed", rigId, snapshotId: "snapshot", result: {
+      snapshotId: "snapshot", preRestoreSnapshotId: null, rigResult: "partially_restored",
+      nodes: [{ nodeId, logicalId: "worker", status: "attention_required" }], warnings: [],
+    } });
+    const strict = vi.fn(async () => ({ ok: false as const, code: "runtime_unsupported", detail: "Not an assisted startup acknowledgement." }));
+    const checked = new SeatAttentionReconciler({ db, sessionRegistry, eventBus, agentActivityStore: activityStore, reconcileRestoreOutcome: strict });
+    expect(await checked.clearAttention("worker@assisted-control", { reason: "Checked startup" })).toMatchObject({ ok: false });
+    expect(strict).toHaveBeenCalledTimes(1);
+    expect(db.prepare("SELECT startup_status FROM sessions WHERE id=?").get(sessionId)).toEqual({ startup_status: "attention_required" });
+    expect(db.prepare("SELECT seq FROM events WHERE type='restore.outcome_reconciled'").all()).toEqual([]);
+  });
+
   it("OPR.0.5.9.14: refuses derived-class clear without strict evidence even with operator attestation", async () => {
-    seedDerivedAttentionSeat("r-derived-refuse", "worker@r-derived-refuse");
+    const { rigId, nodeId, sessionId } = seedDerivedAttentionSeat("r-derived-refuse", "worker@r-derived-refuse");
+    const before = db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").all();
+    const sendVerify = vi.fn(async () => ({ ok: true }));
+    const capture = vi.fn(async (sessionName: string) => ({ ok: true, sessionName, content: "fixture" }));
     const derivedReconciler = new SeatAttentionReconciler({
-      sessionRegistry, eventBus, agentActivityStore: activityStore, db,
+      sessionRegistry, eventBus, agentActivityStore: activityStore, db, sendVerify, capture,
     });
 
     const result = await derivedReconciler.clearAttention("worker@r-derived-refuse", { reason: "operator verified" });
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe("not_demonstrably_responsive");
+    expect(result.detail).toContain("strict restore reconciler is unavailable");
+    const refusals = db.prepare("SELECT payload FROM events WHERE type = 'seat.attention_clear_refused'").all() as { payload: string }[];
+    expect(refusals).toHaveLength(1);
+    expect(JSON.parse(refusals[0]!.payload)).toEqual({
+      type: "seat.attention_clear_refused", rigId, nodeId, sessionId,
+      sessionName: "worker@r-derived-refuse", attentionClass: "restore_outcome", code: "strict_reconciler_unavailable",
+    });
+    expect(db.prepare("SELECT payload FROM events WHERE type = 'restore.completed'").all()).toEqual(before);
+    expect(db.prepare("SELECT payload FROM events WHERE type = 'seat.attention_cleared'").all()).toHaveLength(0);
+    expect(sendVerify).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
     const events = db.prepare("SELECT payload FROM events WHERE type = 'restore.outcome_reconciled'").all();
     expect(events).toHaveLength(0);
+  });
+
+  // #116 — clear-attention and the projection fence the same restore outcomes.
+  describe("restore outcomes fenced by a ready current-generation fresh launch (#116)", () => {
+    function seedRunningSeat(rigName: string, sessionName: string): { rigId: string; nodeId: string } {
+      const rig = rigRepo.createRig(rigName);
+      const node = rigRepo.addNode(rig.id, "worker", { role: "worker", runtime: "claude-code" });
+      const session = sessionRegistry.registerSession(node.id, sessionName);
+      sessionRegistry.updateStartupStatus(session.id, "ready");
+      sessionRegistry.updateStatus(session.id, "running");
+      return { rigId: rig.id, nodeId: node.id };
+    }
+
+    function launchFreshOccupant(rigId: string, nodeId: string, sessionName: string, status: "ready" | "attention_required" = "ready") {
+      const session = sessionRegistry.registerSession(nodeId, sessionName, "fresh");
+      sessionRegistry.updateStartupStatus(session.id, "ready");
+      sessionRegistry.updateStatus(session.id, "running");
+      eventBus.emit({
+        type: "seat.fresh_launched", rigId, nodeId, logicalId: "worker", sessionName, sessionId: session.id,
+        supersededSessionIds: [], retiringGeneration: null,
+        newGeneration: sessionRegistry.currentOccupantTenure(nodeId)!.generationUuid,
+        nativeSessionId: null, model: null, startupPolicyHash: "test", reason: "fresh occupant", operator: null, status,
+      });
+    }
+
+    function failedRestoreResult(nodeId: string) {
+      return { snapshotId: "snap-1", preRestoreSnapshotId: "snap-0", rigResult: "failed", nodes: [{ nodeId, logicalId: "worker", status: "failed" }], warnings: [] };
+    }
+
+    function refusingStrictReconciler() {
+      const strict = vi.fn(async () => ({ ok: false as const, code: "no_attempt_proof", detail: "test refusal" }));
+      const fenced = new SeatAttentionReconciler({
+        sessionRegistry, eventBus, agentActivityStore: activityStore, db, reconcileRestoreOutcome: strict as any,
+      });
+      return { strict, fenced };
+    }
+
+    function reconciledEvents() {
+      return db.prepare("SELECT payload FROM events WHERE type = 'restore.outcome_reconciled'").all() as { payload: string }[];
+    }
+
+    it("a ready fresh launch after a failed full restore leaves no restore class to clear", async () => {
+      const { rigId, nodeId } = seedDerivedAttentionSeat("r-116-fresh", "worker@r-116-fresh");
+      launchFreshOccupant(rigId, nodeId, "worker@r-116-fresh");
+      const { strict, fenced } = refusingStrictReconciler();
+
+      const result = await fenced.clearAttention("worker@r-116-fresh", { reason: "operator verified" });
+
+      expect(result).toMatchObject({ ok: false, code: "not_in_attention" });
+      expect(strict).not.toHaveBeenCalled();
+      expect(reconciledEvents()).toHaveLength(0);
+      expect(getNodeInventory(db, rigId)[0]).toMatchObject({ restoreOutcome: "n-a", lifecycleState: "running" });
+    });
+
+    it("a fresh launch that needed attention still needs the strict reconciler", async () => {
+      const { rigId, nodeId } = seedDerivedAttentionSeat("r-116-unready", "worker@r-116-unready");
+      launchFreshOccupant(rigId, nodeId, "worker@r-116-unready", "attention_required");
+      const { strict, fenced } = refusingStrictReconciler();
+
+      const result = await fenced.clearAttention("worker@r-116-unready", { reason: "operator verified" });
+
+      expect(result).toMatchObject({ ok: false, code: "not_demonstrably_responsive" });
+      expect(strict).toHaveBeenCalledWith(rigId, nodeId);
+      expect(reconciledEvents()).toHaveLength(0);
+      expect(getNodeInventory(db, rigId)[0]).toMatchObject({ restoreOutcome: "failed", lifecycleState: "attention_required" });
+    });
+
+    it("a restore attempt started after the fresh launch still needs the strict reconciler", async () => {
+      const { rigId, nodeId } = seedRunningSeat("r-116-new-attempt", "worker@r-116-new-attempt");
+      launchFreshOccupant(rigId, nodeId, "worker@r-116-new-attempt");
+      eventBus.emit({ type: "restore.started", rigId, snapshotId: "snap-1" });
+      eventBus.emit({ type: "restore.completed", rigId, snapshotId: "snap-1", result: failedRestoreResult(nodeId) } as any);
+      const { strict, fenced } = refusingStrictReconciler();
+
+      const result = await fenced.clearAttention("worker@r-116-new-attempt");
+
+      expect(result).toMatchObject({ ok: false, code: "not_demonstrably_responsive" });
+      expect(strict).toHaveBeenCalledWith(rigId, nodeId);
+    });
+
+    it("a full restore completing after the fresh launch, for an attempt started before it, is fenced", async () => {
+      const { rigId, nodeId } = seedRunningSeat("r-116-late", "worker@r-116-late");
+      eventBus.emit({ type: "restore.started", rigId, snapshotId: "snap-1" });
+      launchFreshOccupant(rigId, nodeId, "worker@r-116-late");
+      eventBus.emit({ type: "restore.completed", rigId, snapshotId: "snap-1", result: failedRestoreResult(nodeId) } as any);
+      const { strict, fenced } = refusingStrictReconciler();
+
+      const result = await fenced.clearAttention("worker@r-116-late");
+
+      expect(result).toMatchObject({ ok: false, code: "not_in_attention" });
+      expect(strict).not.toHaveBeenCalled();
+      expect(getNodeInventory(db, rigId)[0]).toMatchObject({ restoreOutcome: "n-a", lifecycleState: "running" });
+    });
+
+    // A subset restore records no start, so a completion after the fresh launch
+    // stays current (unresolved) and keeps the subset path.
+    it("a subset completion after the fresh launch keeps the subset path", async () => {
+      const { rigId, nodeId } = seedRunningSeat("r-116-subset", "worker@r-116-subset");
+      launchFreshOccupant(rigId, nodeId, "worker@r-116-subset");
+      eventBus.emit({
+        type: "restore.subset_completed", rigId, snapshotId: "snap-subset",
+        result: { ...failedRestoreResult(nodeId), snapshotId: "snap-subset", nodes: [{ nodeId, logicalId: "worker", status: "attention_required" }] },
+      } as any);
+      emitActivity(rigId, nodeId, "worker@r-116-subset", "running");
+      const { strict, fenced } = refusingStrictReconciler();
+
+      const result = await fenced.clearAttention("worker@r-116-subset");
+
+      expect(result.ok).toBe(true);
+      expect(strict).not.toHaveBeenCalled();
+      expect(result.clearedClasses).toContain("restore_outcome");
+      expect(JSON.parse(reconciledEvents()[0]!.payload)).toMatchObject({ attemptId: 0, from: "attention_required" });
+      // The clear's zero attemptId acknowledges that late subset outcome, as on main.
+      expect(getNodeInventory(db, rigId)[0]).toMatchObject({ restoreOutcome: "operator_recovered" });
+    });
+
+    it("a zero-ID acknowledgment after a full attempt started after the fresh launch still needs strict proof", async () => {
+      const { rigId, nodeId } = seedRunningSeat("r-116-zero-ack", "worker@r-116-zero-ack");
+      launchFreshOccupant(rigId, nodeId, "worker@r-116-zero-ack");
+      eventBus.emit({ type: "restore.started", rigId, snapshotId: "snap-1" });
+      eventBus.emit({ type: "restore.completed", rigId, snapshotId: "snap-1",
+        result: { ...failedRestoreResult(nodeId), nodes: [{ nodeId, logicalId: "worker", status: "attention_required" }] } } as any);
+      eventBus.emit({ type: "restore.outcome_reconciled", rigId, nodeId, attemptId: 0, from: "attention_required", to: "operator_recovered",
+        evidence: { source: "operator_attestation" } });
+      const { strict, fenced } = refusingStrictReconciler();
+
+      const result = await fenced.clearAttention("worker@r-116-zero-ack", { reason: "operator verified" });
+
+      expect(result).toMatchObject({ ok: false, code: "not_demonstrably_responsive" });
+      expect(strict).toHaveBeenCalledWith(rigId, nodeId);
+    });
   });
 
   it("OPR.0.4.0.16: clears both classes when startupStatus + restoreOutcome both in attention", async () => {
@@ -694,5 +972,115 @@ describe("SeatAttentionReconciler", () => {
 
     expect(result.ok).toBe(false);
     expect(result.code).toBe("not_in_attention");
+  });
+
+  // #2622: a full restore that stopped a seat at a prompt (a resume-selection picker) leaves its outcome
+  // attention_required until the strict reconciler proves the resume; nothing ran it but clear-attention.
+  describe("#2622 a restored seat's positive activity runs the strict reconciler once", () => {
+    function seedRestoredAtPrompt(rigName: string, sessionName: string): { rigId: string; nodeId: string } {
+      const rig = rigRepo.createRig(rigName);
+      const node = rigRepo.addNode(rig.id, "worker", { role: "worker", runtime: "claude-code" });
+      const session = sessionRegistry.registerSession(node.id, sessionName);
+      sessionRegistry.updateStartupStatus(session.id, "ready");
+      sessionRegistry.updateStatus(session.id, "running");
+      eventBus.emit({ type: "restore.started", rigId: rig.id, snapshotId: "snap-1" });
+      eventBus.emit({ type: "restore.completed", rigId: rig.id, snapshotId: "snap-1", result: {
+        snapshotId: "snap-1", preRestoreSnapshotId: "snap-0", rigResult: "partially_restored",
+        nodes: [{ nodeId: node.id, logicalId: "worker", status: "attention_required" }], warnings: [],
+      } } as any);
+      return { rigId: rig.id, nodeId: node.id };
+    }
+    const attention = (rigId: string, nodeId: string) => {
+      const entry = getNodeInventory(db, rigId).find((e) => e.nodeId === nodeId)!;
+      return { lifecycleState: entry.lifecycleState, needsAttention: seatNeedsAttention(entry, null) };
+    };
+    const eventCount = () => (db.prepare("SELECT COUNT(*) AS n FROM events").get() as { n: number }).n;
+
+    it("answered and resumed: its first positive activity reconciles the outcome, and the seat stops needing attention", async () => {
+      const { rigId, nodeId } = seedRestoredAtPrompt("r-2622-resumed", "worker@r-2622-resumed");
+      const checked = strictDerivedReconciler();
+      expect(attention(rigId, nodeId)).toEqual({ lifecycleState: "attention_required", needsAttention: true });
+
+      expect(await checked.onSeatActivity("worker@r-2622-resumed", "needs_input")).toBe(false);
+      expect(await checked.onSeatActivity("worker@r-2622-resumed", "running")).toBe(true);
+
+      const reconciled = db.prepare("SELECT payload FROM events WHERE type = 'restore.outcome_reconciled'").all() as { payload: string }[];
+      expect(reconciled).toHaveLength(1);
+      expect(JSON.parse(reconciled[0]!.payload)).toMatchObject({ nodeId, from: "attention_required", to: "operator_recovered" });
+      expect(attention(rigId, nodeId).needsAttention).toBe(false);
+      expect(attention(rigId, nodeId).lifecycleState).not.toBe("attention_required");
+    });
+
+    it("a resumed pane whose lineage doesn't match stays in attention, and the failed check appends no reconciliation and emits no refusal", async () => {
+      const { rigId, nodeId } = seedRestoredAtPrompt("r-2622-other", "worker@r-2622-other");
+      const strict = vi.fn(async () => ({ ok: false as const, code: "resume_token_mismatch", detail: "The pane runs another conversation." }));
+      const checked = new SeatAttentionReconciler({ db, sessionRegistry, eventBus, agentActivityStore: activityStore, reconcileRestoreOutcome: strict });
+      const before = eventCount();
+
+      expect(await checked.onSeatActivity("worker@r-2622-other", "running")).toBe(false);
+
+      expect(strict).toHaveBeenCalledWith(rigId, nodeId);
+      expect(eventCount()).toBe(before);
+      expect(db.prepare("SELECT seq FROM events WHERE type IN ('seat.attention_clear_refused', 'restore.outcome_reconciled')").all()).toEqual([]);
+      expect(attention(rigId, nodeId)).toEqual({ lifecycleState: "attention_required", needsAttention: true });
+    });
+
+    it("runs once per positive transition, and never for a seat without a full-restore outcome", async () => {
+      seedRestoredAtPrompt("r-2622-bounded", "worker@r-2622-bounded");
+      const strict = vi.fn(async () => ({ ok: false as const, code: "pane_not_usable", detail: "Still at the picker." }));
+      const checked = new SeatAttentionReconciler({ db, sessionRegistry, eventBus, agentActivityStore: activityStore, reconcileRestoreOutcome: strict });
+      for (const state of ["running", "running", "needs_input", "unknown", undefined]) await checked.onSeatActivity("worker@r-2622-bounded", state);
+      expect(strict).toHaveBeenCalledTimes(1);
+      await checked.onSeatActivity("worker@r-2622-bounded", "idle");
+      expect(strict).toHaveBeenCalledTimes(2);
+
+      const rig = rigRepo.createRig("r-2622-plain");
+      const node = rigRepo.addNode(rig.id, "worker", { role: "worker", runtime: "claude-code" });
+      const session = sessionRegistry.registerSession(node.id, "worker@r-2622-plain");
+      sessionRegistry.updateStartupStatus(session.id, "ready");
+      sessionRegistry.updateStatus(session.id, "running");
+      expect(await checked.onSeatActivity("worker@r-2622-plain", "running")).toBe(false);
+      expect(strict).toHaveBeenCalledTimes(2);
+    });
+
+    it("a seat that settled before the whole restore completed is checked once at completion, and only in that rig", async () => {
+      const seat = (rigId: string, logicalId: string, sessionName: string) => {
+        const node = rigRepo.addNode(rigId, logicalId, { role: "worker", runtime: "claude-code" });
+        const session = sessionRegistry.registerSession(node.id, sessionName);
+        sessionRegistry.updateStartupStatus(session.id, "ready");
+        sessionRegistry.updateStatus(session.id, "running");
+        return node.id;
+      };
+      const complete = (rigId: string, nodes: Array<{ nodeId: string; logicalId: string }>) => eventBus.emit({
+        type: "restore.completed", rigId, snapshotId: "snap-1", result: {
+          snapshotId: "snap-1", preRestoreSnapshotId: "snap-0", rigResult: "partially_restored",
+          nodes: nodes.map((n) => ({ ...n, status: "attention_required" })), warnings: [],
+        } } as any);
+      const rig = rigRepo.createRig("r-2622-early");
+      const early = seat(rig.id, "early", "early@r-2622-early");
+      const waiting = seat(rig.id, "waiting", "waiting@r-2622-early");
+      const other = rigRepo.createRig("r-2622-elsewhere");
+      const elsewhere = seat(other.id, "worker", "worker@r-2622-elsewhere");
+      eventBus.emit({ type: "restore.started", rigId: rig.id, snapshotId: "snap-1" });
+      eventBus.emit({ type: "restore.started", rigId: other.id, snapshotId: "snap-1" });
+      const checked = strictDerivedReconciler();
+
+      // Answered and settled while the rest of the rig was still restoring: nothing to reconcile yet.
+      expect(await checked.onSeatActivity("early@r-2622-early", "idle")).toBe(false);
+      expect(await checked.onSeatActivity("waiting@r-2622-early", "needs_input")).toBe(false);
+      expect(await checked.onSeatActivity("worker@r-2622-elsewhere", "idle")).toBe(false);
+      complete(rig.id, [{ nodeId: early, logicalId: "early" }, { nodeId: waiting, logicalId: "waiting" }]);
+      complete(other.id, [{ nodeId: elsewhere, logicalId: "worker" }]);
+      expect(attention(rig.id, early).needsAttention).toBe(true);
+
+      expect(await checked.onRestoreCompleted(rig.id)).toBe(1);
+      expect(await checked.onRestoreCompleted(rig.id)).toBe(0);
+
+      const reconciled = db.prepare("SELECT payload FROM events WHERE type = 'restore.outcome_reconciled'").all() as { payload: string }[];
+      expect(reconciled.map((row) => JSON.parse(row.payload).nodeId)).toEqual([early]);
+      expect(attention(rig.id, early).needsAttention).toBe(false);
+      expect(attention(rig.id, waiting).needsAttention).toBe(true);
+      expect(attention(other.id, elsewhere).needsAttention).toBe(true);
+    });
   });
 });

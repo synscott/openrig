@@ -17,6 +17,10 @@ vi.mock("node:fs", async importOriginal => {
 });
 
 describe("Claude kernel inspection permissions", () => {
+  it("asks before an audited member-rule update even with the broad team rig allowance", () => {
+    expect(decide('rig seat set-permissions dev-reader@team --rules rules.json --reason "Change lane"', policy)).toBe("ask");
+  });
+
   // Exercise the actual session hook emitted by the launcher. These are inert
   // hook inputs: no command, network request, provider or rig is executed.
   it.each([
@@ -38,6 +42,25 @@ describe("Claude kernel inspection permissions", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ hookSpecificOutput: {
       hookEventName: "PreToolUse", permissionDecision: "allow",
     } });
+  });
+
+  it.each(["kernel", "team"])("passes only the %s policy name and preserves legacy decisions", kind => {
+    const settings = JSON.parse(operationalLaunchArgs("claude-code", kind === "kernel"
+      ? { kernelAuthority: true } : { teamPermissionDefault: true })[1]);
+    const hook = settings.hooks.PreToolUse[0].hooks[0];
+    expect(hook.command).toBe([process.execPath, asset, kind].map(shellQuote).join(" "));
+    const legacy = Buffer.from(JSON.stringify(kind === "kernel"
+      ? { allow: ["Bash(rig:*)"], ask: [] } : { allow: ["Bash(rig:*)"], ask: ["Bash(rig down:*)"] })).toString("base64");
+    for (const [command, expected] of [["rig down demo", kind === "kernel" ? "allow" : "ask"],
+      ["rig down --help", "allow"], ["unknown-command", undefined]]) {
+      for (const argument of [kind, legacy]) {
+        const result = spawnSync(process.execPath, [asset, argument], {
+          input: JSON.stringify({ tool_name: "Bash", tool_input: { command } }), encoding: "utf8",
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout ? JSON.parse(result.stdout).hookSpecificOutput.permissionDecision : undefined).toBe(expected);
+      }
+    }
   });
 
   it("keeps kernel lifecycle authority distinct from team asks, with no blanket shell grant", () => {
@@ -81,6 +104,36 @@ describe("Claude team command permissions", () => {
     "/private/tmp/project/node_modules/.bin/jest test/unit.test.ts", "python3 -m pytest",
     "rig send worker 'literal rig down text'", "rig send worker 'multiline\nrig down example'",
   ])("allows existing allowance spelling: %s", command => expect(decide(command, policy)).toBe("allow"));
+
+  // Team agents run most rig commands without a prompt; the commands that start, stop or remove teams or agents still
+  // ask, and so do four that change who decides an agent's permissions or context. These lists are written out, not
+  // derived from TEAM_CLAUDE_ASK, so a change to that list is caught here.
+  const STARTS_STOPS_OR_REMOVES = [
+    "up", "down", "start", "launch", "restore", "fork", "bootstrap", "create", "add", "remove", "grow", "shrink", "expand",
+    "destroy", "handover", "env down", "daemon start", "daemon stop", "bundle install", "seat launch", "seat stop", "seat handover",
+    "seat restart",
+  ];
+  const KEPT_FOR_A_PERSON = [
+    "import", // its --instantiate branch launches nodes, and the prefix rule can't tell its modes apart
+    "seat set-permissions", "policy apply", "policy permissions apply", // an explicit permission choice stays with a person
+    "setup", // its --policy option records a permission choice, and the prefix rule can't tell it from ordinary setup
+    "compact", // it replaces a peer's working context
+  ];
+  const ORDINARY = [
+    "archive", "unarchive", "adopt", "attach", "bind", "unclaim", "release", "reconcile-session",
+    "config set", "config reset", "seat continue", "seat clean", "seat switch-client", "seat set-model", "seat set-effort",
+  ];
+  it.each([...STARTS_STOPS_OR_REMOVES, ...KEPT_FOR_A_PERSON])("rig %s asks", command =>
+    expect(decide(`rig ${command} example`, policy)).toBe("ask"));
+  it.each(ORDINARY)("rig %s doesn't start, stop or remove anything: no prompt", command =>
+    expect(decide(`rig ${command} example`, policy)).toBe("allow"));
+  it.each(["--plan", "--verify"])("rig seat restart %s asks too, under the prefix rule; --help does not", flag => {
+    expect(decide(`rig seat restart example@demo ${flag}`, policy)).toBe("ask");
+    expect(decide("rig seat restart --help", policy)).toBe("allow");
+  });
+  it("the ask list is exactly those 29", () => {
+    expect([...TEAM_CLAUDE_ASK].sort()).toEqual([...STARTS_STOPS_OR_REMOVES, ...KEPT_FOR_A_PERSON].map(command => `Bash(rig ${command}:*)`).sort());
+  });
 
   it.each([
     "/opt/tools/rig down example", "'/opt/my tools/rig' down example", "command rig down example",
@@ -144,12 +197,13 @@ describe("Claude team command permissions", () => {
     }
   });
 
-  it("is self-contained under an install path with spaces and quotes", () => {
+  it.each(["kernel", "team", "legacy"])("loads %s policy under an install path with spaces and quotes", kind => {
     const dir = mkdtempSync(join(tmpdir(), "claude-hook 'path "));
     try {
       const copy = join(dir, "hook.cjs"); copyFileSync(asset, copy);
-      const encoded = Buffer.from(JSON.stringify(policy)).toString("base64");
-      const result = spawnSync("/bin/sh", ["-c", [process.execPath, copy, encoded].map(shellQuote).join(" ")], {
+      if (kind !== "legacy") copyFileSync(new URL("../assets/claude-permission-policies.cjs", import.meta.url), join(dir, "claude-permission-policies.cjs"));
+      const argument = kind === "legacy" ? Buffer.from(JSON.stringify({ allow: ["Bash(rig:*)"], ask: ["Bash(rig down:*)"] })).toString("base64") : kind;
+      const result = spawnSync("/bin/sh", ["-c", [process.execPath, copy, argument].map(shellQuote).join(" ")], {
         input: JSON.stringify({ tool_name: "Bash", tool_input: { command: "rig down --help" } }), encoding: "utf8",
       });
       expect(result.status, result.stderr).toBe(0);

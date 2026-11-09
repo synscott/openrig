@@ -1,17 +1,17 @@
 // OPR.0.4.6.PI1 — hermetic unit tests for the pi-runner core: submitted paste
 // boundaries (including delayed multi-line sends), stdin→RPC routing
-// (idle→prompt / streaming→steer / prefix conventions), the event→mirror and
+// (every block a prompt the runtime queues as a steer while busy / prefix conventions), the event→mirror and
 // event→activity mapping, the get_state identity capture + sidecar, the
 // durable catch-up cursor, and honest pi-exit reporting. No live pi.
 
 import { describe, it, expect, vi } from "vitest";
 import { PassThrough } from "node:stream";
 import {
-  createRunnerInput, MAX_PI_INPUT_BYTES, RunnerCore, mapPiEvent, parseRunnerArgs,
-  prepareRunnerSidecar,
+  createRunnerInput, inOrder, MAX_PI_INPUT_BYTES, RunnerCore, mapPiEvent, parseRunnerArgs,
+  prepareRunnerSidecar, startHeartbeatTimer,
   type RunnerIo,
 } from "../src/adapters/pi-runner.js";
-import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
+import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, buildPiRunnerCommand, buildPiChildArgs, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
 
 const SESSION = "devpi-a@some-rig";
 const SESSION_FILE = "/state/pi/devpi-a@some-rig/sessions/2026_0197.jsonl";
@@ -42,6 +42,376 @@ function readyCore(f = fakeIo()) {
   }));
   return { core, ...f };
 }
+
+// ── Activity posts arrive in the runner's own order ─────────────────────────
+
+describe("inOrder", () => {
+  it("starts a post only after the one before it settles, even when the first is slow", async () => {
+    const started: string[] = [];
+    const releases: Array<() => void> = [];
+    const send = inOrder((name: string) => new Promise<string>((resolve) => {
+      started.push(name);
+      releases.push(() => resolve(name));
+    }));
+    const first = send("beat");
+    const second = send("agent_start");
+    await Promise.resolve(); await Promise.resolve();
+    expect(started).toEqual(["beat"]);
+    releases[0]();
+    await first;
+    await Promise.resolve(); await Promise.resolve();
+    expect(started).toEqual(["beat", "agent_start"]);
+    releases[1]();
+    await expect(second).resolves.toBe("agent_start");
+  });
+
+  it("goes on to the next post when one fails", async () => {
+    const send = inOrder(async (n: number) => { if (n === 1) throw new Error("down"); return n; });
+    const failed = send(1);
+    await expect(send(2)).resolves.toBe(2);
+    await expect(failed).rejects.toThrow("down");
+  });
+});
+
+describe("Pi extension UI requests", () => {
+  it.each(["confirm", "select", "input", "editor"])("shows a %s request, cancels it and retains attention until the next turn", method => {
+    const f = readyCore();
+    f.core.handlePiLine(JSON.stringify({ type: "extension_ui_request", id: "probe", method, title: "Probe", message: "Proceed?" }));
+    expect(f.rpc.at(-1)).toEqual({ type: "extension_ui_response", id: "probe", cancelled: true });
+    expect(f.lines.at(-1)).toContain("Probe — Proceed?");
+    expect(f.lines.at(-1)).toMatch(/cancelled.*Operator action required/);
+    expect(f.activity.at(-1)).toMatchObject({ runtime: "pi", hookEvent: "Notification", subtype: "permission_prompt" });
+    f.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    f.core.heartbeat();
+    expect(f.activity.at(-1)).toMatchObject({ hookEvent: "Notification", subtype: "permission_prompt" });
+    f.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    f.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(f.activity.at(-1)).toMatchObject({ runtime: "pi", hookEvent: "Stop" });
+  });
+
+  it("shows notify text without replying or raising attention", () => {
+    const f = readyCore();
+    const before = f.rpc.length;
+    f.core.handlePiLine(JSON.stringify({ type: "extension_ui_request", id: "notice", method: "notify", message: "\u001b[31mprobe notify\u001b[0m\nnext line" }));
+    expect(f.lines.at(-1)).toBe("[pi-runner] probe notify next line");
+    expect(f.rpc).toHaveLength(before);
+    expect(f.activity).not.toContainEqual(expect.objectContaining({ hookEvent: "Notification" }));
+    f.core.heartbeat();
+    expect(f.activity.at(-1)).toMatchObject({ hookEvent: "Stop", subtype: "idle_heartbeat" });
+  });
+});
+
+// ── Idle heartbeat ──────────────────────────────────────────────────────────
+
+describe("idle heartbeat", () => {
+  function clocked(runtime?: "pi" | "omp") {
+    const f = fakeIo();
+    let t = Date.parse("2026-07-06T10:00:00Z");
+    f.io.now = () => new Date(t).toISOString();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-77" }, runtime ? { runtime } : undefined);
+    core.start();
+    const beats = () => f.activity.filter(a => a.subtype === "idle_heartbeat");
+    return { core, f, beats, advance: (ms: number) => { t += ms; } };
+  }
+  const ready = (core: RunnerCore) => core.handlePiLine(JSON.stringify({
+    type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" } }));
+
+  it("says nothing before the runner is ready", () => {
+    const c = clocked();
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+
+  it("posts idle once ready, then at most once per interval", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([expect.objectContaining({ sessionName: SESSION, hookEvent: "Stop", subtype: "idle_heartbeat", runtime: "pi" })]);
+    c.advance(60_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+    c.advance(120_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(2);
+  });
+
+  it("stays quiet mid-turn and resumes after agent_end", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.advance(10 * 60_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(180_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+  });
+
+  // agent_start is not the only way a turn runs, but turn_start DOES open the streaming flag:
+  // a turn opened by turn_start alone gets beats. Compaction and auto-retry report the agent
+  // working without opening a turn, and a beat in those stretches would read idle mid-turn.
+  it.each([
+    ["a compaction", { type: "compaction_start" }],
+    ["an automatic retry", { type: "auto_retry_start" }],
+  ])("stays quiet during %s, and resumes after agent_end", (_name, event) => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify(event));
+    c.advance(10 * 60_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(180_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+  });
+
+  it("counts a Stop the turn posted as a report: the next beat is a full interval after agent_end", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.heartbeat();
+    c.advance(170_000);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(60_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+    c.advance(120_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(2);
+  });
+
+  it("stays quiet after the pi child exits", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiExit(1);
+    c.advance(10 * 60_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+
+  it("every Stop a Pi runner posts says how often it will beat, except its exit report", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(180_000); c.core.heartbeat();
+    const stops = c.f.activity.filter(a => a.hookEvent === "Stop");
+    expect(stops).toHaveLength(2);
+    for (const stop of stops) expect(stop.livenessSeconds).toBe(180);
+    c.core.handlePiExit(1);
+    const exit = c.f.activity.find(a => a.subtype === "pi_exited");
+    expect(exit).toBeDefined();
+    expect(exit).not.toHaveProperty("livenessSeconds");
+    expect(c.f.activity.filter(a => a.hookEvent !== "Stop")).toSatisfy((rest: Record<string, unknown>[]) => rest.every(a => !("livenessSeconds" in a)));
+  });
+
+  it("is a Pi-only behaviour", () => {
+    const c = clocked("omp");
+    ready(c.core);
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+});
+
+// ── Streaming heartbeat: the runner contract's working beat (section 4), `active` / `liveness` ──
+
+describe("streaming heartbeat", () => {
+  function clocked(runtime?: "pi" | "omp") {
+    const f = fakeIo();
+    let t = Date.parse("2026-07-06T10:00:00Z");
+    f.io.now = () => new Date(t).toISOString();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-77" }, runtime ? { runtime } : undefined);
+    core.start();
+    const beats = () => f.activity.filter(a => a.subtype === "liveness");
+    return { core, f, beats, advance: (ms: number) => { t += ms; } };
+  }
+  const ready = (core: RunnerCore) => core.handlePiLine(JSON.stringify({
+    type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" } }));
+
+  // A silent inference leaves no events for the daemon; without a beat, a `running` hook older than
+  // the freshness window decays to `unknown` minutes into the turn it saw start.
+  it("re-asserts working behind a turn that runs silently, at most once per interval", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.advance(10_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([expect.objectContaining({ sessionName: SESSION, hookEvent: "active", subtype: "liveness", runtime: "pi",
+      turnId: "1", livenessSeconds: 30 })]);
+    c.advance(10_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(2);
+  });
+
+  // CodeRabbit 2336 — some turn paths omit agent_start; turn_start alone opens the turn.
+  it("keeps beating on a turn opened by turn_start alone", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "turn_start" }));
+    c.advance(10_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([expect.objectContaining({ subtype: "liveness", turnId: "1" })]);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(10_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1); // closed: idle branch resumes
+  });
+
+  it("stays quiet while real events keep arriving, then spaces the beat behind the newest one", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    for (let i = 0; i < 10; i++) { c.advance(1_000); c.core.handlePiLine(JSON.stringify({ type: "tool_execution_start", toolName: "bash" })); }
+    c.core.heartbeat();
+    expect(c.beats()).toEqual([]); // the newest post (a tool call) is 1s old — well inside the interval
+    c.advance(10_000); c.core.heartbeat();
+    expect(c.beats()).toHaveLength(1);
+  });
+
+  it("stops when agent_end closes the turn, and after the pi child exits", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.advance(20_000);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.advance(20_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handlePiExit(1);
+    c.advance(20_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+
+  it("says nothing before the runner is ready", () => {
+    const c = clocked();
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.advance(20_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+  });
+
+  it("is a Pi-only behaviour", () => {
+    const c = clocked("omp");
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.advance(20_000); c.core.heartbeat();
+    expect(c.beats()).toEqual([]);
+    expect(c.f.activity.filter(a => a.hookEvent === "UserPromptSubmit")).toEqual([]);
+  });
+
+  // A beat counts only for the latest accepted turn (contract section 4). Pi's runs start from the runner's prompts, so
+  // each run that opens posts its accepted turn first; a prompt Pi handles without a run opens none.
+  it("posts one accepted turn per run, before the run's first post, and its beats name that turn", () => {
+    const c = clocked();
+    ready(c.core);
+    const turns = () => c.f.activity.filter(a => a.hookEvent === "UserPromptSubmit");
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handlePiLine(JSON.stringify({ type: "turn_start" })); // the same run's next model call opens no turn
+    expect(turns()).toEqual([expect.objectContaining({ subtype: "accepted", turnId: "1", runtime: "pi" })]);
+    const opened = c.f.activity.findIndex(a => a.hookEvent === "UserPromptSubmit");
+    expect(c.f.activity[opened + 1]).toMatchObject({ hookEvent: "active", subtype: "agent_start" });
+    c.advance(10_000); c.core.heartbeat();
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    c.core.handlePiLine(JSON.stringify({ type: "turn_start" })); // a run opened by turn_start alone
+    c.advance(10_000); c.core.heartbeat();
+    expect(turns().map(a => a.turnId)).toEqual(["1", "2"]);
+    expect(c.beats().map(a => a.turnId)).toEqual(["1", "2"]);
+    const sequences = c.f.activity.map(a => Number(a.sequence)).filter(Number.isFinite);
+    expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+  });
+
+  // Section 4: each prompt the runner submits is accepted with its own number. One submitted while a run is open (a
+  // steer, or a follow-up) is posted as it's sent, and the open run's agent_end ends it.
+  it("posts an accepted turn for each prompt or follow-up submitted while a run is open, and its beats name it", () => {
+    const c = clocked();
+    ready(c.core);
+    const turns = () => c.f.activity.filter(a => a.hookEvent === "UserPromptSubmit").map(a => a.turnId);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    c.core.handleUserBlock("look at b.txt too");
+    expect(turns()).toEqual(["1", "2"]);
+    c.advance(10_000); c.core.heartbeat();
+    c.core.handleUserBlock("/followup then c.txt");
+    c.core.handleUserBlock("/abort");
+    expect(turns()).toEqual(["1", "2", "3"]);
+    c.advance(10_000); c.core.heartbeat();
+    expect(c.beats().map(a => a.turnId)).toEqual(["2", "3"]);
+    const sequences = c.f.activity.map(a => Number(a.sequence)).filter(Number.isFinite);
+    expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+  });
+
+  it("opens no turn for a prompt Pi handles without a run, so the idle beat goes on", () => {
+    const c = clocked();
+    ready(c.core);
+    c.core.handlePiLine(JSON.stringify({ type: "agent_end" })); // idle, with a Stop posted
+    c.core.handleUserBlock("/model some-model");
+    c.advance(180_000); c.core.heartbeat();
+    expect(c.f.activity.filter(a => a.hookEvent === "UserPromptSubmit")).toEqual([]);
+    expect(c.f.activity.at(-1)).toMatchObject({ hookEvent: "Stop", subtype: "idle_heartbeat" });
+  });
+});
+
+// ── The real heartbeat scheduler (CodeRabbit 2336: the first cut's tests called
+// heartbeat() by hand and never drove the interval, hiding that a 15s tick landed the
+// streaming beat at the edge of HOOK_AUTHORITY_WINDOW_MS). Fake timers run the actual
+// startHeartbeatTimer wiring, and io.now follows the faked clock so age checks are real.
+
+describe("heartbeat scheduler cadence", () => {
+  function scheduledCore() {
+    vi.useFakeTimers({ now: Date.parse("2026-07-06T10:00:00Z") });
+    const f = fakeIo();
+    f.io.now = () => new Date().toISOString();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-77" });
+    core.start();
+    core.handlePiLine(JSON.stringify({
+      type: "response", id: "pi-runner-get-state",
+      data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" },
+    }));
+    const timer = startHeartbeatTimer(core, "pi");
+    const beats = () => f.activity.filter(a => a.subtype === "liveness");
+    return { f, core, timer, beats, advance: (ms: number) => vi.advanceTimersByTime(ms) };
+  }
+  const after = (c: ReturnType<typeof scheduledCore>) => { c.timer.stop(); vi.useRealTimers(); };
+
+  it("lands the first streaming beat 5–10s after the turn opens, then every ~5s — inside the 15s authority window", () => {
+    const c = scheduledCore();
+    try {
+      c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+      c.advance(4_000);
+      expect(c.beats()).toEqual([]); // too young
+      c.advance(1_000); // t+5s: the tick fires, the age gate passes
+      expect(c.beats()).toHaveLength(1);
+      c.advance(5_000); // t+10s
+      expect(c.beats()).toHaveLength(2);
+      c.advance(5_000); // t+15s: still inside the authority window per beat
+      expect(c.beats()).toHaveLength(3);
+    } finally { after(c); }
+  });
+
+  it("spaces the beat behind the newest real event, not just behind the turn", () => {
+    const c = scheduledCore();
+    try {
+      c.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+      c.advance(5_000);
+      expect(c.beats()).toHaveLength(1); // 5s after agent_start
+      c.core.handlePiLine(JSON.stringify({ type: "tool_execution_start", toolName: "bash" }));
+      c.advance(4_000);
+      expect(c.beats()).toHaveLength(1); // tool event only 4s old — age gate holds the beat
+      c.advance(1_000); // 5s after the tool event
+      expect(c.beats()).toHaveLength(2);
+    } finally { after(c); }
+  });
+
+  it("the idle beat still keeps its 3-minute interval under the 5s tick", () => {
+    const c = scheduledCore();
+    try {
+      const idles = () => c.f.activity.filter(a => a.subtype === "idle_heartbeat");
+      c.advance(3 * 60_000);
+      const first = idles().length; // 1: the very first tick posts (nothing older than the gate yet)
+      expect(first).toBe(1);
+      c.advance(4_000); // total 184s since open: 179s since the first beat — the age gate holds
+      expect(idles()).toHaveLength(first);
+      c.advance(1_000); // total 185s = 180s after the first beat
+      expect(idles()).toHaveLength(first + 1);
+    } finally { after(c); }
+  });
+
+  it("a non-pi runtime starts no timer", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-77" }, { runtime: "omp" });
+    core.start();
+    const timer = startHeartbeatTimer(core, "omp");
+    timer.stop(); // noop, and nothing threw
+    expect(true).toBe(true);
+  });
+});
 
 // ── Actual Node line editor + framed input ──────────────────────────────────
 
@@ -114,7 +484,7 @@ describe("runner input", () => {
       core.handlePiLine(JSON.stringify({ type: "agent_start" }));
       t.input.write(start + "second" + end + "\r/followup later\r/abort\r");
       expect(rpc.filter(x => ["prompt", "steer", "follow_up", "abort"].includes(String(x.type)))).toEqual([
-        { type: "prompt", message: "first" }, { type: "steer", message: "second" },
+        { type: "prompt", message: "first", streamingBehavior: "steer" }, { type: "prompt", message: "second", streamingBehavior: "steer" },
         { type: "follow_up", message: "later" }, { type: "abort" },
       ]);
     } finally { t.editor.close(); }
@@ -199,25 +569,55 @@ describe("runner input", () => {
 // ── stdin → RPC routing ──────────────────────────────────────────────────────
 
 describe("RunnerCore.handleUserBlock", () => {
-  it("idle → RPC prompt", () => {
-    const { core, rpc } = readyCore();
+  // Every ordinary block is a prompt with streamingBehavior "steer": Pi and OMP queue it as a steer while they are busy
+  // and run it as a prompt when they are idle, so the runtime decides, not the runner's view of the turn.
+  const prompt = (message: string) => ({ type: "prompt", message, streamingBehavior: "steer" });
+
+  it("idle → RPC prompt that the runtime queues as a steer if it turns out to be busy", () => {
+    const { core, rpc, lines } = readyCore();
     core.handleUserBlock("hello pi");
-    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "hello pi" });
+    expect(rpc.at(-1)).toEqual(prompt("hello pi"));
+    expect(lines.at(-1)).toBe("you ▸ hello pi");
   });
 
-  it("streaming → RPC steer (Pi's documented mid-stream delivery)", () => {
-    const { core, rpc } = readyCore();
+  it("streaming → the same prompt, which Pi queues as a steer (its documented mid-stream delivery)", () => {
+    const { core, rpc, lines } = readyCore();
     core.handlePiLine(JSON.stringify({ type: "agent_start" }));
     core.handleUserBlock("change course");
-    expect(rpc.at(-1)).toEqual({ type: "steer", message: "change course" });
+    expect(rpc.at(-1)).toEqual(prompt("change course"));
+    expect(lines.at(-1)).toBe("you (steer) ▸ change course");
   });
 
-  it("back to prompt after agent_end", () => {
-    const { core, rpc } = readyCore();
+  it("back to an ordinary prompt line after agent_end", () => {
+    const { core, rpc, lines } = readyCore();
     core.handlePiLine(JSON.stringify({ type: "agent_start" }));
     core.handlePiLine(JSON.stringify({ type: "agent_end" }));
     core.handleUserBlock("next task");
-    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "next task" });
+    expect(rpc.at(-1)).toEqual(prompt("next task"));
+    expect(lines.at(-1)).toBe("you ▸ next task");
+  });
+
+  it("a block that arrives after a prompt but before agent_start goes as a prompt the busy runtime queues as a steer (#1932)", () => {
+    const { core, rpc } = readyCore();
+    core.handleUserBlock("first startup block");
+    core.handlePiLine(JSON.stringify({ type: "response", command: "prompt", success: true }));
+    core.handleUserBlock("second startup block");
+    expect(rpc.filter(x => ["prompt", "steer"].includes(String(x.type)))).toEqual([
+      prompt("first startup block"), prompt("second startup block"),
+    ]);
+  });
+
+  it("after a local-only command succeeds with no turn, real work still goes as a prompt and runs", () => {
+    // An extension command or an input handler can consume a prompt: Pi answers success and starts no turn.
+    // A steer then would only queue, with no turn to drain it.
+    const { core, rpc } = readyCore();
+    core.handleUserBlock("/local-command");
+    core.handlePiLine(JSON.stringify({ type: "response", command: "prompt", success: true }));
+    core.handleUserBlock("real work");
+    core.handleUserBlock("more work");
+    expect(rpc.filter(x => x.type === "steer")).toEqual([]);
+    expect(rpc.at(-2)).toMatchObject({ type: "prompt", message: "real work" });
+    expect(rpc.at(-1)).toMatchObject({ type: "prompt", message: "more work" });
   });
 
   it("/abort → RPC abort; /followup → RPC follow_up", () => {
@@ -314,6 +714,14 @@ describe("mapPiEvent", () => {
     });
   });
 
+  // Some turn paths omit agent_start; turn_start alone opens the turn, so it must open the
+  // streaming flag too — the beat's only in-flight signal — or that path still goes blind.
+  it("turn_start opens streaming for pi", () => {
+    expect(mapPiEvent({ type: "turn_start" })).toMatchObject({
+      streaming: true, activity: { hookEvent: "active", subtype: "turn_start" },
+    });
+  });
+
   it("pre-0.84 message_update appends only the delta, never the cumulative message", () => {
     const partial = { ...PI_REPLY, content: [{ type: "text", text: "Hello from the" }], stopReason: "pending" };
     const legacy = mapPiEvent({
@@ -335,6 +743,22 @@ describe("mapPiEvent", () => {
   it("compaction and retry map to their honest states", () => {
     expect(mapPiEvent({ type: "compaction_start" }).activity).toEqual({ hookEvent: "active", subtype: "compaction" });
     expect(mapPiEvent({ type: "auto_retry_start" }).activity).toEqual({ hookEvent: "active", subtype: "auto_retry" });
+  });
+
+  // Pi's compaction_end (its docs/rpc.md): `aborted` when it was cancelled, otherwise `errorMessage` when it failed and no
+  // summary was written (#2521). The JSON line carries no `result` then.
+  it("reports a compaction's end the way Pi does: cancelled, failed with Pi's reason, or done", () => {
+    const done = { type: "compaction_end", reason: "threshold", result: { summary: "s", firstKeptEntryId: "e1", tokensBefore: 150000 }, aborted: false, willRetry: false };
+    const failed = { type: "compaction_end", reason: "threshold", aborted: false, willRetry: false,
+      errorMessage: "Auto-compaction failed: Summarization failed: generation hit the token cap and the summary is incomplete" };
+    const cancelled = { type: "compaction_end", reason: "manual", aborted: true, willRetry: false };
+    expect(mapPiEvent(done).mirrorLines).toEqual(["[pi] compaction done"]);
+    expect(mapPiEvent(failed).mirrorLines).toEqual(["[pi] compaction failed: Auto-compaction failed: Summarization failed: generation hit the token cap and the summary is incomplete"]);
+    expect(mapPiEvent(cancelled).mirrorLines).toEqual(["[pi] compaction cancelled"]);
+    expect(mapPiEvent({ ...failed, errorMessage: "Compaction failed: \u001b[31mquota\u001b[0m\nexceeded" }).mirrorLines)
+      .toEqual(["[pi] compaction failed: Compaction failed: quota exceeded"]);
+    // An end that names neither a cancel nor a failure keeps reading done, as before.
+    expect(mapPiEvent({ type: "compaction_end" }, "omp").mirrorLines).toEqual(["[omp] compaction done"]);
   });
 
   it("leaves auto_compaction_* unmapped for Pi so an idle seat never reads as running", () => {
@@ -596,6 +1020,122 @@ describe("parseRunnerArgs", () => {
   it("rejects unknown flags loudly", () => {
     expect(() => parseRunnerArgs([...base, "--approve", "--resume"])).toThrow(/unknown flag/);
   });
+
+  it("accepts --thinking verbatim (Pi warns on a level it does not know)", () => {
+    expect(parseRunnerArgs([...base, "--approve", "--thinking", "high"]).thinking).toBe("high");
+    expect(parseRunnerArgs([...base, "--approve", "--thinking", "bogus"]).thinking).toBe("bogus");
+    expect(parseRunnerArgs([...base, "--approve"]).thinking).toBeUndefined();
+  });
+
+  it("a --thinking VALUE that looks like a control flag is a value, not a flag", () => {
+    const parsed = parseRunnerArgs([...base, "--approve", "--thinking", "--approval-mode"]);
+    expect(parsed.thinking).toBe("--approval-mode");
+    expect(parsed.trust).toBe("approve");
+    const cmdBase = { runnerEntryPath: "/r.js", sessionName: SESSION, stateRoot: "/sr", cwd: "/work", trust: "approve" as const, launchId: "L1", runtime: "pi" as const };
+    const cmd = buildPiRunnerCommand({ ...cmdBase, thinking: "none" });
+    expect(parseRunnerArgs(cmd.split(" ").slice(2).map((w) => w.replace(/^'|'$/g, ""))).thinking).toBe("none");
+  });
+
+  it("still refuses genuinely incompatible trust control flags", () => {
+    expect(() => parseRunnerArgs([...base, "--approve", "--approval-mode", "yolo"])).toThrow(/explicit trust flag is required/);
+    expect(() => parseRunnerArgs([...base, "--runtime", "omp", "--approval-mode", "yolo", "--approve"])).toThrow(/OMP requires --approval-mode/);
+    expect(() => parseRunnerArgs([...base, "--runtime", "omp", "--approve"])).toThrow(/OMP requires --approval-mode/);
+  });
+
+  it("a flag-looking value elsewhere does not count as a Pi trust flag", () => {
+    const parsed = parseRunnerArgs([...base, "--runtime", "omp", "--approval-mode", "yolo", "--model", "--approve"]);
+    expect(parsed.model).toBe("--approve");
+    expect(parsed.trust).toBe("approve");
+  });
+
+  it("parses repeated --launch-wrapper-arg tokens with literal spaces, quotes, leading --, and empty strings", () => {
+    const wrapper = ["/abs/bin/wrapper", "space arg", "quote's", "$UNEXPANDED", "--", "--approve", "--runtime", ""];
+    const argv = [...base, "--no-approve", ...wrapper.flatMap((arg) => ["--launch-wrapper-arg", arg])];
+    const parsed = parseRunnerArgs(argv);
+    expect(parsed.launchWrapper).toEqual(wrapper);
+    expect(parsed.trust).toBe("no-approve");
+  });
+
+  it.each([
+    ["dangling flag without value", [...base, "--no-approve", "--launch-wrapper-arg"], /--launch-wrapper-arg requires a value/],
+    ["OMP runtime with wrapper", [...base, "--runtime", "omp", "--approval-mode", "yolo", "--launch-wrapper-arg", "/bin/sh"], /only supported for the Pi runtime/],
+    ["relative bare wrapper[0]", [...base, "--no-approve", "--launch-wrapper-arg", "bare-wrapper"], /absolute/],
+    ["relative dot wrapper[0]", [...base, "--no-approve", "--launch-wrapper-arg", "./wrapper"], /absolute/],
+    ["empty wrapper[0]", [...base, "--no-approve", "--launch-wrapper-arg", ""], /non-empty/],
+    ["whitespace wrapper[0]", [...base, "--no-approve", "--launch-wrapper-arg", "   "], /non-empty/],
+    ["NUL in wrapper arg", [...base, "--no-approve", "--launch-wrapper-arg", "/bin/sh", "--launch-wrapper-arg", "bad\0arg"], /NUL, CR, or LF/],
+    ["LF in wrapper arg", [...base, "--no-approve", "--launch-wrapper-arg", "/bin/sh", "--launch-wrapper-arg", "bad\narg"], /NUL, CR, or LF/],
+  ])("rejects malformed --launch-wrapper-arg (%s)", (_label, argv, pattern) => {
+    expect(() => parseRunnerArgs(argv)).toThrow(pattern);
+  });
+});
+
+describe("buildPiRunnerCommand launchWrapper", () => {
+  const cmdBase = { runnerEntryPath: "/r.js", sessionName: SESSION, stateRoot: "/sr", cwd: "/work", trust: "no-approve" as const, launchId: "L1" };
+
+  it("keeps unconfigured and empty launchWrapper byte-identical and serializes repeated --launch-wrapper-arg tokens for Pi only", () => {
+    const baseline = buildPiRunnerCommand(cmdBase);
+    expect(buildPiRunnerCommand({ ...cmdBase, launchWrapper: [] })).toBe(baseline);
+    expect(baseline).not.toContain("--launch-wrapper-arg");
+
+    const wrapper = ["/abs/wrapper", "space arg", "quote's", "--", "--flag", ""];
+    const wrappedCmd = buildPiRunnerCommand({ ...cmdBase, launchWrapper: wrapper });
+    expect(wrappedCmd).toBe(
+      `${baseline} --launch-wrapper-arg '/abs/wrapper' --launch-wrapper-arg 'space arg' --launch-wrapper-arg 'quote'"'"'s' --launch-wrapper-arg '--' --launch-wrapper-arg '--flag' --launch-wrapper-arg ''`,
+    );
+
+    const ompBaseline = buildPiRunnerCommand({ ...cmdBase, runtime: "omp" });
+    expect(buildPiRunnerCommand({ ...cmdBase, runtime: "omp", launchWrapper: wrapper })).toBe(ompBaseline);
+  });
+});
+
+describe("--thinking in the runner command and the pi child argv", () => {
+  const cmdBase = { runnerEntryPath: "/r.js", sessionName: SESSION, stateRoot: "/sr", cwd: "/work", trust: "approve" as const, launchId: "L1" };
+  const childBase = { sessionsDir: "/sd", sessionName: SESSION, trust: "approve" as const };
+
+  it("runner command carries --thinking after --model, only when non-blank, never for omp", () => {
+    const cmd = buildPiRunnerCommand({ ...cmdBase, runtime: "pi", model: "zai/glm", thinking: " high " });
+    expect(cmd).toContain("--model 'zai/glm' --thinking 'high'");
+    expect(cmd.indexOf("--thinking")).toBeGreaterThan(cmd.indexOf("--launch-id"));
+    for (const thinking of [undefined, "", "  "]) {
+      expect(buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking })).toBe(buildPiRunnerCommand({ ...cmdBase, runtime: "pi" }));
+    }
+    expect(buildPiRunnerCommand({ ...cmdBase, runtime: "omp", thinking: "high" })).toBe(buildPiRunnerCommand({ ...cmdBase, runtime: "omp" }));
+    expect(buildPiRunnerCommand({ ...cmdBase, runtime: "omp", thinking: "high" })).not.toContain("--thinking");
+  });
+
+  it("only a value of set-effort's shape is sent: Pi's levels and unknown words go through, flag-shaped and spaced values are left out", () => {
+    for (const thinking of ["off", "minimal", "low", "medium", "high", "xhigh", "max", "none"]) {
+      expect(buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking })).toContain(`--thinking '${thinking}'`);
+      expect(buildPiChildArgs({ ...childBase, thinking })).toEqual(expect.arrayContaining(["--thinking", thinking]));
+    }
+    for (const thinking of ["--cwd", "very high", "x".repeat(33)]) {
+      expect(buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking })).toBe(buildPiRunnerCommand({ ...cmdBase, runtime: "pi" }));
+      expect(buildPiChildArgs({ ...childBase, thinking })).not.toContain("--thinking");
+    }
+  });
+
+  it("a suffixed model passes through unchanged next to --thinking", () => {
+    const cmd = buildPiRunnerCommand({ ...cmdBase, runtime: "pi", model: "openrouter/x:high", thinking: "low" });
+    expect(cmd).toContain("--model 'openrouter/x:high' --thinking 'low'");
+    const args = buildPiChildArgs({ ...childBase, runtime: "pi", model: "openrouter/x:high", thinking: "low" });
+    expect(args).toContain("openrouter/x:high");
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 4)).toEqual(["--model", "openrouter/x:high", "--thinking", "low"]);
+  });
+
+  it("child argv: --thinking present with a value, absent when blank, never for omp", () => {
+    expect(buildPiChildArgs({ ...childBase, thinking: "xhigh" })).toEqual(expect.arrayContaining(["--thinking", "xhigh"]));
+    for (const thinking of [undefined, "", " "]) {
+      expect(buildPiChildArgs({ ...childBase, thinking })).not.toContain("--thinking");
+    }
+    expect(buildPiChildArgs({ ...childBase, runtime: "omp", thinking: "high" })).toEqual(buildPiChildArgs({ ...childBase, runtime: "omp" }));
+  });
+
+  it("parseRunnerArgs round-trips the command's --thinking into the child argv", () => {
+    const cmd = buildPiRunnerCommand({ ...cmdBase, runtime: "pi", thinking: "medium" });
+    const parsed = parseRunnerArgs(cmd.split(" ").slice(2).map((w) => w.replace(/^'|'$/g, "")));
+    expect(buildPiChildArgs({ ...childBase, thinking: parsed.thinking })).toEqual(expect.arrayContaining(["--thinking", "medium"]));
+  });
 });
 
 // ── FR-5: prepareRunnerSidecar + cursor seed (guard re-verdict fold) ─────────
@@ -682,6 +1222,43 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
       entries: [{ id: "e2" }, { id: "e3" }],
     }));
     expect(f.sidecars.at(-1)!.lastEntryId).toBe("e3");
+  });
+
+  it("#2117: a catch-up Pi refuses for a saved cursor it doesn't hold is history sync, and the cursor is re-read from history", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" }, { catchUpSince: "ui-old" });
+    core.start();
+    core.handlePiLine(JSON.stringify({
+      type: "response", id: "pi-runner-get-state",
+      data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" },
+    }));
+    core.handlePiLine(JSON.stringify({
+      type: "response", id: "pi-runner-catch-up", command: "get_entries", success: false, error: "Entry not found: ui-old",
+    }));
+    // No runner ERROR line, which the pane-marker readiness fallback would read as a runner error.
+    expect(f.lines.some((line) => line.includes("[pi-runner] ERROR"))).toBe(false);
+    expect(f.lines).toContainEqual(expect.stringContaining("History catch-up didn't run (Entry not found: ui-old)"));
+    expect(f.rpc.at(-1)).toEqual({ type: "get_entries", id: "pi-runner-cursor-refresh" });
+    expect(f.sidecars.at(-1)).toMatchObject({ ready: true, lastEntryId: "ui-old" });
+    core.handlePiLine(JSON.stringify({
+      type: "response", id: "pi-runner-cursor-refresh", success: true, data: { entries: [{ id: "h1" }, { id: "h7" }] },
+    }));
+    expect(f.sidecars.at(-1)).toMatchObject({ ready: true, lastEntryId: "h7" });
+  });
+
+  it("#2117: on Pi, an event's own id never becomes the cursor; an explicit entryId still does", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" }, { catchUpSince: "e5" });
+    core.start();
+    core.handlePiLine(JSON.stringify({ type: "bash_execution_update", id: "rpc-bash-1", delta: "x" }));
+    core.handlePiLine(JSON.stringify({ type: "extension_ui_request", id: "ui-1", method: "setStatus", statusKey: "k", statusText: "t" }));
+    core.handlePiLine(JSON.stringify({
+      type: "response", id: "pi-runner-get-state",
+      data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" },
+    }));
+    expect(f.sidecars.at(-1)!.lastEntryId).toBe("e5");
+    core.handlePiLine(JSON.stringify({ type: "agent_start", entryId: "entry-8" }));
+    expect(f.sidecars.at(-1)!.lastEntryId).toBe("entry-8");
   });
 
   it("an empty/id-less entries response leaves the cursor untouched (never regresses)", () => {

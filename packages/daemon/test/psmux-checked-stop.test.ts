@@ -58,6 +58,19 @@ describe("checked native stop through existing binding", () => {
       expect(f.exec).not.toHaveBeenCalled();
     } finally { f.db.close(); }
   });
+  it("runs the selected stop check before the native effect and reports its phase", async () => {
+    const f = fixture();
+    try {
+      await bind(f);
+      const check = vi.fn(() => { throw new Error("selection changed"); });
+      expect(await f.adapter.killSession("worker@fixture", check)).toMatchObject({ ok: false, stopPhase: "none" });
+      expect(check).toHaveBeenCalledOnce();
+      expect(f.argv.mock.calls.some(([args]) => args.includes("kill-session"))).toBe(false);
+      f.argv.mockClear();
+      expect(await f.adapter.killSession("worker@fixture", () => {})).toMatchObject({ ok: true, stopPhase: "kill_attempted" });
+      expect(f.argv.mock.calls.filter(([args]) => args.includes("kill-session"))).toHaveLength(1);
+    } finally { f.db.close(); }
+  });
   it.each([{ sid: "$8" }, { pid: "12" }, { birth: "12" }, { name: "sibling@fixture" }])(
     "rejects same-name/local%%1 replacement BEFORE first stop observation: %j", async replacement => {
       const f = fixture(); try {

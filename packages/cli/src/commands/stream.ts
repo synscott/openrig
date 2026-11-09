@@ -1,8 +1,11 @@
 import { Command } from "commander";
-import { DaemonClient } from "../client.js";
+import { DaemonClient, DaemonResponseError, DaemonTimeoutError } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
+import { readOpenRigEnv } from "../openrig-compat.js";
+import { shellQuote } from "../cross-host-executor.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+import { streamOutcome } from "./stream-outcome.js";
 
 /**
  * `rig stream` — coordination primitive L1 commands (PL-004 Phase A).
@@ -39,6 +42,21 @@ function printResult(json: boolean, body: unknown, status: number): void {
     console.log(JSON.stringify(body, null, 2));
   }
   if (status >= 400) process.exitCode = status >= 500 ? 2 : 1;
+}
+
+/**
+ * Added to an emit whose reply came too late or unreadable: the item may still have landed, and the
+ * daemon keeps one item per stream item ID, so only a retry with the same ID can't add a second one.
+ */
+function emitRetryGuidance(id: string | undefined, source: string, sentAt: number): string {
+  if (id !== undefined) {
+    return `The item may still land. To retry safely, repeat the same emit with --id ${shellQuote(id)}; the daemon keeps one item per ID. To check first: rig stream show ${shellQuote(id)}.`;
+  }
+  // The daemon records the seat the request came from (its seat env), not --source, when the two differ.
+  const recorded = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME")?.trim() || source;
+  // Five minutes before the send, for a daemon whose clock runs behind this one.
+  const since = new Date(sentAt - 5 * 60_000).toISOString();
+  return `The item may still land, and this emit had no --id, so emitting again can add a second item. Check first: rig stream list --source ${shellQuote(recorded)} --since ${since}. Pass a stable --id on emits so a later retry is safe.`;
 }
 
 function isWatchedStreamItem(value: unknown): value is WatchedStreamItem {
@@ -103,7 +121,7 @@ export function streamCommand(depsOverride?: StreamDeps): Command {
     .description("Append a stream item")
     .requiredOption("--source <session>", "Source session (e.g. dev-build@starter)")
     .requiredOption("--body <text>", "Stream item body")
-    .option("--hint-destination <session>", "Hint at intended destination seat")
+    .option("--hint-destination <session>", "Hint at intended destination seat (the queue worker routes by this hint)")
     .option("--hint-type <type>", "Hint type (e.g. review, handoff, idea)")
     .option("--hint-urgency <urgency>", "Hint urgency (routine, urgent, critical)")
     .option("--hint-tags <tags>", "Comma-separated hint tags")
@@ -111,6 +129,11 @@ export function streamCommand(depsOverride?: StreamDeps): Command {
     .option("--interrupt", "Mark item as interrupting")
     .option("--id <streamItemId>", "Idempotent stream_item_id (skip if not provided)")
     .option("--json", "JSON output for agents")
+    .addHelpText("after", `
+Stream intake is on by default: the seat named by stream.intake (queue.worker unless set)
+gets an intake row for each item, which wakes it, or a note on its intake row still pending.
+--hint-urgency critical or --interrupt makes that row urgent. The reply names only the stream item.
+To keep emits passive: rig config set stream.intake off`)
     .action(async (opts: {
       source: string;
       body: string;
@@ -126,6 +149,7 @@ export function streamCommand(depsOverride?: StreamDeps): Command {
       const deps = getDeps();
       const tags = opts.hintTags ? opts.hintTags.split(",").map((s) => s.trim()).filter(Boolean) : null;
       await withClient(deps, async (client) => {
+        const sentAt = Date.now();
         const res = await client.post<Record<string, unknown>>("/api/stream/emit", {
           streamItemId: opts.id,
           sourceSession: opts.source,
@@ -136,6 +160,12 @@ export function streamCommand(depsOverride?: StreamDeps): Command {
           hintUrgency: opts.hintUrgency ?? null,
           hintTags: tags,
           interrupt: opts.interrupt ?? false,
+        }).catch((error: unknown): never => {
+          // The shared renderer reads both as an UNKNOWN outcome; name the retry that can't duplicate.
+          if (error instanceof DaemonTimeoutError || error instanceof DaemonResponseError) {
+            error.message += ` ${emitRetryGuidance(opts.id, opts.source, sentAt)}`;
+          }
+          throw error;
         });
         printResult(opts.json ?? false, res.data, res.status);
       });
@@ -211,13 +241,16 @@ export function streamCommand(depsOverride?: StreamDeps): Command {
 
   cmd
     .command("show <streamItemId>")
-    .description("Fetch one stream item by id")
+    .description("Fetch one stream item by id, with what became of it (routing, linked work and its state)")
     .option("--json", "JSON output for agents")
     .action(async (streamItemId: string, opts: { json?: boolean }) => {
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/stream/${encodeURIComponent(streamItemId)}`);
-        printResult(opts.json ?? false, res.data, res.status);
+        if (res.status >= 400 || !res.data || typeof res.data !== "object") { printResult(opts.json ?? false, res.data, res.status); return; }
+        const outcome = await streamOutcome(client, streamItemId)
+          .catch((error: unknown) => ({ stage: "unavailable", summary: error instanceof Error ? error.message : "routing records unavailable" }));
+        printResult(opts.json ?? false, { ...(res.data as Record<string, unknown>), outcome }, res.status);
       });
     });
 
@@ -229,6 +262,88 @@ export function streamCommand(depsOverride?: StreamDeps): Command {
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/stream/${encodeURIComponent(streamItemId)}/archive`, {});
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  // Slice 22 outcome 9: hub readers. Naming the reader is enough; its filter defaults to items addressed to it or tagged
+  // with its session, seat name or logical id.
+  cmd
+    .command("subscribe <readerSession>")
+    .description("Subscribe a reader seat to stream items addressed to it or matching its topics (hint tags)")
+    .option("--tags <tags>", "Comma-separated hint tags to match (any of); default: the reader's own ids")
+    .option("--type <hintType>", "Match only this hint type")
+    .option("--actor <session>", "Who sets this up, when not run from a managed seat")
+    .option("--json", "JSON output for agents")
+    .action(async (readerSession: string, opts: { tags?: string; type?: string; actor?: string; json?: boolean }) => {
+      const hintTags = opts.tags ? opts.tags.split(",").map((s) => s.trim()).filter(Boolean) : [];
+      await withClient(getDeps(), async (client) => {
+        const res = await client.post<unknown>("/api/stream/subscriptions", { readerSession, hintTags, hintType: opts.type ?? null,
+          ...(opts.actor ? { actor: opts.actor } : {}) });
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  cmd
+    .command("unsubscribe <readerSession>")
+    .description("Remove a reader seat's stream subscription")
+    .option("--json", "JSON output for agents")
+    .action(async (readerSession: string, opts: { json?: boolean }) => {
+      await withClient(getDeps(), async (client) => {
+        const res = await client.delete<unknown>(`/api/stream/subscriptions/${encodeURIComponent(readerSession)}`);
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  cmd
+    .command("subscriptions")
+    .description("List stream subscriptions, each with its unread count and size")
+    .option("--json", "JSON output for agents")
+    .action(async (opts: { json?: boolean }) => {
+      await withClient(getDeps(), async (client) => {
+        const res = await client.get<unknown>("/api/stream/subscriptions");
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  cmd
+    .command("read")
+    .description("Read the next page of your subscription (at most 20 items, 2,000-character excerpts) and advance your cursor")
+    .option("--limit <n>", "Items in this page (at most 20)")
+    .option("--reader <session>", "The reader, when not run from a managed seat")
+    .option("--json", "JSON output for agents")
+    .action(async (opts: { limit?: string; reader?: string; json?: boolean }) => {
+      const limit = opts.limit === undefined ? undefined : Number(opts.limit);
+      if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+        console.error("--limit must be a positive integer");
+        process.exitCode = 1;
+        return;
+      }
+      await withClient(getDeps(), async (client) => {
+        const res = await client.post<unknown>("/api/stream/read", { ...(limit ? { limit } : {}), ...(opts.reader ? { reader: opts.reader } : {}) });
+        printResult(opts.json ?? false, res.data, res.status);
+      });
+    });
+
+  cmd
+    .command("act <streamItemId>")
+    .description("Record what you did about a stream item: link the work you opened or joined, decline with a reason, or mark it a duplicate")
+    .option("--work <qitemId>", "The queue row you opened or joined for it")
+    .option("--decline <reason>", "Decline it, with your reason (yours only; others may still act)")
+    .option("--duplicate <id>", "The queue row or stream item it repeats")
+    .option("--reader <session>", "The reader, when not run from a managed seat")
+    .option("--json", "JSON output for agents")
+    .action(async (streamItemId: string, opts: { work?: string; decline?: string; duplicate?: string; reader?: string; json?: boolean }) => {
+      const chosen = [opts.work && "work", opts.decline && "decline", opts.duplicate && "duplicate"].filter(Boolean);
+      if (chosen.length !== 1) {
+        console.error("Give exactly one of --work, --decline or --duplicate");
+        process.exitCode = 1;
+        return;
+      }
+      const body = opts.work ? { action: "act", workQitemId: opts.work } : opts.decline ? { action: "decline", reason: opts.decline }
+        : { action: "duplicate", duplicateOf: opts.duplicate };
+      await withClient(getDeps(), async (client) => {
+        const res = await client.post<unknown>(`/api/stream/${encodeURIComponent(streamItemId)}/act`, { ...body, ...(opts.reader ? { reader: opts.reader } : {}) });
         printResult(opts.json ?? false, res.data, res.status);
       });
     });

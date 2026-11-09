@@ -11,26 +11,31 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-const defaultTmuxExec: TmuxExecFn = (cmd: string) => execSync(cmd, { encoding: "utf-8" }).trim();
+const defaultTmuxExec: TmuxExecFn = (cmd: string) => execSync(cmd, { encoding: "utf-8" }).replace(/\r?\n$/, "");
+
+// tmux writes a control character in its output as "_", so a newline between fields can't separate them, and a
+// session name may hold spaces or underscores. Ask for the two fixed-shape ids first; the rest of the line is the name.
+const TMUX_CONTEXT_FORMAT = "#{pane_id} #{window_id} #{session_name}";
+const TMUX_CONTEXT_LINE = /^(%\d+) (@\d+) (.+)$/;
 
 export function resolveAttachContext(tmuxExec: TmuxExecFn = defaultTmuxExec):
   | { attachmentType: "external_cli" }
-  | { attachmentType: "tmux"; tmuxSession: string; tmuxWindow?: string; tmuxPane: string } {
+  | { attachmentType: "tmux"; tmuxSession: string; tmuxWindow?: string; tmuxPane: string; tmuxSocketPath?: string } {
   const tmuxPane = process.env["TMUX_PANE"];
   if (!tmuxPane) {
     return { attachmentType: "external_cli" };
   }
 
   try {
-    const output = tmuxExec(`tmux display-message -p -t ${JSON.stringify(tmuxPane)} "#{session_name}\n#{window_id}\n#{pane_id}"`);
-    const [tmuxSession, tmuxWindow, resolvedPane] = output.split("\n").map((part) => part.trim());
-    if (tmuxSession && resolvedPane) {
-      return {
-        attachmentType: "tmux",
-        tmuxSession,
-        tmuxWindow: tmuxWindow || undefined,
-        tmuxPane: resolvedPane,
-      };
+    const output = tmuxExec(`tmux display-message -p -t ${shellQuote(tmuxPane)} ${shellQuote(TMUX_CONTEXT_FORMAT)}`);
+    const match = TMUX_CONTEXT_LINE.exec(output.trim());
+    if (match) {
+      const [, resolvedPane, tmuxWindow, tmuxSession] = match;
+      // Read the socket separately: tmux replaces control-character delimiters,
+      // and session names and socket paths may both contain literal spaces.
+      const tmuxSocketPath = tmuxExec(`tmux display-message -p -t ${shellQuote(resolvedPane!)} '#{socket_path}'`).replace(/\r?\n$/, "");
+      return { attachmentType: "tmux", tmuxSession: tmuxSession!, tmuxWindow, tmuxPane: resolvedPane!,
+        ...(tmuxSocketPath ? { tmuxSocketPath } : {}) };
     }
   } catch {
     // Fall back to external_cli if tmux metadata cannot be resolved.
@@ -57,9 +62,9 @@ export function attachCommand(depsOverride?: StatusDeps): Command {
     .option("--member <name>", "Member name for pod attach mode")
     .option("--runtime <runtime>", "Runtime for pod attach mode; optional guard for node mode")
     .option("--cwd <path>", "Working directory to record", process.cwd())
-    .option("--display-name <name>", "External session/display name to record")
+    .option("--display-name <name>", "Display label inside tmux; external session address outside tmux (new bare names gain @rig)")
     .option("--print-env", "Print shell exports for OPENRIG_NODE_ID and OPENRIG_SESSION_NAME")
-    .option("--json", "JSON output")
+    .option("--json", "JSON output, including the activity env the attached app needs. Its token is a credential: don't print or paste it, and use rig whoami for identity")
     .action(async (opts: {
       self?: boolean;
       rig: string;
@@ -119,9 +124,9 @@ export function attachCommand(depsOverride?: StatusDeps): Command {
         body["tmuxSession"] = attachContext.tmuxSession;
         if (attachContext.tmuxWindow) body["tmuxWindow"] = attachContext.tmuxWindow;
         body["tmuxPane"] = attachContext.tmuxPane;
-      } else if (opts.displayName) {
-        body["displayName"] = opts.displayName;
+        if (attachContext.tmuxSocketPath) body["tmuxSocketPath"] = attachContext.tmuxSocketPath;
       }
+      if (opts.displayName) body["displayName"] = opts.displayName;
 
       if (hasNode) {
         body["logicalId"] = opts.node;
@@ -160,7 +165,9 @@ export function attachCommand(depsOverride?: StatusDeps): Command {
       } else {
         console.log(`Created node ${logicalId} and attached this shell in rig ${opts.rig}`);
       }
-      console.log(`Session:    ${sessionName}`);
+      console.log(`Sender:     ${sessionName}`);
+      const physicalSession = res.data["sessionName"];
+      if (typeof physicalSession === "string" && physicalSession !== sessionName) console.log(`Tmux:       ${physicalSession}`);
       console.log(`Transport:  ${
         res.data["attachmentType"] === "tmux"
           ? "tmux"

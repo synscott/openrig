@@ -47,6 +47,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
   let upBodies: Array<Record<string, unknown>> = [];
   let nodesReads = 0;
   let routes: Record<string, (req: http.IncomingMessage, body: Record<string, unknown>) => Record<string, unknown>>;
+  let launches: Array<{ seat: string; body: Record<string, unknown> }> = [];
 
   beforeAll(async () => {
     server = http.createServer((req, res) => {
@@ -112,6 +113,16 @@ describe("rig start (OPR.0.3.4.1)", () => {
           res.end(JSON.stringify(httpStatus ? cleanData : data));
           return;
         }
+        const launchMatch = method === "POST" && url.match(/^\/api\/seat\/launch\/(.+)$/);
+        if (launchMatch) {
+          launches.push({ seat: decodeURIComponent(launchMatch[1]!), body });
+          const data = routes["/api/seat/launch/:seat"]?.(req, body) ?? { ok: true };
+          const httpStatus = (data as Record<string, unknown>)._httpStatus as number | undefined;
+          const { _httpStatus: _, ...cleanData } = data as Record<string, unknown>;
+          res.writeHead(httpStatus ?? 200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(cleanData));
+          return;
+        }
         res.writeHead(404).end();
       });
     });
@@ -123,6 +134,7 @@ describe("rig start (OPR.0.3.4.1)", () => {
 
   beforeEach(() => {
     upBodies = [];
+    launches = [];
     nodesReads = 0;
     routes = {};
   });
@@ -530,6 +542,61 @@ describe("rig start (OPR.0.3.4.1)", () => {
     expect(output).toContain("awaiting-decision");
     const applyBodies = upBodies.filter((b) => b.plan !== true);
     expect(applyBodies.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("#1332 each seat left awaiting a decision gets a one-seat command for exactly that seat, dotted legacy ids included", async () => {
+    setupCandidateRig("legacy-rig");
+    const plan = routes["/api/rigs/:id/up"]!;
+    // A partial restore: a sibling runs, so `rig up --existing ... --fresh` would be refused for these seats.
+    routes["/api/rigs/:id/up"] = (req, body) => body.plan === true ? plan(req, body) : {
+      status: "restored", rigId: "rig-1", rigName: "legacy-rig", rigResult: "partially_restored",
+      nodes: [
+        { logicalId: "orch.lead", status: "resumed" },
+        { logicalId: "dev.ops.impl", status: "awaiting-decision" },
+        { logicalId: "dev.ops-impl", status: "awaiting-decision" },
+      ],
+      warnings: [],
+    };
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "start", "--last"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain(`dev.ops.impl: awaiting-decision -- to fresh-prime: rig seat launch dev.ops.impl@legacy-rig --fresh --reason "fresh-prime after restore"`);
+    expect(output).toContain(`dev.ops-impl: awaiting-decision -- to fresh-prime: rig seat launch dev.ops-impl@legacy-rig --fresh --reason "fresh-prime after restore"`);
+    expect(output).not.toContain("rig up --existing");
+  });
+
+  it("#1332 answering y after a partial restore starts that one seat fresh, not a second whole-rig restore", async () => {
+    setupCandidateRig("legacy-rig");
+    const plan = routes["/api/rigs/:id/up"]!;
+    routes["/api/rigs/:id/up"] = (req, body) => body.plan === true ? plan(req, body) : {
+      status: "restored", rigId: "rig-1", rigName: "legacy-rig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "orch.lead", status: "resumed" }, { logicalId: "dev.ops.impl", status: "awaiting-decision", error: "no token available" }],
+      warnings: [],
+    };
+    routes["/api/seat/launch/:seat"] = () => ({ ok: true, sessionName: "dev-ops.impl@legacy-rig" });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd(vi.fn(async () => true)).parseAsync(["node", "rig", "start", "--last"]);
+    });
+    expect(launches).toEqual([{ seat: "dev.ops.impl@legacy-rig", body: { fresh: true, reason: "fresh-prime after restore" } }]);
+    expect(upBodies.filter((b) => b.plan !== true && Array.isArray(b.freshLogicalIds))).toEqual([]);
+    expect(logs.join("\n")).toContain("dev.ops.impl: fresh-primed (dev-ops.impl@legacy-rig)");
+  });
+
+  it("with --json, a refused one-seat launch after y still reaches stderr", async () => {
+    setupCandidateRig("legacy-rig");
+    const plan = routes["/api/rigs/:id/up"]!;
+    routes["/api/rigs/:id/up"] = (req, body) => body.plan === true ? plan(req, body) : {
+      status: "restored", rigId: "rig-1", rigName: "legacy-rig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "orch.lead", status: "resumed" }, { logicalId: "dev.ops.impl", status: "awaiting-decision", error: "no token available" }],
+      warnings: [],
+    };
+    routes["/api/seat/launch/:seat"] = () => ({ _httpStatus: 409, ok: false, code: "seat_live", message: "The seat's pane is still running." });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd(vi.fn(async () => true)).parseAsync(["node", "rig", "start", "--last", "--json"]);
+    });
+    expect(launches).toHaveLength(1);
+    expect(logs.join("\n")).toContain("dev.ops.impl: not started -- The seat's pane is still running.");
   });
 
   // ---- KERNEL INVARIANT ----
@@ -950,6 +1017,10 @@ describe("rig start (OPR.0.3.4.1)", () => {
 // never crosses into the spawned daemon env.
 describe("S20 — start auto-start: routing env never becomes bind intent", () => {
   it("env-sourced OPENRIG_HOST through rig start creates NO bind intent (no OPENRIG_BIND_HOST, routing scrubbed)", async () => {
+    const { default: net } = await import("node:net");
+    const { EventEmitter } = await import("node:events");
+    const socket = Object.assign(new EventEmitter(), { setTimeout: vi.fn(), destroy: vi.fn(), connect() { queueMicrotask(() => socket.emit("error", Object.assign(new Error("refused"), { code: "ECONNREFUSED" }))); } });
+    const socketSpy = vi.spyOn(net, "Socket").mockImplementation(() => socket as unknown as import("node:net").Socket);
     const savedHost = process.env["OPENRIG_HOST"];
     process.env["OPENRIG_HOST"] = "100.64.55.66"; // the distinct-value discriminator
     let spawnedEnv: Record<string, string> = {};
@@ -990,6 +1061,7 @@ describe("S20 — start auto-start: routing env never becomes bind intent", () =
       expect(spawnedEnv["OPENRIG_BIND_HOST"]).toBeUndefined(); // no intent minted from routing env
       expect(spawnedEnv["OPENRIG_HOST"]).toBeUndefined();      // and the routing var never crosses
     } finally {
+      socketSpy.mockRestore();
       if (savedHost === undefined) delete process.env["OPENRIG_HOST"];
       else process.env["OPENRIG_HOST"] = savedHost;
     }

@@ -4,6 +4,7 @@ import {
   CLAUDE_ACTIVITY_RUNG_INVENTORY,
   CODEX_ACTIVITY_RUNG_INVENTORY,
   TMUX_GENERIC_RUNG_INVENTORY,
+  PI_ACTIVITY_RUNG_INVENTORY,
   runtimeRungInventory,
 } from "../src/domain/activity-taxonomy.js";
 import { readClaudeSelfReportEvidence, type ClaudeSelfReportRead } from "../src/adapters/claude-code-adapter.js";
@@ -34,7 +35,8 @@ describe("S19 A5 — per-harness rung inventories (one data source)", () => {
   it("runtime resolution: claude/codex map to their inventories; anything else gets the generic floor", () => {
     expect(runtimeRungInventory("claude-code")).toBe(CLAUDE_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory("codex")).toBe(CODEX_ACTIVITY_RUNG_INVENTORY);
-    expect(runtimeRungInventory("pi")).toBe(TMUX_GENERIC_RUNG_INVENTORY);
+    expect(runtimeRungInventory("pi")).toBe(PI_ACTIVITY_RUNG_INVENTORY);
+    expect(runtimeRungInventory("terminal")).toBe(TMUX_GENERIC_RUNG_INVENTORY);
     expect(runtimeRungInventory(null)).toBe(TMUX_GENERIC_RUNG_INVENTORY);
   });
 });
@@ -62,6 +64,12 @@ describe("S19 A5 — readClaudeSelfReportEvidence: the pid.json rung, undocument
   it("idle and shell both → idle-at-prompt (turn over; a background shell is not a working turn)", () => {
     expect(readClaudeSelfReportEvidence(input(readOf({ "1.json": record({ status: "idle" }) })))!.activity).toBe("idle-at-prompt");
     expect(readClaudeSelfReportEvidence(input(readOf({ "1.json": record({ status: "shell" }) })))!.activity).toBe("idle-at-prompt");
+  });
+
+  it("shell keeps its own fact, backgroundWork, and idle carries none (#2661)", () => {
+    expect(readClaudeSelfReportEvidence(input(readOf({ "1.json": record({ status: "shell" }) })))!.backgroundWork).toBe(true);
+    expect(readClaudeSelfReportEvidence(input(readOf({ "1.json": record({ status: "idle" }) })))!.backgroundWork).toBeUndefined();
+    expect(readClaudeSelfReportEvidence(input(readOf({ "1.json": record({ status: "busy" }) })))!.backgroundWork).toBeUndefined();
   });
 
   it("waiting → needs-input count+reason (Claude's dialog state — kept OUT of the activity enum)", () => {

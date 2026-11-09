@@ -42,6 +42,25 @@ def configured_root(key, env_key):
     return Path(value).expanduser().resolve() if value else None
 
 
+def extra_work_roots(cli_roots):
+    """Roots beyond workspace.root that the work trace may ascend to: a catalogued project
+    can live outside workspace.root (#2693). Refocus-only, unlike OPENRIG_WORKSPACE_ROOT,
+    which the CLI config store also reads as workspace.root."""
+    values = list(cli_roots or [])
+    values += [part for part in (os.environ.get("OPENRIG_REFOCUS_WORK_ROOT") or "").split(os.pathsep) if part]
+    return [Path(value).expanduser().resolve() for value in values]
+
+
+def work_root_for(start, root, extra_roots):
+    """The deepest known root that contains start; workspace.root when none does, so a node
+    outside every known root still reports the same gap."""
+    if start is None or not extra_roots:
+        return root
+    start = Path(start).expanduser().resolve()
+    containing = [candidate for candidate in (root, *extra_roots) if under_root(start, candidate)]
+    return max(containing, key=lambda candidate: len(candidate.parts)) if containing else root
+
+
 def under_root(path, root):
     try:
         path.relative_to(root)
@@ -75,39 +94,19 @@ def read(path):
         return None
 
 
+# Contract twin of CLI scope-fs.ts and daemon scope/node-file.ts; parity is tested.
+NOTES_FILE_PRECEDENCE = ("NOTES.md", "MISSION_NOTES.md")
+
+
 def resolve_notes(node):
-    try:
-        result = subprocess.run(
-            ["rig", "scope", "resolve-notes", str(node), "--json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return None, "resolver command timed out"
-    except OSError as error:
-        return None, f"resolver command could not start: {error}"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip().splitlines()
-        suffix = f": {detail[0]}" if detail else ""
-        return None, f"resolver command exited {result.returncode}{suffix}"
-    try:
-        payload = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None, "resolver command returned malformed JSON"
-    if not isinstance(payload, dict) or payload.get("ok") is not True or "resolution" not in payload:
-        return None, "resolver command returned an invalid success shape"
-    resolution = payload["resolution"]
-    if resolution is None:
-        return None, None
-    if not isinstance(resolution, dict):
-        return None, "resolver command returned an invalid resolution shape"
-    resolved_path = resolution.get("path")
-    resolved_name = resolution.get("name")
-    if not isinstance(resolved_path, str) or not isinstance(resolved_name, str):
-        return None, "resolver command returned an invalid resolution shape"
-    return (Path(resolved_path), resolved_name), None
+    for name in NOTES_FILE_PRECEDENCE:
+        candidate = node / name
+        try:
+            if candidate.is_file() and os.access(candidate, os.R_OK):
+                return (candidate, name), None
+        except OSError:
+            pass
+    return None, None
 
 
 def intent(text):
@@ -157,6 +156,27 @@ DUTY_HEADINGS = ("my job here", "standing duties")
 NOTES_STATE_HEADINGS = ("current state",)
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 DEFAULT_NOTES_MAX_AGE_DAYS = 14
+# Each packet field is bounded on its own; there is no total cap. A row's summary and continuation are one line each,
+# the held and next lists show their newest rows with the full count, and a matched section's body is cut at a line.
+FIELD_CHARS = 160
+HELD_SHOWN = 20
+NEXT_SHOWN = 10
+SECTION_CHARS = 1500
+
+
+def one_line(text):
+    """(text as one line, cut to FIELD_CHARS, whether it was shortened)."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= FIELD_CHARS:
+        return flat, flat != str(text).strip()
+    return flat[:FIELD_CHARS - 1].rstrip() + "…", True
+
+
+def bounded_section(body):
+    if len(body) <= SECTION_CHARS:
+        return body
+    boundary = body.rfind("\n", 0, SECTION_CHARS)
+    return body[:boundary if boundary > 0 else SECTION_CHARS].rstrip() + "\n[… use --depth full for the rest]"
 
 
 def heading_sections(text, wanted):
@@ -180,7 +200,7 @@ def heading_sections(text, wanted):
 
 def by_section(text, wanted, path):
     found = heading_sections(text, wanted)
-    shown = "\n\n".join(f"{title}\n{body}" if body else title for title, body in found)
+    shown = "\n\n".join(f"{title}\n{bounded_section(body)}" if body else title for title, body in found)
     missing = [phrase for phrase in wanted if not any(title.lower().startswith(phrase) for title, _ in found)]
     if not missing:
         return shown
@@ -335,33 +355,56 @@ def candidate_line(candidate):
     return line
 
 
+def row_fields(row, *fields):
+    """Each named field as one bounded line, and a pointer to the whole row when any was shortened."""
+    values, cut = [], False
+    for field, missing in fields:
+        value, shortened = one_line(row.get(field) or missing)
+        values.append(value)
+        cut = cut or shortened
+    pointer = f" — full row: rig queue show {row['qitemId']}" if cut and row.get("qitemId") else ""
+    return values, pointer
+
+
+def cut_notice(name, state, rows, shown, daemon_cut):
+    """The list's notice when it was cut here or by the daemon: how many are shown, of how many."""
+    if not daemon_cut and len(rows) <= shown:
+        return None
+    total = f"more than {len(rows)}" if daemon_cut else str(len(rows))
+    return (f"(the {name} list was cut: {min(len(rows), shown)} of {total} shown; "
+            f"`rig queue list --owned --state {state}` has the rest)")
+
+
 def render_held_and_next(evidence):
     output = []
+    per_list = "heldTruncated" in evidence or "nextTruncated" in evidence
     held = evidence.get("held") or []
     if held:
         output.append("HELD WORK (blocked; this is not next):")
-        for row in held:
-            output.append(f"- {row.get('qitemId') or 'a row'} — {row.get('summary') or 'no summary'} — "
-                          f"blocked on {row.get('blockedOn') or 'unknown'} — "
-                          f"continuation: {row.get('continuation') or 'none recorded'}")
+        for row in held[:HELD_SHOWN]:
+            (summary, blocked_on, continuation), pointer = row_fields(
+                row, ("summary", "no summary"), ("blockedOn", "unknown"), ("continuation", "none recorded"))
+            output.append(f"- {row.get('qitemId') or 'a row'} — {summary} — blocked on {blocked_on} — "
+                          f"continuation: {continuation}{pointer}")
     following = evidence.get("next") or []
     if following:
         output.append("POSSIBLE NEXT WORK (pending; no order implied):")
-        for row in following:
+        for row in following[:NEXT_SHOWN]:
             missions = ", ".join(row.get("missions") or [])
-            output.append(f"- {row.get('qitemId') or 'a row'} — {row.get('summary') or 'no summary'}"
-                          + (f" [mission: {missions}]" if missions else ""))
-    if "heldTruncated" in evidence or "nextTruncated" in evidence:
-        if evidence.get("heldTruncated"):
-            output.append("(the held list was cut; `rig queue list --owned --state blocked` has the rest)")
-        if evidence.get("nextTruncated"):
-            output.append("(the next list was cut; `rig queue list --owned --state pending` has the rest)")
-    elif evidence.get("heldAndNextTruncated"):
+            (summary,), pointer = row_fields(row, ("summary", "no summary"))
+            output.append(f"- {row.get('qitemId') or 'a row'} — {summary}"
+                          + (f" [mission: {missions}]" if missions else "") + pointer)
+    notices = [
+        cut_notice("held", "blocked", held, HELD_SHOWN, per_list and bool(evidence.get("heldTruncated"))),
+        cut_notice("next", "pending", following, NEXT_SHOWN, per_list and bool(evidence.get("nextTruncated"))),
+    ]
+    output.extend(notice for notice in notices if notice)
+    if not per_list and evidence.get("heldAndNextTruncated"):
         output.append("(held and next lists were cut; `rig queue list` has the rest)")
     return "\n".join(output)
 
 
-def render_candidates(evidence, root, depth, failures):
+def render_candidates(evidence, root, depth, failures, extra_roots=()):
     """The work section from labelled queue evidence. One direct, resolved tag is shown as the
     work with its source; anything less certain lists every candidate and asks the agent."""
     candidates = evidence.get("candidates") or []
@@ -372,7 +415,8 @@ def render_candidates(evidence, root, depth, failures):
         notes = [f"WORK FROM QUEUE EVIDENCE — {only.get('source')}. If this is stale, say what you are actually doing."]
         if not only.get("slice"):
             notes.append("no slice named")
-        traced = render_work(Path(only["workNodePath"]), root, depth, failures, packet=True)
+        start = Path(only["workNodePath"])
+        traced = render_work(start, work_root_for(start, root, extra_roots), depth, failures, packet=True)
         head, _, rest = traced.partition("\n")
         return "\n".join([head, *notes, rest])
 
@@ -390,8 +434,9 @@ def render_candidates(evidence, root, depth, failures):
         output.extend(candidate_line(candidate) for candidate in candidates)
     if unknown:
         output.append("In-progress rows the queue cannot place:")
-        output.extend(f"- {row.get('qitemId') or 'a row'} — {row.get('summary') or 'no summary'}: {row.get('reason')}"
-                      for row in unknown)
+        for row in unknown:
+            (summary,), pointer = row_fields(row, ("summary", "no summary"))
+            output.append(f"- {row.get('qitemId') or 'a row'} — {summary}: {row.get('reason')}{pointer}")
     if not candidates:
         names = evidence.get("missionsOnHost") or []
         if names:
@@ -478,8 +523,11 @@ def main():
     parser.add_argument("--depth", choices=("light", "full"), default=os.environ.get("OPENRIG_REFOCUS_DEPTH", "light"))
     parser.add_argument("--topology-start")
     parser.add_argument("--work-start")
+    parser.add_argument("--work-root", action="append", default=[], help="an extra root the work trace may ascend to, for a catalogued project outside workspace.root; repeatable (also OPENRIG_REFOCUS_WORK_ROOT, separated by the OS path separator)")
     parser.add_argument("--work-basis", help="the daemon's reason no current work node was named")
     parser.add_argument("--work-unknown", help="why the current work node could not be read")
+    parser.add_argument("--unresolved-work-advisory", action="store_true", help="show unresolved typed work as an advisory with broad orientation")
+    parser.add_argument("--work-unknown-timed-out", action="store_true", help="the --work-unknown lookup timed out (a slow daemon); with --unresolved-work-advisory it is an advisory, not a failure")
     parser.add_argument("--check", action="store_true", help="exit nonzero on trace or notes resolution failure; rendered text is unchanged")
     parser.add_argument("--packet", action="store_true", help="carry duties and notes as text by section, with old-notes cues")
     parser.add_argument("--work-candidates", help="labelled work evidence as JSON (a path, or - for stdin), from `rig queue whoami --work-candidates`")
@@ -507,6 +555,7 @@ def main():
         else:
             # Precedence: an explicit start wins; then the hook's daemon answer (basis or unknown);
             # only a standalone run with neither falls back to inferring from the working directory.
+            extra_roots = extra_work_roots(args.work_root)
             explicit = args.work_start or os.environ.get("OPENRIG_REFOCUS_WORK_NODE")
             evidence = None
             if args.work_candidates:
@@ -514,17 +563,28 @@ def main():
                 if error:
                     sections.append(gap(f"## WORK TRACE\nTRACE GAP — {error}"))
             if explicit:
-                sections.append(render_work(Path(explicit), root, args.depth, failures, packet=args.packet))
+                sections.append(render_work(Path(explicit), work_root_for(explicit, root, extra_roots), args.depth, failures, packet=args.packet))
             elif evidence is not None:
-                sections.append(render_candidates(evidence, root, args.depth, failures))
+                sections.append(render_candidates(evidence, root, args.depth, failures, extra_roots))
             elif args.work_candidates:
                 pass  # the unreadable-evidence gap above is the answer; never fall back to the root
             elif args.work_basis == NO_CURRENT_BATON_BASIS:
                 sections.append(render_work(root, root, args.depth, failures, packet=args.packet, fallback=(
                     f"no current typed baton ({args.work_basis}). Showing the project-level chain from the work root: "
                     "a broad orientation, not evidence of a current mission")))
+            elif args.unresolved_work_advisory and args.work_basis and args.work_basis.startswith("typed work did not resolve: "):
+                sections.append(f"## WORK TRACE\nTRACE GAP — no single current work node: {args.work_basis}")
+                sections.append(render_work(root, root, args.depth, failures, packet=args.packet, fallback=(
+                    "typed work could not be resolved. Showing the project-level chain from the work root: "
+                    "a broad orientation, not evidence of a current mission")))
             elif args.work_basis:
                 sections.append(gap(f"## WORK TRACE\nTRACE GAP — no single current work node: {args.work_basis}"))
+            elif args.unresolved_work_advisory and args.work_unknown and args.work_unknown_timed_out:
+                # A lookup that timed out says nothing about this seat's work: name it, orient broadly, and don't fail --check.
+                sections.append(f"## WORK TRACE\nTRACE GAP — current work node UNKNOWN: {args.work_unknown}")
+                sections.append(render_work(root, root, args.depth, failures, packet=args.packet, fallback=(
+                    "the work lookup timed out, which says nothing about this seat's work. Showing the project-level chain "
+                    "from the work root: a broad orientation, not evidence of a current mission")))
             elif args.work_unknown:
                 sections.append(gap(f"## WORK TRACE\nTRACE GAP — current work node UNKNOWN: {args.work_unknown}"))
             else:

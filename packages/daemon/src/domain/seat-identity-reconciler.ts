@@ -7,8 +7,8 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { SeatIdentityVerdict } from "./types.js";
 import { SeatIdentityStore, SelfHostIdentityStore } from "./seat-identity-store.js";
 import { RESERVED_HOST_IDS, validateHostRegistry } from "./hosts/hosts-registry-reader.js";
-import { agentAppOf } from "./built-in-runtimes.js";
-import { sessionAgentAppSelect } from "./session-registry.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { sessionCommunityHarnessSelect } from "./session-registry.js";
 
 /** Default identity-reconcile cadence: 5s. Process identity changes rarely
  *  (a seat's pane/process is stable for its whole life), and the check is
@@ -81,10 +81,10 @@ interface RunningSeatRow {
   resume_rotated_from?: string | null;
   resume_rotated_process?: string | null;
   resume_launch_process?: string | null;
-  agent_app?: string | null;
+  community_harness?: string | null;
 }
 
-type PaneObservation = { pid: number | null; command: string | null };
+type PaneObservation = { pid: number | null; command: string | null; dead?: boolean };
 
 export interface SeatIdentityReconcilerDeps {
   db: Database.Database;
@@ -130,7 +130,7 @@ export class SeatIdentityReconciler {
              s.resume_rotated_from as resume_rotated_from,
              s.resume_rotated_process as resume_rotated_process,
              s.resume_launch_process as resume_launch_process,
-             ${sessionAgentAppSelect(this.db)} as agent_app
+             ${sessionCommunityHarnessSelect(this.db)} as community_harness
       FROM nodes n
       JOIN sessions s ON s.node_id = n.id
         AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
@@ -202,7 +202,7 @@ export class SeatIdentityReconciler {
     // the sole-pane recheck below; do not sample when that capability is absent.
     const nativeSeats: RunningSeatRow[] = [];
     for (const seat of seats) {
-      if (!seat.tmux_pane || !liveSessions.has(seat.session_name)) continue;
+      if (!seat.tmux_pane || !liveSessions.has(seat.session_name) || panes.get(seat.tmux_pane)?.dead === true) continue;
       if (seat.runtime === "codex") nativeSeats.push(seat);
       else if (seat.runtime === "claude-code" && (seat.resume_token != null || this.tmux.listPanes)) {
         try {
@@ -235,6 +235,7 @@ export class SeatIdentityReconciler {
       return Promise.all(nativeSeats.map((seat) => (seat.runtime === "codex" ? observeCodexPaneProcess
         : seat.resume_token !== null && seat.resume_token !== undefined ? observeClaudePaneProcess : observeClaudePaneRuntime)({
         target: seat.tmux_pane!, tmux, expectedToken: seat.resume_token, rotation: claudeResumeRotation(seat),
+        ...(seat.runtime === "codex" ? { requireArgv: true } : {}),
         listProcesses: () => snapshot ??= this.listProcesses(),
       })));
     };
@@ -313,6 +314,16 @@ export class SeatIdentityReconciler {
 
     // From the sweep's one batched list-panes when the pane is in it; otherwise read per pane as before.
     const batched = panes?.get(seat.tmux_pane) ?? null;
+    if (batched?.dead === true) {
+      // Pane IDs can outlive their stored association after a move or server restart.
+      // Only observed membership in the exact session proves this executor exited.
+      const currentPanes = await this.tmux.listPanes?.(seat.session_name, true).catch(() => null);
+      if (!currentPanes?.some(pane => pane.id === seat.tmux_pane)) return this.tmuxUnavailableVerdict(seat, observedAt);
+      return {
+        ...base, verdict: "pane_missing", evidenceSource: "pane_process", reason: "pane_exited",
+        evidence: { registeredPane: seat.tmux_pane, observedPid: null, observedCommand: batched.command, matchedLayer: null },
+      };
+    }
     const pid = batched ? batched.pid : await this.tmux.getPanePid(seat.tmux_pane);
     if (pid === null) {
       // The registered pane no longer resolves. Distinguish "the whole tmux
@@ -344,7 +355,7 @@ export class SeatIdentityReconciler {
       return {
         ...base, verdict: verified ? "verified" : "mismatch",
         evidenceSource: "pane_process", reason: verified ? null : "process_identity_ambiguous",
-        evidence: { registeredPane: seat.tmux_pane, observedPid: native?.process.pid ?? pid,
+        evidence: { registeredPane: seat.tmux_pane, observedPanePid: pid, observedPid: native?.process.pid ?? pid,
           observedCommand: native?.process.command ?? command, matchedLayer: verified ? 1 : null },
       };
     }
@@ -359,8 +370,8 @@ export class SeatIdentityReconciler {
       };
     }
 
-    // A community agent app's process doesn't prove which session it is: the pane is live, its identity unconfirmed.
-    if (agentAppOf(seat.agent_app, seat.runtime)) {
+    // A community harness's process doesn't prove which session it is: the pane is live, its identity unconfirmed.
+    if (communityHarnessOf(seat.community_harness, seat.runtime)) {
       return {
         ...base,
         verdict: "unconfirmed",

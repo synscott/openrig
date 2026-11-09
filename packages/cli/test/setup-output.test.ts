@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Command } from "commander";
 import { setupCommand, type SetupDeps, type SetupResult } from "../src/commands/setup.js";
 
-// Exercise the real command/result path without probing or changing this host.
+// Exercise the real command/result path without probing or changing this host. A case can set the doctor checks.
+const doctor = vi.hoisted(() => ({ checks: [] as Array<Record<string, unknown>> }));
 vi.mock("../src/commands/doctor.js", () => ({
-  runDoctorChecks: () => ({ checks: [], asyncChecks: [] }),
+  runDoctorChecks: () => ({ checks: doctor.checks, asyncChecks: [] }),
 }));
 vi.mock("../src/config-store.js", () => ({
   ConfigStore: class {
@@ -112,4 +113,101 @@ it.each([
   await program.parseAsync(["node", "rig", "setup", "--dry-run", "--json", ...flags]);
   const result = JSON.parse(logs[0]!) as SetupResult;
   expect(result.steps.find(step => step.id === "ghostty_install")?.message).toContain(expected);
+});
+
+// The installer's step 4 consumes only `rig setup`'s exit status and prints setup's own output. These five
+// cases pin that boundary: an incomplete setup exits 1 and lists what is left (each with its Fix) under
+// "Some steps need attention"; a ready one exits 0 with "Setup complete.". A failed provider probe is listed
+// as "not ready to launch" with the probe's own error, whatever the cause, so the installer names no sign-in.
+describe("the installer's setup boundary", () => {
+  const run = async (exec: (cmd: string) => string, flags: string[] = []) => {
+    process.exitCode = undefined;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })));
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...args) => { logs.push(args.map(String).join(" ")); });
+    const deps: SetupDeps = { platform: "darwin", env: {}, exec: vi.fn(exec), readFile: () => null, exists: () => false, writeFile: vi.fn(), mkdirp: vi.fn() };
+    await new Command().addCommand(setupCommand(deps)).parseAsync(["node", "rig", "setup", ...flags]);
+    const output = logs.join("\n");
+    return { exitCode: process.exitCode, output, attention: output.slice(output.indexOf("Some steps need attention:")) };
+  };
+  const ok = (cmd: string) => cmd === "cmux capabilities --json" ? '{"capabilities":[]}' : "available";
+
+  it("a sign-in only: exit 1, the provider listed with its Fix", async () => {
+    const r = await run((cmd) => { if (cmd === "claude auth status") throw new Error("Not logged in"); return ok(cmd); });
+    expect(r.exitCode).toBe(1);
+    expect(r.attention).toContain("claude_auth: Claude Code is installed but not ready to launch: Not logged in");
+    expect(r.attention).toContain("Fix: Run `claude auth login`");
+  });
+
+  it("a real failure beside a sign-in: exit 1, both listed", async () => {
+    const r = await run((cmd) => {
+      if (cmd === "claude auth status") throw new Error("Not logged in");
+      if (cmd === "codex --version" || cmd === "npm install -g @openai/codex") throw new Error("npm ERR! network");
+      return ok(cmd);
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.attention).toContain("claude_auth:");
+    expect(r.attention).toContain("codex_install:");
+  });
+
+  it("ready: exit 0 and Setup complete", async () => {
+    const r = await run(ok);
+    expect(r.exitCode).toBeUndefined();
+    expect(r.output).toContain("Setup complete.");
+    expect(r.output).not.toContain("Some steps need attention:");
+  });
+
+  it("an unselected provider is not a failure: exit 0 with only the chosen provider checked", async () => {
+    const r = await run((cmd) => { if (cmd.startsWith("codex")) throw new Error("codex absent"); return ok(cmd); }, ["--providers", "claude"]);
+    expect(r.exitCode).toBeUndefined();
+    expect(r.output).toContain("Setup complete.");
+    expect(r.output).toContain("codex_auth: Not selected");
+  });
+
+  it("an uncertain probe is listed with its own error, not as a confirmed missing login", async () => {
+    const r = await run((cmd) => { if (cmd === "claude auth status") throw new Error("Command timed out after 10000ms"); return ok(cmd); });
+    expect(r.exitCode).toBe(1);
+    expect(r.attention).toContain("claude_auth: Claude Code is installed but not ready to launch: Command timed out after 10000ms");
+    expect(r.attention).not.toMatch(/not logged in/i);
+  });
+
+  // A failed doctor check leaves setup not ready, so it's listed too. A provider check is a reused step, so it isn't
+  // listed twice.
+  it("a failed doctor check: exit 1, listed with its Fix, and a reused provider step listed once", async () => {
+    doctor.checks = [
+      { name: "port", status: "fail", message: "Port 127.0.0.1:7433 is in use by another process.",
+        fix: "Stop the process using port 7433, or start the daemon on a different port with: rig daemon start --port <port>" },
+      { name: "claude_auth", status: "fail", message: "Claude Code is installed but not ready to launch: Not logged in" },
+    ];
+    try {
+      const r = await run((cmd) => { if (cmd === "claude auth status") throw new Error("Not logged in"); return ok(cmd); });
+      expect(r.exitCode).toBe(1);
+      expect(r.attention).toContain("port: Port 127.0.0.1:7433 is in use by another process.");
+      expect(r.attention).toContain("Fix: Stop the process using port 7433");
+      expect(r.attention.split("claude_auth:").length - 1).toBe(1);
+    } finally {
+      doctor.checks = [];
+    }
+  });
+
+  // A first user on a shared machine whose configured port is served by another OS user's OpenRig daemon, or a share set
+  // up through config alone: setup stays ready and exits 0, and still shows whose daemon it is and the way on.
+  it("another user's daemon on the configured port: exit 0, Setup complete, and the warning listed with its Fix", async () => {
+    doctor.checks = [
+      { name: "port", status: "warn",
+        message: "Port 127.0.0.1:7433 is in use by an OpenRig daemon of another OS user: the endpoint reports euid 1001; your euid is 1002.",
+        fix: "To run your own, give this OpenRig home a free port and start its daemon there." },
+      { name: "cmux", status: "warn", message: "cmux is not installed." },
+    ];
+    try {
+      const r = await run(ok);
+      expect(r.exitCode).toBeUndefined();
+      expect(r.output).toContain("Setup complete.");
+      expect(r.attention).toContain("port: Port 127.0.0.1:7433 is in use by an OpenRig daemon of another OS user: the endpoint reports euid 1001");
+      expect(r.attention).toContain("Fix: To run your own, give this OpenRig home a free port and start its daemon there.");
+      expect(r.attention).not.toContain("cmux:");
+    } finally {
+      doctor.checks = [];
+    }
+  });
 });

@@ -1,8 +1,10 @@
+import { physicalSessionName } from "./session-registry.js";
 import Database from "better-sqlite3";
 import { join } from "node:path";
 import os from "node:os";
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, unlinkSync } from "node:fs";
 import { resolveCodexDbPaths } from "./codex-thread-id.js";
+import { declaredRuntimeHomes } from "./seat-runtime-home.js";
 import type { ContextUsage, ContextUnknownReason } from "./types.js";
 import { parseSqliteUtcMs } from "./sqlite-time.js";
 import {
@@ -204,7 +206,16 @@ export class ContextUsageStore {
 
     const cw = raw.context_window;
     if (!cw || typeof cw.used_percentage !== "number") {
-      return this.unknownUsage("parse_error");
+      // Still unknown, but the conversation the sidecar names is kept: the first sample after a /clear can carry no
+      // percentage yet, and a held compaction for the previous conversation must see that it changed (#2682). The
+      // session name goes with it, so the name guards that read this row (resume-token discovery, session_mismatch)
+      // still apply.
+      const sessionId = typeof raw.session_id === "string" ? raw.session_id : null;
+      return {
+        ...this.unknownUsage("parse_error"),
+        sessionId,
+        sessionName: sessionId !== null && typeof raw.session_name === "string" ? raw.session_name : null,
+      };
     }
 
     const sampledAt = raw.sampled_at ?? null;
@@ -319,6 +330,7 @@ export class ContextUsageStore {
   /** Get context usage for a single node. Session-aware: mismatched session returns unknown. */
   getForNode(nodeId: string, currentSessionName: string | null): ContextUsage {
     if (!currentSessionName) return this.unknownUsage("not_managed");
+    currentSessionName = physicalSessionName(this.db, currentSessionName);
 
     const row = this.db.prepare("SELECT * FROM context_usage WHERE node_id = ?").get(nodeId) as ContextUsageRow | undefined;
     if (!row) return this.unknownUsage("no_data");
@@ -343,6 +355,7 @@ export class ContextUsageStore {
     const result = new Map<string, ContextUsage>();
     if (entries.length === 0) return result;
 
+    entries = entries.map(entry => ({ ...entry, currentSessionName: entry.currentSessionName ? physicalSessionName(this.db, entry.currentSessionName) : null }));
     const nodeIds = entries.map((e) => e.nodeId);
     const sessionMap = new Map(entries.map((e) => [e.nodeId, e.currentSessionName]));
 
@@ -462,7 +475,11 @@ export class ContextUsageStore {
   }
 
   private resolveCodexStateDbPaths(): string[] {
-    return this.codexHome || this.codexHomeDir ? resolveCodexDbPaths(this.codexHomeDir ?? "", "state", undefined, this.codexHome) : [];
+    const daemon = this.codexHome || this.codexHomeDir ? resolveCodexDbPaths(this.codexHomeDir ?? "", "state", undefined, this.codexHome) : [];
+    // A seat with its own CODEX_HOME keeps its threads there. A thread id is unique across homes, so each declared home is
+    // searched after the daemon's.
+    const seats = declaredRuntimeHomes(this.db, "codex").flatMap(home => resolveCodexDbPaths("", "state", undefined, home));
+    return [...new Set([...daemon, ...seats])];
   }
 
   private readLatestCodexTokenCount(rolloutPath: string): CodexTokenCountEvent | null {

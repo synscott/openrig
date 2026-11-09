@@ -1,7 +1,11 @@
-import { Hono } from "hono";
-import type { SessionTransport, TargetSpec } from "../domain/session-transport.js";
+import { expectedConversation, type ExpectedConversation } from "../domain/expected-conversation.js";
+import { Hono, type Context } from "hono";
+import { CAPTURE_INPUT_BOX_DEADLINE_MS, CAPTURE_READABLE_BUDGET_MS, type SessionTransport, type TargetSpec } from "../domain/session-transport.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
-import { requireSenderIdentity, transportSenderSession } from "./require-sender-identity.js";
+import { requireSenderIdentity, resolveRecordedIdentity, transportSenderSession } from "./require-sender-identity.js";
+import { OCCUPANT_GENERATION_HEADER, runtimeSwitchCustodyRefusal } from "./runtime-switch-custody.js";
+import { runtimeSwitchCommittedSince, runtimeSwitchSummary } from "../domain/seat-runtime-switch-service.js";
+import type Database from "better-sqlite3";
 import type { OutboxHandler } from "../domain/outbox-handler.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
 
@@ -10,7 +14,10 @@ import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
 // Held to the S1 truthfulness bar for a success payload: what happened, what the
 // recipient cannot know, and the concrete fix (sign).
 const UNKNOWN_SENDER_NOTICE =
-  "Delivered without sender identity: this request carried no X-OpenRig-Session header, so your recipient has no way of knowing who sent it. Follow up and sign it — send from a seat shell (the header stamps automatically) or state your identity in the message body.";
+  "Delivered without sender identity: this request carried no X-OpenRig-Session header, so your recipient has no way of knowing who sent it. Follow up and sign it: from a seat shell the header stamps automatically; from anywhere else, send it as a declared sender, `rig queue create --source <you>@external --destination <seat> --summary \"<one line>\" --body-file <file>` (recorded as declared; a registered human gets a reply route), or join this shell to a seat, `eval \"$(rig attach --self --rig <rigId> --node <logicalId> --print-env)\"`, so its sends carry that seat's name (`rig attach --help` covers adding a new member).";
+
+// A fan-out where every recipient holds the text hasn't delivered yet, but the text still arrives unsigned.
+const UNKNOWN_SENDER_HELD_NOTICE = UNKNOWN_SENDER_NOTICE.replace(/^Delivered/, "Held for delivery");
 
 // The unknown-sender From: marker, DERIVED from the canonical envelope wrapper
 // (pane-envelope.ts SENDER_FALLBACK is unexported and its literal is
@@ -23,24 +30,35 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
   const router = new Hono();
 
   const terminalToken = opts?.bearerToken ?? null;
-  router.use("*", authBearerTokenMiddleware({ expectedToken: terminalToken }));
+  router.use("*", authBearerTokenMiddleware({ expectedToken: terminalToken, diagnosticContext: "terminal" }));
 
-  router.post("/send", async (c) => {
+  const send = async (c: Context) => {
     const transport = c.get("sessionTransport" as never) as SessionTransport;
     const body = await c.req.json<{
       session?: string;
       deliveryId?: string;
+      expectedIdentity?: unknown;
       text: string;
       verify?: boolean;
       force?: boolean;
       waitForIdleMs?: number;
       dangerouslyInteract?: boolean;
+      typeWithoutChecking?: boolean;
       reason?: string;
       actorSession?: string | null;
       submitOnly?: boolean;
       expectedStagedText?: string;
       expectedStagedLineCount?: number;
+      /** The unwrapped text; typed instead of `text` when the recipient is a terminal seat. */
+      exactText?: string;
+      urgent?: boolean;
     }>();
+
+    let expectedIdentity: ExpectedConversation | undefined;
+    if (c.req.path.endsWith("/send-expected") || body.expectedIdentity !== undefined) {
+      try { expectedIdentity = expectedConversation(body.expectedIdentity); }
+      catch (error) { return c.json({ ok: false, sent: false, reason: "invalid_expected_identity", error: (error as Error).message }, 400); }
+    }
 
     // submitOnly (mechanics-gate fix d9b3989a) sends NO text — the Enter-only retry for staged
     // content; every other send still requires text.
@@ -88,7 +106,19 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     // the 401 only ever stopped honest uncounted callers. Instead the send DELIVERS, the
     // already-nullable audit actor records null (projected "unknown"), and the response carries
     // the sign-it notice below.
+    if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
+      error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
     const derivedActor = transportSenderSession(c) ?? null;
+    // The MCP adapter's caller, on a direct attributed send, for every outbox row this send writes (guarded, retained or the
+    // audit record below); otherwise the stamp this route has always recorded.
+    const attributed = derivedActor ? resolveRecordedIdentity(c, { provenance: "transport:v1" }) : null;
+    const sendIdentity = attributed?.identityPrincipal
+      ? { identityProvenance: "principal:v1", identityPrincipal: attributed.identityPrincipal }
+      : derivedActor ? { identityProvenance: "transport:v1" } : {};
+    // Slice 16: a runtime switch's own predecessor or not-yet-committed successor doesn't send as the seat.
+    const db = c.get("db" as never) as Database.Database;
+    const switchHeld = runtimeSwitchCustodyRefusal(db, derivedActor, c.req.header(OCCUPANT_GENERATION_HEADER));
+    if (switchHeld) return c.json(switchHeld.body, switchHeld.status);
 
     // Check for ambiguity first
     const resolved = await transport.resolveSessions({ session: body.session });
@@ -97,27 +127,57 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       return c.json({ ok: false, error: resolved.error }, status);
     }
 
+    const exactText = typeof body.exactText === "string" ? body.exactText : undefined;
+    // Slice 16: a seat that is switching runtime takes no input until its switch ends. Rather than wait behind the
+    // switch's lease (its whole confirmation window), the send is held at once, like any held send, and says why.
+    const target = resolved.sessions.length === 1 ? resolved.sessions[0]!.sessionName : null;
+    const switching = target ? runtimeSwitchSummary(db, { session: target }) : null;
+    if (target && switching && (switching.phase === "preparing" || switching.phase === "confirmed")) {
+      if (expectedIdentity) return c.json({ ok: false, sessionName: target, sent: false, inputPhase: "not_reached",
+        reason: "expected_identity_unavailable", error: "The seat is switching runtime. No input or expected-identity constraint was retained; retry the conditional endpoint with the original expectedIdentity.",
+        runtimeSwitch: switching }, 409);
+      return c.json({ ok: true, sessionName: target, outcome: "retained", sent: false, verified: false, reason: "runtime_switch_in_progress",
+        runtimeSwitch: switching,
+        warning: `${target} is switching runtime (${switching.from} -> ${switching.to}, switch ${switching.id}) until about ${switching.deadlineAt}. Send it again after the switch; it then reaches whoever holds the seat.` });
+    }
+    const sendStartedAt = new Date().toISOString();
+
     const result = await transport.send(body.session, body.text ?? "", {
       deliveryId: body.deliveryId,
+      expectedIdentity,
       verify: body.verify,
       force: body.force,
       waitForIdleMs: body.waitForIdleMs,
       dangerouslyInteract: body.dangerouslyInteract,
+      typeWithoutChecking: body.typeWithoutChecking,
       reason: body.reason,
       actorSession: derivedActor, // transport-derived, never the body claim
-      ...(derivedActor ? { identityProvenance: "transport:v1" } : {}),
+      ...sendIdentity,
+      // Anyone may mark a send urgent; who marked it is the transport-derived sender, never a body claim.
+      ...(body.urgent === true ? { urgent: { by: derivedActor ?? "unknown" } } : {}),
       // Mechanics-gate fix (d9b3989a): the walk retry's bare-Enter mode, guarded in the
       // transport by the expected-staged-text precheck.
       submitOnly: body.submitOnly,
       expectedStagedText: body.expectedStagedText,
       expectedStagedLineCount: body.expectedStagedLineCount,
+      exactText,
+      // The caller's request: if it goes away while the send still waits, nothing is typed later.
+      signal: c.req.raw.signal,
     });
 
+    // The seat's own agent typing into its own terminal is told apart where the sender is known: it's treated like any
+    // agent's message, and recorded as its own.
+    const self = !!derivedActor && resolved.sessions.length === 1 && resolved.sessions[0]!.sessionName === derivedActor;
+    if (self) Object.assign(result, { fromDestinationSeat: true });
     if (result.outcome === "retained") return c.json(result);
 
     if (!result.ok) {
       const statusMap: Record<string, number> = {
+        expected_identity_mismatch: 409,
+        expected_identity_unavailable: 409,
+        invalid_expected_identity: 400,
         typing_guard_enabled: 409,
+        caller_cancelled: 409,
         guard_target_unknown: 409,
         guard_target_changed: 409,
         delivery_identity_conflict: 409,
@@ -125,6 +185,8 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
         delivery_already_attempted: 409,
         delivery_in_progress: 409,
         delivery_indeterminate: 409,
+        override_input_present: 409,
+        override_input_unknown: 409,
         draft_input_busy: 409,
         draft_input_unknown: 409,
         draft_input_changed: 409,
@@ -140,6 +202,9 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
         wait_for_idle_timeout: 409,
         target_needs_input: 409,
         target_activity_unknown: 409,
+        target_runtime_conflict: 409,
+        target_runtime_not_running: 409,
+        target_runtime_unverified: 409,
         prompt_override_audit_unavailable: 500,
         submit_failed: 502,
         send_failed: 502,
@@ -148,6 +213,12 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
         pane_in_mode: 409,
       };
       const status = (statusMap[result.reason ?? ""] ?? 500) as 400 | 404 | 409 | 500 | 502 | 503;
+      // A send that waited while its seat switched runtime: say so, and that it needs sending again.
+      const moved = result.reason === "guard_target_changed" && result.sent === false && target ? runtimeSwitchCommittedSince(db, target, sendStartedAt) : null;
+      if (moved) {
+        Object.assign(result, { runtimeSwitch: moved,
+          error: `${result.error ?? "The seat changed while this send waited."} ${target} moved to ${moved.to} (runtime switch ${moved.id}) while this send waited, so nothing was typed. Send it again to reach its new occupant.` });
+      }
       return c.json(result, status);
     }
 
@@ -164,12 +235,14 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
       if (outbox) {
         try {
-          outbox.record({
+          const entry = outbox.record({
             senderSession: derivedActor,
             destinationSession: body.session,
-            body: body.text,
-            identityProvenance: "transport:v1",
+            body: result.envelopeOmitted && exactText !== undefined ? exactText : body.text,
+            ...sendIdentity,
           });
+          // The input was dispatched successfully; mark its audit row as broadcast does.
+          outbox.markDelivered(entry.outboxId);
         } catch (err) {
           console.warn(`[transport/send] outbox auto-record failed (send already delivered): ${(err as Error).message}`);
         }
@@ -184,7 +257,10 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     }
 
     return c.json(result);
-  });
+  };
+  router.post("/send", send);
+  // Separate capability path: an older daemon refuses with 404 instead of ignoring a new field.
+  router.post("/send-expected", send);
 
   router.post("/capture", async (c) => {
     const transport = c.get("sessionTransport" as never) as SessionTransport;
@@ -193,7 +269,19 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       rig?: string;
       pod?: string;
       lines?: number;
+      inputBox?: boolean;
+      readable?: { width?: unknown; height?: unknown };
     }>();
+    // Read an agent seat's input box only when the request asks: `rig capture` and the MCP tool do; send --verify and
+    // walk read only the pane text. The same readers learn when a pane is too small to show a prompt.
+    const inputBox = body.inputBox === true;
+    const promptPane = inputBox;
+    // `rig capture --readable` / `--size WxH`: read a small seat at that size, then give its window back.
+    const dimension = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1000;
+    if (body.readable !== undefined && !(dimension(body.readable?.width) && dimension(body.readable?.height))) {
+      return c.json({ ok: false, error: "readable needs a width and height, whole numbers from 1 to 1000" }, 400);
+    }
+    const readable = body.readable ? { width: body.readable.width as number, height: body.readable.height as number } : undefined;
 
     // Multi-target: rig or pod
     if (body.rig || body.pod) {
@@ -206,9 +294,14 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
         return c.json({ ok: false, error: resolved.error }, 404);
       }
 
+      // One budget for the whole fan-out's input-box reads, so slow tmux adds at most that to the request.
+      const inputBoxBudget = { remainingMs: CAPTURE_INPUT_BOX_DEADLINE_MS };
+      // And one for readable reads, so a fan-out of small seats returns inside the CLI's wait.
+      const readableBudget = { remainingMs: CAPTURE_READABLE_BUDGET_MS };
       const results = [];
       for (const session of resolved.sessions) {
-        const result = await transport.capture(session.sessionName, { lines: body.lines });
+        const result = await transport.capture(session.sessionName, { lines: body.lines, inputBox, inputBoxBudget, promptPane,
+          ...(readable ? { readable, readableBudget } : {}) });
         results.push(result);
       }
       return c.json({ results });
@@ -219,7 +312,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       return c.json({ error: "Provide session, rig, or pod to capture" }, 400);
     }
 
-    const result = await transport.capture(body.session, { lines: body.lines });
+    const result = await transport.capture(body.session, { lines: body.lines, inputBox, promptPane, ...(readable ? { readable } : {}) });
     if (!result.ok) {
       const statusMap: Record<string, number> = {
         session_missing: 404,
@@ -248,8 +341,10 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       // (the danger audit fires once per seat, not once per batch).
       waitForIdleMs?: number;
       dangerouslyInteract?: boolean;
+      typeWithoutChecking?: boolean;
       reason?: string;
       actorSession?: string | null;
+      urgent?: boolean;
       // OPR.0.4.3.30 — when set, the fan-out wraps each recipient in its own From/To envelope.
       // `rig broadcast` never sets it (raw-to-all, unchanged).
       envelopeSender?: string | null;
@@ -263,7 +358,12 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     // transport header (see /send). An absent header no longer refuses — the send proceeds and the
     // audit's already-nullable actor records null (projected "unknown"); the response carries the
     // sign-it notice below.
+    if (body.typeWithoutChecking && (!body.dangerouslyInteract || !body.reason?.trim())) return c.json({ ok: false, reason: "invalid_dangerously_interact",
+      error: "--type-without-checking requires --dangerously-interact and --reason. No text was sent." }, 400);
     const derivedActor = transportSenderSession(c) ?? null;
+    // Slice 16: a runtime switch's own predecessor or not-yet-committed successor doesn't send as the seat.
+    const switchHeld = runtimeSwitchCustodyRefusal(c.get("db" as never) as Database.Database, derivedActor, c.req.header(OCCUPANT_GENERATION_HEADER));
+    if (switchHeld) return c.json(switchHeld.body, switchHeld.status);
 
     // P21 I4 (orch ruling from specimen 5 — the false "From: pm-lead" the incident acted upon): the
     // From: line rendered into every recipient's terminal MUST DERIVE from the transport identity, never
@@ -292,10 +392,14 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       force: body.force,
       waitForIdleMs: body.waitForIdleMs,
       dangerouslyInteract: body.dangerouslyInteract,
+      typeWithoutChecking: body.typeWithoutChecking,
       reason: body.reason,
       actorSession: derivedActor, // transport-derived, never the body claim
+      ...(body.urgent === true ? { urgent: { by: derivedActor ?? "unknown" } } : {}),
       envelopeSender, // the From: is the DERIVED identity (never the body value) — orch ruling (a)
       ...(derivedActor ? { identityProvenance: "transport:v1" } : {}),
+      // Recipients not yet started when the caller goes away are not written; started ones keep their results.
+      signal: c.req.raw.signal,
     });
 
     // A3b (P22 follow-on, planner-ruled IN scope): auto-record the fan-out — N rows, ONE per RESOLVED
@@ -318,6 +422,7 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
               identityProvenance: "transport:v1",
             });
             if (r.ok) outbox.markDelivered(entry.outboxId);
+            else if (r.inputPhase === "attempted" || r.inputPhase === "written" || r.sent === true) outbox.markIndeterminate(entry.outboxId);
             else outbox.markFailed(entry.outboxId);
           } catch (err) {
             console.warn(`[transport/broadcast] outbox auto-record failed for ${r.sessionName} (fan-out already dispatched): ${(err as Error).message}`);
@@ -327,9 +432,10 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     }
 
     // S2 (OPR.0.5.4.3) sender-side honesty: an unattributed fan-out's response carries the
-    // sign-it notice for the CLI renderers to surface. Attributed fan-outs are unchanged.
-    if (!derivedActor) {
-      return c.json({ ...result, warning: UNKNOWN_SENDER_NOTICE });
+    // sign-it notice for the CLI renderers to surface. Attributed fan-outs are unchanged. A fan-out that reached nobody
+    // (an unknown rig, every send refused) doesn't carry it, but a retained send is typed later and is still unsigned.
+    if (!derivedActor && result.sent + (result.retained ?? 0) > 0) {
+      return c.json({ ...result, warning: result.sent > 0 ? UNKNOWN_SENDER_NOTICE : UNKNOWN_SENDER_HELD_NOTICE });
     }
     return c.json(result);
   });

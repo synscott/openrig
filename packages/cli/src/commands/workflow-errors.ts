@@ -53,7 +53,7 @@ export function describeDaemonRejection(body: unknown, instanceHint?: string): T
         // OPR.0.4.6.WF5 FR-4: the promised pointer upgrade — resume is
         // real now. A FAILED instance redrives; other terminal states
         // still inspect-first.
-        action: `If it is failed, redrive it: rig workflow resume <instanceId> --actor-session <you>. Otherwise inspect: ${showCmd}`,
+        action: `If it is failed, redrive it: rig workflow resume <instanceId>. Otherwise inspect: ${showCmd}`,
       };
     }
     case "instance_not_failed":
@@ -72,7 +72,7 @@ export function describeDaemonRejection(body: unknown, instanceHint?: string): T
       return {
         fact: "The failed step no longer exists in the cached workflow spec.",
         consequence: "The spec drifted after this instance failed; rebinding would route a step the workflow no longer declares.",
-        action: "Restore the step in the spec (re-validate to refresh the cache) or instantiate a fresh run.",
+        action: "Restore the step in the spec (then re-register it through the workflows-folder scan or an instantiate by path to refresh the cache) or instantiate a fresh run.",
       };
     case "instance_version_conflict":
       return {

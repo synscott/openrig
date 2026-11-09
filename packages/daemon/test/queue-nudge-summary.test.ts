@@ -109,6 +109,52 @@ describe("queue wake nudge carries the stored summary", () => {
     } finally { await settle(); h.db.close(); }
   });
 
+  it("a person's message reaches the seat with a reply hint that answers in its own Slack thread", async () => {
+    const h = makeHarness();
+    try {
+      const row = await h.repo.create({ sourceSession: "alex@external", destinationSession: "dev@rig", body: "can you check the build?" });
+      await vi.waitFor(() => expect(h.calls).toHaveLength(1));
+      expect(h.calls[0]!.text.split("\n").at(-1)).toBe(`↩ Reply if needed: rig queue create --destination alex@external --human-intent update --reply-to ${row.qitemId} --summary "<one line>" --body "..." --verify`);
+    } finally { await settle(); h.db.close(); }
+  });
+
+  it.each(["human@kernel", "human@host"])("a wake from %s offers a reply accepted by the real queue writer", async (sender) => {
+    const h = makeHarness();
+    try {
+      const row = await h.repo.create({ sourceSession: sender, destinationSession: "dev@rig", body: "Please check the build." });
+      await vi.waitFor(() => expect(h.calls).toHaveLength(1));
+      const envelope = h.calls[0]!.text;
+      expect(envelope).toContain(`From: ${sender}\nTo: dev@rig\n`);
+      expect(envelopeBody(envelope)).toEqual([`Queue handoff: ${row.qitemId} - check your queue.`]);
+      const reply = { sourceSession: "dev@rig", destinationSession: sender, humanIntent: "update" as const,
+        summary: "Build checked", body: "The result is in the proof.", nudge: false };
+      // Establish the existing route and its required field before checking the generated command.
+      await expect(h.repo.create(reply)).rejects.toMatchObject({ code: "human_route_fields_required" });
+      const control = await h.repo.create({ ...reply, evidenceRef: "proof/build.md" });
+      expect(control.destinationSession).toBe(sender);
+      expect(control.humanIntent).toBe("update");
+      const hint = envelope.split("\n").at(-1)!;
+      expect(hint).toBe(`↩ Reply if needed: rig queue create --destination ${sender} --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify`);
+      // Fill the actual emitted placeholders, then feed those values into the production queue writer.
+      const command = hint.replace('"<one line>"', '"Build checked"').replace('"<path>"', '"proof/build.md"').replace('"..."', '"The result is in the proof."');
+      const fields = /--destination (\S+) --human-intent (update) --summary "([^"]+)" --evidence-ref "([^"]+)" --body "([^"]+)" --verify$/.exec(command)!;
+      expect(fields).not.toBeNull();
+      const accepted = await h.repo.create({ sourceSession: "dev@rig", destinationSession: fields[1]!,
+        humanIntent: fields[2] as "update", summary: fields[3]!, evidenceRef: fields[4]!, body: fields[5]!, nudge: false });
+      expect(accepted).toMatchObject({ sourceSession: "dev@rig", destinationSession: sender,
+        humanIntent: "update", summary: "Build checked", evidenceRef: "proof/build.md" });
+    } finally { await settle(); h.db.close(); }
+  });
+
+  it("a seat's message keeps the ordinary reply hint", async () => {
+    const h = makeHarness();
+    try {
+      await h.repo.create({ sourceSession: "lead@rig", destinationSession: "dev@rig", body: "work" });
+      await vi.waitFor(() => expect(h.calls).toHaveLength(1));
+      expect(h.calls[0]!.text.split("\n").at(-1)).toBe('↩ Reply: rig send lead@rig "..."');
+    } finally { await settle(); h.db.close(); }
+  });
+
   it("create without a summary keeps the generic nudge", async () => {
     const h = makeHarness();
     try {

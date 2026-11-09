@@ -1,10 +1,11 @@
-import { closeSync, fstatSync, openSync, readSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { loadConfig, configPathFor, DEFAULT_CONFIG, type SlackConnectorConfig } from "./slack/config.js";
 import { resolveSecret } from "./slack/secrets.js";
 import { loadHumanRegistry } from "./human-registry.js";
-import { channelStateDigest, type ChannelOperation } from "./channel-operations.js";
+import { loadRelayProfiles } from "./relay-config.js";
+import { channelStateDigest } from "./channel-operations.js";
 import type { SettingsStore } from "../user-settings/settings-store.js";
 
 /** Shared passive read context. Raw values and the redactor stay inside the domain. */
@@ -68,16 +69,12 @@ export function connectionsProjection(home: string, gateway: Record<string, unkn
   const digest = cfg ? channelStateDigest(cfg) : null;
   const applied = !digest || typeof connector?.configurationDigest !== "string" ? "unverified"
     : connector.configurationDigest === digest ? "matching" : "changed";
-  const verification = latestVerification(home, digest);
-  verification.actor = text(verification.actor);
   // Authored intent describes delivery only after the running wire confirms application.
   const state = !cfg || !secretsAvailable || !gateway ? "unavailable"
     : gateway.state === "failed" ? "failed" : gateway.state !== "active" ? "unavailable"
     : applied === "changed" ? "unapplied" : applied === "unverified" ? "unverified"
     : !cfg.enabled ? "disabled" : !bot || !cfg.channel ? "incomplete"
-    : connector?.outboundReady !== true ? "unverified"
-    : verification.state === "failed" ? "failed" : verification.state === "indeterminate" ? "indeterminate"
-    : "unverified"; // Even a successful dated check is not current external reachability.
+    : "unverified"; // Nothing here reaches Slack; `rig slack verify` checks scopes and channel membership live, not an end-to-end post.
   // OPR.0.6.0.5: no Slack app yet (neither token resolves) → create one from the shipped manifest first.
   const noSlackApp = !!cfg && secretsAvailable && !bot && !app;
   const nextAction = state !== "unavailable" && state !== "failed" && noSlackApp ? "rig slack manifest --url"
@@ -86,62 +83,58 @@ export function connectionsProjection(home: string, gateway: Record<string, unkn
     : "rig slack verify --json";
   let registry: ReturnType<typeof loadHumanRegistry>;
   try { registry = loadHumanRegistry(home, { readOnly: true }); } catch { registry = { ok: false, error: "registry unavailable" }; }
+  const relayProfilesResult = registry.ok ? loadRelayProfiles(home, { entities: registry.entities }) : null;
+  const relayProfileValues = relayProfilesResult ? [...relayProfilesResult.profiles.values()] : [];
+  const relayTokens = relayProfileValues
+    .flatMap((p) => [p.credentials?.inboundToken, p.credentials?.outboundToken])
+    .filter((t): t is string => Boolean(t));
+  const safeText = (v: unknown): string | null => {
+    const base = text(v);
+    if (base === null) return null;
+    let out = base;
+    for (const tok of relayTokens) out = out.split(tok).join("[redacted]");
+    return out;
+  };
+  const relaySummary = {
+    configured: relayProfileValues.length > 0,
+    ready: relayProfileValues.length > 0 && relayProfileValues.every((p) => p.ready),
+    profiles: relayProfileValues.map((p) => ({
+      connectorRef: safeText(p.connectorRef),
+      state: p.state,
+      configured: p.configured,
+      ready: p.ready,
+      reason: safeText(p.reason),
+      nextAction: safeText(p.nextAction),
+    })),
+  };
   const instance = ["host.name", "workspace.root", "workspace.operator_seat_name"] as const;
   const browserKey = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
   return {
-    observedAt: new Date().toISOString(), home: text(home), pid: process.pid,
-    settingsSource: text(settings?.configPath),
+    observedAt: new Date().toISOString(), home: safeText(home), pid: process.pid,
+    settingsSource: safeText(settings?.configPath),
     settings: instance.map((key) => {
       try {
         const r = settings?.resolveOne(key);
-        return { key, value: text(r?.value), source: r?.source ?? "unavailable" };
+        return { key, value: safeText(r?.value), source: r?.source ?? "unavailable" };
       } catch { return { key, value: null, source: "unavailable" }; }
     }),
-    configSource: { state: configState, path: text(configPath), sourceState }, configuration,
-    running: { state: text(gateway?.state) ?? "unavailable", activatedAt: text(gateway?.activatedAt),
+    configSource: { state: configState, path: safeText(configPath), sourceState }, configuration,
+    running: { state: safeText(gateway?.state) ?? "unavailable", activatedAt: safeText(gateway?.activatedAt),
       outboundReady: typeof connector?.outboundReady === "boolean" ? connector.outboundReady : null,
       inboundReady: typeof connector?.inboundReady === "boolean" ? connector.inboundReady : null,
-      inboundState: text(inbound?.state) ?? "unverified",
+      inboundState: safeText(inbound?.state) ?? "unverified",
       // Delivery health beside the socket state: an open socket is not proof that events arrive.
-      inboundDelivery: text(inbound?.delivery), inboundEventsMissingSince: text(inbound?.eventsMissingSince), applied },
-    state, nextAction, verification,
-    registry: { state: registry.ok ? "available" : "unavailable", path: text(join(home, "gateway", "humans")) },
+      inboundDelivery: safeText(inbound?.delivery), inboundEventsMissingSince: safeText(inbound?.eventsMissingSince), applied },
+    state, nextAction,
+    relay: relaySummary,
+    registry: { state: registry.ok ? "available" : "unavailable", path: safeText(join(home, "gateway", "humans")) },
     humans: registry.ok ? registry.entities.map((h) => ({
       browserKey: browserKey(h.entityId),
-      entityId: text(h.entityId) ?? "[withheld]", address: text(h.address) ?? "[withheld]", displayName: text(h.displayName), class: h.class, away: h.prefs.away ?? null,
+      entityId: safeText(h.entityId) ?? "[withheld]", address: safeText(h.address) ?? "[withheld]", displayName: safeText(h.displayName), class: h.class, away: h.prefs.away ?? null,
       deliveryClass: h.prefs.deliveryClass, availability: h.prefs.availability ?? (h.prefs.away ? "away" : "available"),
       excluded: cfg ? cfg.outboundDestinations.length > 0 && !cfg.outboundDestinations.includes(h.address) : null,
       bindings: h.connectorBindings.map((b) => ({ browserKey: browserKey(JSON.stringify([b.kind, b.connectorRef, b.role, b.handle ?? null])),
-        kind: b.kind, ref: text(b.connectorRef), role: b.role, handle: text(b.handle), credentialReference: Boolean(b.secretsRef) })),
+        kind: b.kind, ref: safeText(b.connectorRef), role: b.role, handle: safeText(b.handle), credentialReference: Boolean(b.secretsRef) })),
     })) : [],
   };
-}
-
-/** Bounded tail of the EXISTING audit log; no second cache or freshness policy. */
-function latestVerification(home: string, digest: string | null) {
-  const empty = { state: "unverified", at: null as string | null, actor: null as string | null };
-  const file = join(home, "state", "human-channel-operations.jsonl");
-  let fd: number | undefined;
-  try {
-    fd = openSync(file, "r");
-    const size = fstatSync(fd).size;
-    const start = Math.max(0, size - 64 * 1024);
-    const bytes = Buffer.alloc(size - start);
-    readSync(fd, bytes, 0, bytes.length, start);
-    const lines = bytes.toString("utf8").split("\n");
-    if (start) lines.shift();
-    for (const line of lines.reverse()) {
-      if (!line.trim()) continue;
-      const r = JSON.parse(line) as ChannelOperation;
-      if (r.action !== "verify" || r.subject !== "slack") continue;
-      if (!digest || r.before?.digest !== digest) return { ...empty, state: "changed" };
-      if (typeof r.at !== "string" || !Number.isFinite(Date.parse(r.at))) return { ...empty, state: "indeterminate" };
-      return { state: r.effect !== "observed" ? "indeterminate" : r.after?.ready === true ? "ready-at-check"
-        : r.after?.ready === false ? "failed" : "indeterminate", at: r.at,
-        // Actor is an identity; reason/connector responses are deliberately omitted.
-        actor: typeof r.actor === "string" ? r.actor.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 120) : null };
-    }
-    return empty;
-  } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? empty : { ...empty, state: "indeterminate" }; }
-  finally { if (fd !== undefined) closeSync(fd); }
 }

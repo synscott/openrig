@@ -20,6 +20,25 @@ it("reads v1 extensions without importing authored live facts", () => {
   expect(value.members).toEqual([member]);
   expect(() => parseRoster({ ...authored, version: 2 })).toThrow("version 1");
 });
+it("shows a hosted member's last call only for a roster row on this host; another host's same-named seat is unknown", () => {
+  const home = mkdtempSync(join(tmpdir(), "roster-presence-"));
+  folders.push(home);
+  vi.stubEnv("OPENRIG_HOME", home);
+  writeFileSync(join(home, "mcp-http-presence.json"), JSON.stringify({ version: 1, seats: { "bot@team": { grant: "bot", lastCallAt: "2026-10-26T18:00:00.000Z" } } }));
+  const local = { ...member, seat: "bot@team", host: "host-a", hosted: true };
+  const here = { ...inventory([]), localHostId: "host-a" };
+  expect(enrichRosterMember(local, here).live).toMatchObject({ lastCallAt: "2026-10-26T18:00:00.000Z" });
+  expect(enrichRosterMember({ ...local, host: "host-b" }, here).live).toMatchObject({ lastCallAt: null });
+  expect(enrichRosterMember(local, { ...here, localHostId: null }).live).toMatchObject({ lastCallAt: null });
+  vi.unstubAllEnvs();
+});
+
+it("keeps an authored hosted flag, refuses one that isn't a boolean, and says a hosted member has no pane", () => {
+  const hosted = { ...member, seat: "grok@studio", hosted: true };
+  expect(parseRoster({ ...authored, members: [hosted, { ...member, hosted: false }] }).members).toEqual([hosted, member]);
+  expect(() => parseRoster({ ...authored, members: [{ ...member, hosted: "yes" }] })).toThrow("hosted: true or false");
+  expect(enrichRosterMember(hosted, inventory()).live).toMatchObject({ status: "unknown", reason: expect.stringContaining("hosted member: it has no pane") });
+});
 it("joins exact host self-id and seat, never the caller alias", () => {
   expect(enrichRosterMember(member, inventory()).live).toMatchObject({ status: "reported", runtime: "claude-code", configuredModel: "configured-a", observedModel: null, agentActivity: { sampledAt: node.agentActivity.sampledAt } });
   expect(enrichRosterMember(member, inventory([{ ...node, hostSelfId: "different", hostId: member.host } as typeof node])).live).toMatchObject({ status: "unknown", runtime: null, configuredModel: null });
@@ -53,7 +72,7 @@ it("preserves fan-out gaps in JSON and text, without claiming availability", asy
   await new Command().addCommand(rosterCommand({ folder: () => p, inventory: async () => unavailable })).parseAsync(["roster", "show", "production", "--json"], { from: "user" });
   const result = JSON.parse(logs.mock.calls[0]![0]); expect(result.roster.members[0].live.status).toBe("unknown"); expect(result.observations.sources).toEqual(unavailable.sources);
   await new Command().addCommand(rosterCommand({ folder: () => p, inventory: async () => unavailable })).parseAsync(["roster", "find", "colour"], { from: "user" });
-  expect(logs.mock.calls.flat().join("\n")).toContain("observed model unknown"); expect(errors.mock.calls.flat().join("\n")).toContain("one host unavailable");
+  expect(logs.mock.calls.flat().join("\n")).toContain("last observed model UNKNOWN"); expect(errors.mock.calls.flat().join("\n")).toContain("one host unavailable");
 });
 
 it.skipIf(process.platform === "win32")("skips a FIFO without blocking or losing regular rosters", async () => {
@@ -66,4 +85,51 @@ it.skipIf(process.platform === "win32")("skips a FIFO without blocking or losing
   const result = JSON.parse(stdout);
   expect(result.rosters.map((r: { id: string }) => r.id)).toEqual(["production"]);
   expect(result.warnings).toEqual(["waiting.json: Not a regular file; skipped"]);
+});
+
+it("reports the occupant's observed model separately from its configured model, retaining host gaps", () => {
+  const observation = { status: "observed", model: "claude-opus-example", source: "claude-assistant-response", observedAt: "2026-10-18T23:00:00.000Z", generation: "current", reason: null };
+  const sample: RosterInventory = { readAt: "2026-10-18T23:01:00Z", nodes: [{ ...node, modelObservation: observation }], sources: [{ scope: "registered-hosts", status: "partial", error: "offline peer" }] };
+  const live = enrichRosterMember(member, sample).live;
+  expect(live.configuredModel).toBe("configured-a");
+  expect(live.observedModel).toBe("claude-opus-example");
+  expect(live).toMatchObject({ modelObservation: observation });
+  expect(sample.sources[0]?.status).toBe("partial");
+});
+
+it.each(["model", "time", "unknown", "generation"])("r2: preserves registry fields when duplicate routes disagree only on observation %s", kind => {
+  const observation = { status: "observed", model: "model-a", source: "codex-turn-context", observedAt: "2026-10-18T23:00:00.000Z", generation: "current", reason: null };
+  const other = kind === "model" ? { ...observation, model: "model-b" }
+    : kind === "time" ? { ...observation, observedAt: "2026-10-18T23:00:01.000Z" }
+    : kind === "generation" ? { ...observation, generation: "replacement" }
+    : { status: "unknown", model: null, source: null, observedAt: null, generation: "current", reason: "model-record-unavailable" };
+  const sample: RosterInventory = { readAt: "2026-10-18T23:01:00Z", nodes: [{ ...node, modelObservation: observation }, { ...node, modelObservation: other }], sources: [] };
+  expect(enrichRosterMember(member, sample).live).toMatchObject({ status: "reported", configuredModel: "configured-a", runtime: "claude-code", sessionStatus: "running", agentActivity: node.agentActivity });
+  expect(enrichRosterMember(member, sample).live.observedModel).toBeNull();
+  expect(enrichRosterMember(member, sample).live).toMatchObject({ modelObservation: { status: "unknown", reason: "conflicting-observations" } });
+});
+
+it("does not choose the first duplicate route when activity observations conflict", () => {
+  const idle = { ...node, agentActivity: { state: "idle", sampledAt: "2026-10-01T00:00:00Z" } };
+  const working = { ...node, agentActivity: { state: "working", sampledAt: "2026-10-01T00:00:00Z" } };
+  for (const nodes of [[idle, working], [working, idle]]) {
+    const live = enrichRosterMember(member, { readAt: "2026-10-01T00:00:01Z", nodes, sources: [] }).live;
+    expect(live).toMatchObject({ status: "reported", runtime: "claude-code", configuredModel: "configured-a",
+      agentActivity: { state: "unknown", reason: "Conflicting activity observations", sampledAt: null } });
+  }
+  expect(enrichRosterMember(member, { readAt: "2026-10-01T00:00:01Z", nodes: [idle, idle], sources: [] }).live.agentActivity)
+    .toEqual({ state: "idle", reason: null, sampledAt: "2026-10-01T00:00:00Z" });
+  const later = { ...idle, agentActivity: { ...idle.agentActivity, sampledAt: "2026-10-01T00:00:01Z" } };
+  const missing = { ...idle, agentActivity: null };
+  for (const nodes of [[idle, later], [later, idle]]) {
+    expect(enrichRosterMember(member, { readAt: "2026-10-01T00:00:02Z", nodes, sources: [] }).live.agentActivity)
+      .toEqual({ state: "idle", reason: null, sampledAt: "2026-10-01T00:00:01Z" });
+  }
+  for (const nodes of [[idle, missing], [missing, idle]]) {
+    expect(enrichRosterMember(member, { readAt: "2026-10-01T00:00:02Z", nodes, sources: [] }).live.agentActivity)
+      .toEqual({ state: "unknown", reason: "Conflicting activity observations", sampledAt: null });
+  }
+  const unclocked = { ...idle, agentActivity: { ...idle.agentActivity, sampledAt: null } };
+  expect(enrichRosterMember(member, { readAt: "2026-10-01T00:00:02Z", nodes: [idle, unclocked], sources: [] }).live.agentActivity)
+    .toEqual({ state: "idle", reason: null, sampledAt: null });
 });

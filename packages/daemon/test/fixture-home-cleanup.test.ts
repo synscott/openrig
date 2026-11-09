@@ -10,6 +10,7 @@ import { createRequire } from "node:module";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
+/** Run the real setup in a child and return its paths after exit-time cleanup. */
 function runSetup(env: Record<string, string | undefined> = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-home-run-"));
   roots.push(tmp);
@@ -21,7 +22,10 @@ function runSetup(env: Record<string, string | undefined> = {}) {
     env: { PATH: process.env.PATH, TMPDIR: tmp, ...env },
   });
   expect(child.status, child.stderr).toBe(0);
-  const homes = JSON.parse(child.stdout.trim().split("\n").pop()!) as { openrigHome: string; home: string; tmpdir: string; scratch: string };
+  const homes = JSON.parse(child.stdout.trim().split("\n").pop()!) as {
+    openrigHome: string; home: string; tmpdir: string; scratch: string;
+    osHome: string; codexHome?: string; claudeConfigDir?: string; xdgConfig: string; codexVersion: string;
+  };
   return { tmp, ...homes };
 }
 const fixtureEntries = (tmp: string) => fs.readdirSync(tmp).filter((name) => name.startsWith(".openrig-test-fixture-home-"));
@@ -29,7 +33,34 @@ const fixtureEntries = (tmp: string) => fs.readdirSync(tmp).filter((name) => nam
  *  Not tsx's loader cache, which the child's launcher makes before the setup runs. */
 const leftovers = (tmp: string) => fs.readdirSync(tmp).filter((name) => !name.startsWith("tsx-"));
 
-describe.skipIf(process.env["OPENRIG_E2E_REAL_CODEX"] === "1")("fixture homes are removed when the worker exits", () => {
+describe("fixture homes are removed when the worker exits", () => {
+  it.each([undefined, "1"])("isolates provider homes and runtime lookup with native opt-in=%s", optIn => {
+    const { tmp, openrigHome, home, osHome, codexHome, claudeConfigDir, xdgConfig, codexVersion } = runSetup({
+      HOME: "/synthetic-host-home", CODEX_HOME: "/synthetic-host-codex",
+      CLAUDE_CONFIG_DIR: "/synthetic-host-claude", XDG_CONFIG_HOME: "/synthetic-host-xdg",
+      OPENRIG_E2E_REAL_CODEX: optIn,
+    });
+    expect(home).toBe(`${openrigHome}-user-home`);
+    expect(osHome).toBe(home);
+    expect(codexHome).toBeUndefined();
+    expect(claudeConfigDir).toBeUndefined();
+    expect(xdgConfig).toBe(path.join(home, ".config"));
+    expect(codexVersion).toBe("codex-cli 0.139.0");
+    expect(leftovers(tmp)).toEqual([]);
+  });
+
+  it.skipIf(process.platform !== "darwin").each([false, true])("handles an explicit macOS per-user TMPDIR (keep=%s)", keep => {
+    const systemTmp = spawnSync("getconf", ["DARWIN_USER_TEMP_DIR"], { encoding: "utf8" });
+    expect(systemTmp.status, systemTmp.stderr).toBe(0);
+    const supplied = fs.mkdtempSync(path.join(fs.realpathSync(systemTmp.stdout.trim()), "fixture-override-"));
+    roots.push(supplied);
+    const { openrigHome, tmpdir, scratch } = runSetup({ TMPDIR: supplied, OPENRIG_TEST_KEEP_TMPDIR: keep ? "1" : undefined });
+    expect(path.dirname(openrigHome)).toBe(keep ? supplied : fs.realpathSync("/tmp"));
+    expect(keep ? tmpdir : path.dirname(tmpdir)).toBe(keep ? supplied : fs.realpathSync("/tmp"));
+    expect(fs.existsSync(openrigHome)).toBe(false);
+    expect(leftovers(supplied)).toEqual(keep ? [path.basename(scratch)] : []);
+  }, 65_000);
+
   it("removes the fixture home and the user home", () => {
     const { tmp, openrigHome, home } = runSetup();
     expect(path.dirname(openrigHome)).toBe(tmp);

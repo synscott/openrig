@@ -31,7 +31,10 @@ export type FindingKind =
   // SPEC.md compatibility — a node carrying BOTH authored files. Advisory by
   // construction (low severity never flips the exit code): SPEC.md wins, and the
   // shadowed README.md is a state to notice, never a failure to gate on.
-  | "shadowed_node_file";
+  | "shadowed_node_file"
+  // Another mission has a slice folder of the same name, which the slice list and the name-only routes
+  // hide. Advisory (low severity): renaming is the person's call.
+  | "slice_name_shared";
 
 export interface AuditFinding {
   kind: FindingKind;
@@ -165,6 +168,11 @@ export function deriveMissionDependencyGraph(input: MissionDependencyGraphInput)
 // construction — the generated output can never trip malformed_mission_brief
 // without this file changing too).
 export const MISSION_BRIEF_HEADERS = ["What & why", "Building", "Progress", "Proven", "Needs you", "Pointers"];
+
+// A slice directory's name: two or more digits, a dash, then the slug. `rig scope slice create` numbers past 99
+// (100-…), so a two-digit-only check flags names OpenRig made. The CLI audit and the daemon's audit route both read
+// this one pattern.
+export const SLICE_DIRECTORY_NAME = /^\d{2,}-/;
 
 function childPath(parent: string, child: string): string {
   return parent.endsWith("/") ? `${parent}${child}` : `${parent}/${child}`;
@@ -422,7 +430,7 @@ export function classifyScopeItem(input: ScopeAuditInput): ScopeAuditResult {
       });
     }
 
-    // PM dogfood #1 (qitem-20260720015700-630eef64) — per-SECTION source
+    // PM dogfood #1 — per-SECTION source
     // selection, decided independently for `## Mini-requirements` and
     // `## Proof contract`: an authored PRD section is canonical, but a
     // PRESENT-and-PRISTINE scaffold-only PRD section yields to an authored

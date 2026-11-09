@@ -6,7 +6,8 @@ const f = vi.hoisted(() => ({ serve: vi.fn(), createDaemon: vi.fn(), fetch: vi.f
   contextStart: vi.fn(), contextStop: vi.fn(), eventStop: vi.fn(), markStop: vi.fn() }));
 vi.mock("@hono/node-server", () => ({ serve: f.serve }));
 vi.mock("../src/startup.js", () => ({ createDaemon: f.createDaemon }));
-vi.mock("../src/adapters/bounded-probe-exec.js", () => ({
+vi.mock("../src/adapters/bounded-probe-exec.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/adapters/bounded-probe-exec.js")>(),
   endProbeGroupsOnStartupSignal: () => () => {}, stopRuntimeProbes: async () => {},
 }));
 
@@ -33,6 +34,7 @@ describe("required Windows control startup completion", () => {
     f.createDaemon.mockResolvedValue({
       app: { fetch: f.fetch }, contextMonitor: { start: f.contextStart, stop: f.contextStop },
       eventLoopMonitor: { stop: f.eventStop }, injectWebSocket: vi.fn(),
+      wakeRecovery: { start: vi.fn(), stop: vi.fn() },
       deps: { rigRepo: { db: {} }, settingsStore: { resolveOne: () => ({ value: false }) },
         daemonLifecycleStore: { recordHeartbeat: vi.fn(), recordStop: f.markStop },
         tmuxAdapter: { closeControlClient: vi.fn() } },

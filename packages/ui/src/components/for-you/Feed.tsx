@@ -180,7 +180,8 @@ export function hydratedCardKind(
   // signals are enforced at the write path, guessing is worse than reading.
   if (item.tier === "human-gate") return "approval";
   const state = item.state.toLowerCase();
-  if (state === "done" || state === "closed" || state === "completed") return "shipped";
+  const hasQuestions = Array.isArray(item.humanQuestions) && item.humanQuestions.length > 0;
+  if ((state === "done" || state === "closed" || state === "completed") && !(isQueueDerivedFeedCard(card) && hasQuestions)) return "shipped";
   if (isHumanSeat(item.destinationSession)) return "action-required";
   return card.kind;
 }
@@ -278,7 +279,7 @@ export function Feed() {
   // currentSeqs. Queue-derived synthetic cards carry seq=-1, which
   // would pin min-seq at -1 and prevent the auto-prune for
   // event-derived dismissals (guard re-verify-2
-  // qitem-20260518192210 CLEANUP-1). eventDerivedSeqsForPrune
+  // CLEANUP-1). eventDerivedSeqsForPrune
   // filters them OUT — their dismissal lives in useDismissedCardIds.
   const rawCardSeqs = useMemo(() => eventDerivedSeqsForPrune(rawCards), [rawCards]);
   const rawCardIds = useMemo(() => rawCards.map((c) => c.id), [rawCards]);

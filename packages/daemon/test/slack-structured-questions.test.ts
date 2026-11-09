@@ -27,7 +27,7 @@ import { formatHumanAnswers, unansweredQuestions } from "../src/domain/human-que
 
 const human = "human-founder@external";
 const registry = { ok: true as const, entities: [{ entityId: "human-founder", class: "human" as const, displayName: "Founder", address: human, connectorBindings: [{ kind: "slack" as const, connectorRef: "primary", secretsRef: "env:SLACK_BOT_TOKEN", role: "primary" as const, handle: "UFOUNDER" }], prefs: { deliveryClass: "A" as const } }] };
-const request = { sourceSession: "author@rig", destinationSession: human, summary: "Two quick questions", body: "Pick one for each; my recommendation is marked.", evidenceRef: "/private/proof.md", nudge: false };
+const request = { humanAlert: true, sourceSession: "author@rig", destinationSession: human, summary: "Two quick questions", body: "Pick one for each; my recommendation is marked.", evidenceRef: "/private/proof.md", nudge: false };
 const questions = [
   { id: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres", recommended: true }, { id: "sqlite", label: "SQLite" }] },
   { id: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }] },
@@ -159,7 +159,8 @@ describe("structured human questions (#193)", () => {
       const { text } = render();
       for (const s of ["Which database?", "Postgres (recommended)", "SQLite", "Ship this week?", "Yes", "No"]) expect(text).toContain(s);
       expect(text).toMatch(/reply in this thread/i);
-      expect(JSON.stringify(render().blocks)).toMatch(/reply in this thread/i);
+      expect(text).toContain("A typed reply submits your answer without waiting for every question");
+      expect(JSON.stringify(render().blocks)).toContain("A typed reply submits your answer without waiting for every question");
     });
 
     it("escapes question and option text like any other queue-authored field", () => {
@@ -167,6 +168,24 @@ describe("structured human questions (#193)", () => {
       const json = JSON.stringify(blocks);
       expect(json).not.toContain("<!channel>");
       expect(json).toContain("&lt;!channel&gt;");
+    });
+
+    it.each([{ sharedChannel: false }, { sharedChannel: true }])("a resolved notice carries no buttons and no reply hint, in blocks or fallback (sharedChannel=$sharedChannel)", ({ sharedChannel }) => {
+      const resolved = buildOutboundMessage({ qitemId: "q", summary: "Two quick questions", body: "Pick one for each.", humanQuestions: questions, ownerNotificationKind: "human-decision-resolved", sharedChannel }, { sourceLabel: "proof" });
+      expect((resolved.blocks as Block[]).some((b) => b.type === "actions")).toBe(false);
+      expect(JSON.stringify(resolved.blocks)).not.toMatch(/reply in this thread|Or reply in this thread/i);
+      expect(resolved.text).not.toMatch(/reply in this thread/i);
+      // The question still reads as history: its text and options are kept, without the live controls.
+      for (const s of ["Which database?", "Postgres (recommended)", "Ship this week?", "No"]) expect(resolved.text).toContain(s);
+    });
+
+    it("an open ask keeps its buttons and reply hint, and so does a shared-channel ask", () => {
+      for (const sharedChannel of [false, true]) {
+        const open = buildOutboundMessage({ qitemId: "q", summary: "S", body: "B", humanQuestions: questions, ownerNotificationKind: "human-required", sharedChannel }, { sourceLabel: "proof" });
+        const hasButtons = (open.blocks as Block[]).some((b) => b.type === "actions");
+        expect(hasButtons).toBe(!sharedChannel);
+        expect(open.text).toMatch(/reply in this thread/i);
+      }
     });
 
     it("renders a plain decision exactly as before", () => {
@@ -384,9 +403,35 @@ describe("structured human questions (#193)", () => {
       await click("ship", "yes", { actionTs: "2001.1" }); // a real late click
       await click("ship", "yes", { actionTs: "2001.1" }); // and its redelivery
       await vi.waitFor(() => expect(threadAcks()).toHaveLength(3));
-      expect(threadAcks()[2]).toBe(CLICK_REPLIES.closed);
-      expect(threadAcks().filter((t) => t === CLICK_REPLIES.closed)).toHaveLength(1);
+      expect(threadAcks()[2]).toContain("Already answered; the original answer went to author@rig as ");
+      expect(threadAcks().filter((t) => t.startsWith("Already answered"))).toHaveLength(1);
       expect(repliesToSeat()).toHaveLength(1);
+    });
+
+    it("a late click on a decision made on the person's behalf names who decided it, under which mode, and what", async () => {
+      repo.db.prepare("UPDATE queue_items SET delegated_decision = ? WHERE qitem_id = ?").run(JSON.stringify({ applicationId: "a-1", modeName: "asleep",
+        decisionRoom: { words: "database choices", exclusions: [] }, decidedBy: "builder@rig", decidedAt: "2026-10-21T02:00:00.000Z", reason: "recommended", reversible: false,
+        choices: [{ questionId: "db", question: "Which database?", options: [{ id: "pg", label: "Postgres" }], chosen: "pg" },
+          { questionId: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Yes" }], chosen: "yes" }] }), decisionId);
+      await repo.update({ qitemId: decisionId, actorSession: "builder@rig", state: "done", closureReason: "no-follow-on" } as never);
+      await click("db", "mysql");
+      await vi.waitFor(() => expect(threadAcks()).toHaveLength(1));
+      expect(threadAcks()[0]).toBe("This was decided on your behalf by builder@rig under asleep: Postgres, Yes (it can't be undone). "
+        + "Your click wasn't recorded; it's listed in that mode's account.");
+      expect(repo.getById(decisionId)?.humanAnswers).toBeNull();
+    });
+
+    it("the reply naming a decision made for the person goes through the same escaping and redaction as other replies", async () => {
+      repo.db.prepare("UPDATE queue_items SET delegated_decision = ? WHERE qitem_id = ?").run(JSON.stringify({ applicationId: "a-1", modeName: "asleep <!channel>",
+        decisionRoom: { words: "database choices", exclusions: [] }, decidedBy: "builder@rig", decidedAt: "2026-10-21T02:00:00.000Z", reason: "recommended", reversible: true,
+        choices: [{ questionId: "db", question: "Which database?", options: [{ id: "pg", label: "Notify <!here>" }], chosen: "pg" },
+          { questionId: "ship", question: "Ship this week?", options: [{ id: "yes", label: "Use xoxb-LEAK-label" }], chosen: "yes" }] }), decisionId);
+      await repo.update({ qitemId: decisionId, actorSession: "builder@rig", state: "done", closureReason: "no-follow-on" } as never);
+      await click("db", "mysql");
+      await vi.waitFor(() => expect(threadAcks()).toHaveLength(1));
+      expect(threadAcks()[0]).toContain("under asleep &lt;!channel&gt;: Notify &lt;!here&gt;, ");
+      expect(threadAcks()[0]).toContain("[redacted-secret]");
+      expect(threadAcks()[0]).not.toMatch(/<!here>|<!channel>|xoxb-LEAK/);
     });
 
     it("tells the person when a button no longer matches the decision, or its message can't be matched", async () => {
@@ -416,7 +461,7 @@ describe("structured human questions (#193)", () => {
       expect(threadAcks()).toHaveLength(1);
       await click("ship", "yes", { actionTs: "2200.1" }); // Socket Mode redelivery of that click
       await vi.waitFor(() => expect(threadAcks()).toHaveLength(2));
-      expect(threadAcks()[1]).toBe(CLICK_REPLIES.onRecord);
+      expect(threadAcks()[1]).toContain("Already answered; the original answer went to author@rig as ");
       await click("ship", "yes", { actionTs: "2200.1" }); // and once posted, never again
       expect(threadAcks()).toHaveLength(2);
       expect(repliesToSeat()).toHaveLength(1);
@@ -494,6 +539,22 @@ describe("structured human questions (#193)", () => {
       );
       expect(repliesToSeat()).toHaveLength(1);
       expect(repliesToSeat()[0]?.body).toContain(text);
+      expect(repliesToSeat()[0]?.body).toContain("Read the person's words; closing the decision does not mean approval.");
+    });
+
+    it("#2299 recognizes an old-footer answer replay after the ask closes, but not a different event", async () => {
+      const text = "Not yet, revise the plan.";
+      await typeReply(text, { ts: "3001.1" });
+      const answer = repliesToSeat()[0]!;
+      const oldBody = answer.body.replace("\nRead the person's words; closing the decision does not mean approval.", "");
+      repo.db.prepare("UPDATE queue_items SET body = ? WHERE qitem_id = ?").run(oldBody, answer.qitemId);
+      rmSync(join(home, "state", "slack-inbound-seen.jsonl"), { force: true });
+      await typeReply(text, { ts: "3001.1" });
+      expect(repliesToSeat()).toHaveLength(1);
+      expect(repliesToSeat()[0]!.body).toBe(oldBody);
+      await typeReply("A different follow-up.", { ts: "3002.1" });
+      expect(repliesToSeat()).toHaveLength(2);
+      expect(repliesToSeat().some((row) => row.body.includes("A different follow-up."))).toBe(true);
     });
 
     it("preserves a previous button answer when the remaining question gets a typed reply", async () => {

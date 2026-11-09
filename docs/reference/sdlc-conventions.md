@@ -144,6 +144,23 @@ changes either. `rig scope` reads an `established` or `canonical` slice whose
 `verified:` is missing, has no source, names a tool-scaffolded placeholder, or is
 older than 90 days as `provisional`.
 
+A slice's frontmatter may also carry `status:`. `GET /api/slices` reports the
+bucket each word falls in as the slice's `status`, and its
+`?filter=all|active|done|blocked` filters on that bucket:
+
+| `status:` word | Bucket |
+| --- | --- |
+| `active`, `in-flight`, `ratified` | `active` |
+| `draft`, `draft-pending-orch-ratification`, `placeholder` | `draft` |
+| `done`, `shipped`, `promoted`, `closed` | `done` |
+| `blocked`, `parked-with-evidence` | `blocked` |
+
+Words are matched ignoring case. Any other word is matched by what it contains:
+`done`, `ship` or `close` makes it `done`; `block` or `park`, `blocked`; `draft`
+or `pending`, `draft`. A word that matches none of these counts as `active`, so a
+slice marked `complete` counts as `active`. A slice with no `status:` counts as
+`draft`.
+
 When the owning scope selects `proofPolicy.judges`, use `rig proof judge` to
 record an attributed accept, reject or withdraw decision on a contract item,
 and `rig proof show` to read derived readiness up through slice, mission and
@@ -165,6 +182,12 @@ commit. Evidence capture (`proof add`), policy acceptance, higher outcome
 judgment and publication are distinct. This optional component does not select
 Part B or add a mandatory review gate.
 
+A judgment binds the slice's path, the item's text and the policy. Moving or
+renaming a slice (`rig scope slice move`, or by hand) reopens its judged items:
+`rig proof show` reports each as `unknown`, and each needs a new judgment on its
+current revision. `rig scope audit` checks structure only and never reads proof
+readiness, so a passing audit doesn't mean the proof still stands.
+
 The project readiness that `rig proof show --project` reports counts only
 missions whose `mission.yaml` carries `metadata.status: active` or
 `metadata.status: release-candidate`. `rig scope mission create` writes
@@ -172,9 +195,13 @@ missions whose `mission.yaml` carries `metadata.status: active` or
 a mission does not change the project's readiness. A `planned` mission stays
 outside the rollup, even after its slices are accepted, until someone changes
 its status to `active` (or `release-candidate` for a release that is ready to
-judge). Nothing changes the status automatically. Missions created before this
-default carry no status and are not counted either; add the line by hand to
-include them.
+judge). Nothing changes the status automatically. A mission can also carry
+`metadata.status: complete`, which only `POST /api/missions/:missionId/complete`
+writes (no `rig` verb does); a `complete` mission is outside the rollup too.
+Missions created before this default carry no status and are not counted either;
+add the line by hand to include them. It also writes `metadata.name`, the mission's folder name, which
+the project lifecycle compiler requires; a mission created without it refuses to
+compile with `lifecycle_field_missing` until you add that line.
 
 The three sections project into the UI's one review structure: a vertical
 stack of **INTENT → PLAN → DELIVERED**. A slice missing a section still

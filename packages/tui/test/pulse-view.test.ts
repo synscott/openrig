@@ -48,7 +48,7 @@ describe("PULSE view (5.2 Wave B — increment 1: static skeleton from the appro
     expect(body).toContain("dev50-driver@openrig-build");
     // label==referent: the blocking AGENT is named (resolved blockerSession), NOT the qitem pointer
     expect(body).toContain("blocked on review-r1@openrig-build");
-    expect(body).not.toContain("qitem-20260805-review");
+    expect(body).not.toContain("qitem-demo-05-review");
     expect(body).toContain("terminal verdict for 51209941");
     expect(body).not.toContain("human sign-off pending"); // human-blocked → not here
 
@@ -63,8 +63,16 @@ describe("PULSE view (5.2 Wave B — increment 1: static skeleton from the appro
     expect(iBlocked).toBeLessThan(iLanes);
   });
 
+  it("draws JUST FINISHED clocks in the TUI's time zone", () => {
+    const v = createViewState({ instanceId: "t", timeZone: "Asia/Kolkata", ...withSnap });
+    v.dispatch({ type: "tab", tab: "pulse" });
+    const body = renderScreen(v.get(), snap, { cols: 140, rows: 44, nowMs: DEMO_NOW }).lines.join("\n");
+    expect(body).toContain("17:14");
+    expect(body).not.toContain("11:44");
+  });
+
   it("builds the three lanes + footer LIVE from the demo snapshot (label==referent honesty)", () => {
-    const v = createViewState({ instanceId: "t", ...withSnap });
+    const v = createViewState({ instanceId: "t", timeZone: "UTC", ...withSnap });
     v.dispatch({ type: "tab", tab: "pulse" });
     const body = renderScreen(v.get(), snap, { cols: 140, rows: 44, nowMs: DEMO_NOW }).lines.join("\n");
 

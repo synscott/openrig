@@ -112,10 +112,53 @@ const RETIRED_TEACHING =
 const MANIFEST_FIRST_STEP =
   "`rig slack manifest --url` prints a link that creates your own Slack app from OpenRig's manifest (see `rig slack manifest --help`)";
 
-// #192: a saved config change reaches the running connector when it next rewires.
+// #192: a saved map change reaches the running connector at a daemon restart. Disable then enable rewires too, but
+// enabling marks alerts still waiting to be posted as already seen, so it isn't the advice.
 const CHANNEL_MAP_APPLY =
   "Invite the app to every mapped channel, then `rig slack verify`. A running connector picks up the change " +
-  "when it next rewires (`rig slack disable` then `rig slack enable`, or a daemon restart).";
+  "at a daemon restart (`rig daemon stop`, then `rig daemon start`). Don't use `rig slack disable` then " +
+  "`rig slack enable` for it: enabling marks alerts still waiting to be posted as already seen.";
+
+const POST_OPEN_ASKS = "`rig slack post-open-asks`";
+
+type OpenAskOutcome = "posted" | "already-posted" | "queued" | "held" | "below-floor" | "no-longer-active" | "superseded"
+  | "recipient-changed" | "state-unavailable" | "transport-failed" | "uncertain";
+interface OpenAsk { qitemId: string; recipient: string; summary: string | null; outcome: OpenAskOutcome; detail?: string }
+interface PostOpenAsksResponse { ok: boolean; asks: OpenAsk[] }
+
+const OUTCOME_LABEL: Record<OpenAskOutcome, string> = {
+  posted: "posted",
+  "already-posted": "already posted",
+  queued: "queued, awaiting receipt",
+  held: "held",
+  "below-floor": "below the posting floor",
+  "no-longer-active": "no longer active",
+  superseded: "superseded",
+  "recipient-changed": "recipient changed",
+  "state-unavailable": "state unavailable",
+  "transport-failed": "transport failed",
+  uncertain: "uncertain",
+};
+
+/** #1679: one count line, one line per ask, then what to do about the outcomes that need it. */
+export function describeOpenAsks(asks: OpenAsk[]): string[] {
+  if (asks.length === 0) return ["No open asks to show."];
+  const counts = new Map<OpenAskOutcome, number>();
+  for (const ask of asks) counts.set(ask.outcome, (counts.get(ask.outcome) ?? 0) + 1);
+  const lines = [`${asks.length} open ask(s): ${[...counts].map(([outcome, n]) => `${n} ${OUTCOME_LABEL[outcome]}`).join(", ")}`];
+  for (const ask of asks) {
+    const detail = ask.detail ? ` (${ask.detail})` : "";
+    lines.push(`  ${OUTCOME_LABEL[ask.outcome]}: ${ask.qitemId} for ${ask.recipient}: ${ask.summary ?? "(no summary)"}${detail}`);
+  }
+  if (counts.has("queued") || counts.has("uncertain")) {
+    lines.push(`Queued or uncertain asks have no Slack receipt yet. Run ${POST_OPEN_ASKS} again later to see where they landed; it reuses each ask's decision rather than offering it again.`);
+  }
+  if (counts.has("state-unavailable")) {
+    lines.push(`No new offer was made for an ask whose state couldn't be read; its detail says what couldn't be read and what is known. Run ${POST_OPEN_ASKS} again once that reads, and the same ask continues.`);
+  }
+  if (counts.has("transport-failed")) lines.push("A transport failure is on the ask's row, and `rig queue undelivered` lists it for the seat that asked.");
+  return lines;
+}
 
 function resolveSecrets(surface: SlackSurface, cfg: SlackConnectorConfig): { bot: string | null; app: string | null } {
   const envFile = cfg.secretsEnvFile ?? undefined;
@@ -143,6 +186,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
     .option("--source-label <label>", "label shown in the posted message footer (where the queue lives)")
     .option("--secrets-env-file <path>", "path to the 0600 env file with SLACK_BOT_TOKEN / SLACK_APP_TOKEN")
     .option("--required-scopes <csv>", "comma-separated bot scopes to require at verify time")
+    .option("--reactions <mode>", "what a person's emoji reaction on an OpenRig post does: route (default) makes a row for the seat that asked; off ignores reactions, so an acknowledging emoji costs no agent turn")
     .option("--reason <reason>", "Reason recorded with the configuration change", "configure human delivery")
     .option("--actor <actor>", "Named operator when outside a managed seat")
     .action(async (opts) => {
@@ -157,6 +201,7 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         sourceLabel: opts.sourceLabel ?? cur.sourceLabel,
         secretsEnvFile: opts.secretsEnvFile ?? cur.secretsEnvFile,
         requiredScopes: opts.requiredScopes ? String(opts.requiredScopes).split(",").map((s: string) => s.trim()).filter(Boolean) : cur.requiredScopes,
+        ...(opts.reactions !== undefined ? { reactions: opts.reactions } : {}),
       };
       const { runChannelOperation, channelStateDigest } = await import("@openrig/daemon/gateway-slack");
       const result = await runChannelOperation({
@@ -204,13 +249,24 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         log(`slack-connector configuration checks (config: ${cfg.enabled ? "enabled" : "disabled"}; delivery runs IN-DAEMON — S10 subsystem)`);
         for (const r of readiness) log(`  ${r.ok ? "✓" : "✗"} ${r.label}: ${r.detail}`);
         log(`Daemon: ${observation.state}${observation.reason ? ` (${observation.reason})` : ""}`);
-        const connector = observation.connector as { configurationDigest?: string;
-          deadLetterBacklog?: number | null; deadLetterBacklogState?: string; deadLetterBacklogReason?: string;
+        const connector = observation.connector as { configurationDigest?: string; inboundReady?: boolean; outboundReady?: boolean;
+          inboundRouting?: { fallback: string; destination: string };
+          settlement?: { pending: number; lastFailure: string | null };
+          deadLetterBacklog?: number | null; deadLetterBacklogState?: string; deadLetterBacklogReason?: string; relayAttemptsInFlight?: number;
           inbound?: InboundDeliveryStatus & { state?: string; generation?: number; lastEventAt?: string };
           recovery?: { state?: string; reason?: string; lastScanAt?: string; acceptedThisProcess?: number; deadLetteredThisProcess?: number;
             coverage?: { coverageStart: string; coveredThrough: string; pending?: { upper: string; nextLatest: string }; nextRetryAt?: number } | null;
+            channels?: Array<{ channel?: string | null; state?: string; reason?: string; lastScanAt?: string;
+              coverage?: { coverageStart: string; coveredThrough: string; nextRetryAt?: number } | null }>;
+            threads?: { state?: string; reason?: string; tracked?: number; scanned?: number; pending?: number; oldestPendingSeconds?: number | null;
+              backoff?: Record<string, number>; incomplete?: Record<string, number> };
             limits?: string[] } } | undefined;
         if (connector) {
+          if (connector.settlement) {
+            log(`  Ask edits: ${connector.settlement.pending} queued for reconciliation`);
+            if (connector.settlement.lastFailure) log(`  Last ask-edit failure: ${connector.settlement.lastFailure}`);
+          }
+          if (connector.inboundRouting?.fallback === "local") log(`  Configured routing fallback: local to ${connector.inboundRouting.destination} (after forwarding, thread and channel routes)`);
           log(`  Socket: ${connector.inbound?.state ?? "unknown"}; generation ${connector.inbound?.generation ?? "unknown"}; last event ${connector.inbound?.lastEventAt ?? "unknown"}`);
           for (const line of socketDeliveryLines(connector.inbound)) log(`  ${line}`);
           const recovery = connector.recovery;
@@ -221,7 +277,21 @@ export function slackCommand(deps: SlackDeps = {}): Command {
             if (coverage.pending) log(`  Pending interval to ${slackTime(coverage.pending.upper)}; next page before ${slackTime(coverage.pending.nextLatest)}`);
             if (coverage.nextRetryAt) log(`  Retry after: ${new Date(coverage.nextRetryAt).toISOString()}`);
           }
+          for (const c of recovery?.channels ?? []) {
+            const scanned = c.coverage ? `; scanned [${slackTime(c.coverage.coverageStart)}, ${slackTime(c.coverage.coveredThrough)})` : "";
+            const retry = c.coverage?.nextRetryAt ? `; retry after ${new Date(c.coverage.nextRetryAt).toISOString()}` : "";
+            log(`  Recovery, channel ${c.channel ?? "unknown"}: ${c.state ?? "unknown"}${c.reason ? ` (${c.reason})` : ""}${scanned}${retry}`);
+          }
+          const threads = recovery?.threads;
+          if (threads) {
+            const reasons = (counts?: Record<string, number>) => Object.entries(counts ?? {}).map(([reason, n]) => `${reason} ${n}`).join(", ");
+            const behind = threads.oldestPendingSeconds != null ? ` (oldest ${Math.round(threads.oldestPendingSeconds / 60)} min behind)` : "";
+            log(`  Thread recovery: ${threads.state ?? "unknown"}${threads.reason ? ` (${threads.reason})` : ""}; ${threads.tracked ?? 0} tracked (open, or closed within seven days); `
+              + `${threads.scanned ?? 0} scanned, ${threads.pending ?? 0} waiting their turn${behind}`
+              + `${reasons(threads.backoff) ? `; backing off: ${reasons(threads.backoff)}` : ""}${reasons(threads.incomplete) ? `; incomplete: ${reasons(threads.incomplete)}` : ""}`);
+          }
           log(`  Recovery counts since connector start: accepted ${recovery?.acceptedThisProcess ?? "unknown"}; dead-lettered ${recovery?.deadLetteredThisProcess ?? "unknown"} (custody, not delivery)`);
+          if (connector.relayAttemptsInFlight !== undefined) log(`  Relay attempts awaiting response: ${connector.relayAttemptsInFlight} (this process, point-in-time; zero does not prove global quiescence)`);
           if (connector.deadLetterBacklogState !== undefined) {
             const scope = "inbound messages, reactions and click answers";
             if (connector.deadLetterBacklogState === "unknown") {
@@ -229,13 +299,13 @@ export function slackCommand(deps: SlackDeps = {}): Command {
               // not be read, so the line must not read as an empty backlog.
               log(`  Inbound dead-letter backlog: unknown (could not read the ${scope} dead-letter records: ${connector.deadLetterBacklogReason ?? "unreadable"})`);
             } else {
-              log(`  Inbound dead-letter backlog: ${connector.deadLetterBacklog ?? 0} retained record(s) awaiting retry (${scope}; durable, kept across restarts)`);
+              log(`  Inbound dead-letter backlog: ${connector.deadLetterBacklog ?? 0} retained record(s)${connector.inboundReady === false && connector.outboundReady === false ? "; retry paused" : " awaiting retry"} (${scope}; durable, kept across restarts)`);
             }
           }
           if (connector.configurationDigest) log(`  Observed configuration digest: ${connector.configurationDigest} (local configuration above)`);
           for (const limit of recovery?.limits ?? []) log(`  Limit: ${limit}`);
         }
-        log("Connected/configured alone is not proof of delivery. Recovery covers available top-level channel history only.");
+        log("Connected/configured alone is not proof of delivery. Recovery covers available history in this machine's channels and replies in its tracked threads.");
         if (permWarn) log(`  ⚠ ${permWarn}`);
         if (next) log(`  ${next}`);
       }
@@ -279,44 +349,29 @@ export function slackCommand(deps: SlackDeps = {}): Command {
     .command("verify")
     .description("Live-verify GRANTED Slack scopes (from response headers) + channel membership")
     .option("--json", "JSON output")
-    .option("--reason <reason>", "Reason recorded with the verification", "verify human delivery")
-    .option("--actor <actor>", "Named operator when outside a managed seat")
     .action(async (opts) => {
       const surface = await loadSurface();
       const cfg = surface.loadConfig(deps.home);
       const s = resolveSecrets(surface, cfg);
-      const { runChannelOperation, channelStateDigest } = await import("@openrig/daemon/gateway-slack");
-      const verification = await runChannelOperation({
-        actor: resolveSenderSession() ?? opts.actor ?? SENDER_FALLBACK, provenance: "claimed:v1",
-        reason: opts.reason, action: "verify", subject: "slack", before: { digest: channelStateDigest(cfg) },
-        run: async () => {
-          const scope = s.bot ? await surface.verifyScopes(s.bot, cfg.requiredScopes, deps.fetchImpl) : null;
-          // #192: membership in every channel the connector uses — the default and each mapped one.
-          const channels = [];
-          for (const c of s.bot ? surface.mappedChannels(cfg) : []) {
-            channels.push({ ...c, member: await surface.verifyChannelMembership(s.bot!, c.channel, deps.fetchImpl) });
-          }
-          const member = channels.find((c) => c.isDefault)?.member ?? null;
-          const ready = scope === null || scope.error || channels.some((c) => c.member.error) ? null
-            : scope.ok && member !== null && channels.every((c) => c.member.isMember);
-          return { value: { scope, member, channels }, after: { ready }, effect: "observed" };
-        },
-      }, deps.home);
       if (!s.bot) {
         log("✗ bot token unresolved — set SLACK_BOT_TOKEN (env or secrets env file). Cannot verify.");
         process.exitCode = 1;
         return;
       }
-      const scope = verification.value.scope!;
-      const member = verification.value.member;
-      const channels = verification.value.channels;
+      const scope = await surface.verifyScopes(s.bot, cfg.requiredScopes, deps.fetchImpl);
+      // #192: membership in every channel the connector uses — the default and each mapped one.
+      const channels = [];
+      for (const c of surface.mappedChannels(cfg)) {
+        channels.push({ ...c, member: await surface.verifyChannelMembership(s.bot, c.channel, deps.fetchImpl) });
+      }
+      const member = channels.find((c) => c.isDefault)?.member ?? null;
       const ready = scope.ok && member !== null && channels.every((c) => c.member.isMember);
       // Failed scope requests or an absent/empty grant header cannot prove
       // which optional features are available. Baseline readiness is unchanged.
       const missingFeatures = scope.error || scope.granted.length === 0 ? null
         : surface.FEATURE_SCOPES.filter((feature) => !scope.granted.includes(feature.scope));
       if (opts.json) {
-        log(JSON.stringify({ scope, member, ...(cfg.channelMap?.length ? { channels } : {}), ready, missingFeatures, receipt: verification.receipt }));
+        log(JSON.stringify({ scope, member, ...(cfg.channelMap?.length ? { channels } : {}), ready, missingFeatures }));
       } else {
         log(`granted scopes: ${scope.granted.join(", ") || "(none)"}`);
         if (!scope.ok) log(`✗ MISSING scopes (configured != granted — reinstall the app): ${scope.missing.join(", ")}${scope.error ? ` [${scope.error}]` : ""}`);
@@ -467,8 +522,34 @@ export function slackCommand(deps: SlackDeps = {}): Command {
         const res = await clientFactory().post<{ ok: boolean; seeded: number; onlineStatus: string }>("/api/gateway/slack/enable", { reason: opts.reason, actor: resolveSenderSession() ?? opts.actor ?? SENDER_FALLBACK });
         if (res.status !== 200 || res.data.ok !== true) throw new Error(`daemon refused enable (HTTP ${res.status}): ${JSON.stringify(res.data)}`);
         log(res.data.onlineStatus);
+        if (res.data.seeded > 0) log(`To show the asks still open in Slack, run ${POST_OPEN_ASKS}.`);
       } catch (e) {
         log(`✗ enable failed: ${(e as Error).message}`);
+        process.exitCode = 1;
+      }
+    });
+
+  cmd
+    .command("post-open-asks")
+    .description("Show in Slack the asks still open that enable marked as seen, through ordinary delivery, and say what became of each")
+    .option("--reason <reason>", "Reason recorded with the action")
+    .option("--wait <seconds>", "How long to wait for Slack receipts before reporting the rest as queued (0-60)", "10")
+    .option("--actor <actor>", "Named operator when outside a managed seat")
+    .option("--json", "Print the daemon's result as JSON")
+    .action(async (opts) => {
+      try {
+        const waitSeconds = Number(opts.wait);
+        if (!Number.isFinite(waitSeconds) || waitSeconds < 0 || waitSeconds > 60) throw new Error(`--wait takes 0 to 60 seconds, not ${opts.wait}`);
+        const res = await clientFactory().post<PostOpenAsksResponse>("/api/gateway/slack/post-open-asks",
+          { reason: opts.reason, waitSeconds, actor: resolveSenderSession() ?? opts.actor ?? SENDER_FALLBACK },
+          { timeoutMs: (waitSeconds + 30) * 1000 });
+        if (res.status !== 200 || res.data.ok !== true) {
+          throw new Error((res.data as { message?: string }).message ?? `daemon refused (HTTP ${res.status}): ${JSON.stringify(res.data)}`);
+        }
+        if (opts.json) { log(JSON.stringify(res.data, null, 2)); return; }
+        for (const line of describeOpenAsks(res.data.asks)) log(line);
+      } catch (e) {
+        log(`✗ post-open-asks failed: ${(e as Error).message}`);
         process.exitCode = 1;
       }
     });

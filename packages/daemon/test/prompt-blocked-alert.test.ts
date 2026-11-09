@@ -9,12 +9,19 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { makeParkedOwnerConsumerPolicy, makeRigAnchor, PARKED_OWNER_POLICY_NAME, REFUSED_PREFIX, RESERVE_PREFIX } from "../src/domain/policies/parked-owner-consumer.js";
 import type { PolicyJob } from "../src/domain/policies/types.js";
-import type { WatchdogHistoryEntry } from "../src/domain/watchdog-history-log.js";
+import { WatchdogHistoryLog, type WatchdogHistoryEntry } from "../src/domain/watchdog-history-log.js";
+import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
+import { tmuxAttachCommand } from "../src/adapters/tmux-server.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
+import { makeKernelHookReviewReader } from "../src/domain/kernel-hook-review.js";
+import { verifyCodexPaneProcess, type NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import { runWakeLadderTick, queueRecoveryOwnsWake, classifyPromptAfterRefusal } from "../src/domain/queue-wake-ladder.js";
 import { makeOperatorDeliveryEngine } from "../src/domain/gateway/operator-delivery-engine.js";
 import { buildSlackGatewayWire } from "../src/domain/gateway/slack/slack-subsystem.js";
 import { DEFAULT_CONFIG, saveConfig } from "../src/domain/gateway/slack/config.js";
 import { DispatchBuffer } from "../src/domain/gateway/dispatch-buffer.js";
+import { SeenStore } from "../src/domain/gateway/slack/state-store.js";
+import { OUTBOUND_OP } from "../src/domain/gateway/slack/outbound-driver.js";
 import type { LoadResult } from "../src/domain/gateway/human-registry.js";
 import { GatewayDispatcher } from "../src/domain/gateway/dispatcher.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -49,7 +56,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
   });
   afterEach(() => { for (const w of wires.splice(0)) w.stop(); db.close(); rmSync(home, { recursive: true, force: true }); });
 
-  function engine(posts: unknown[], registered: boolean | (() => LoadResult) = true) {
+  function engine(posts: unknown[], registered: boolean | (() => LoadResult) = true, to?: string[], readiness = async () => ({ ready: true, reason: "fixture delivery ready" })) {
     const load = typeof registered === "function" ? registered : () => registered ? registry : { ok: true as const, entities: [] };
     const secrets = join(home, "slack.env");
     writeFileSync(secrets, "SLACK_BOT_TOKEN=fixture-only\n", { mode: 0o600 });
@@ -68,9 +75,9 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
       },
     });
     wires.push(wire); wire.startServices?.();
-    return makeOperatorDeliveryEngine({ home, queueRepo: repo,
+    return makeOperatorDeliveryEngine({ home, queueRepo: repo, ...{ readiness },
       registry: { loadHumanRegistry: load },
-      dispatch: (op, ref, payload, opts) => wire.dispatcher.dispatch(op, ref, payload, opts),
+      dispatch: (op, ref, payload, opts) => { to?.push(ref); return wire.dispatcher.dispatch(op, ref, payload, opts); },
     });
   }
 
@@ -127,6 +134,246 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     expect(repo.getById(row.qitemId)?.state).toBe("in-progress");
   });
 
+  it("a stale cross-host sender cannot prevent a prompt alert reaching the existing human route", async () => {
+    const row = await refusal();
+    const staleSource = "sender@remote@retired-host";
+    db.prepare("UPDATE queue_items SET source_session=? WHERE qitem_id=?").run(staleSource, row.qitemId);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: target => target !== staleSource });
+    const posts: unknown[] = [], wakes: string[] = [];
+    const port = engine(posts);
+    const result = await tick(port, { attemptWake: async (_id, target) => { wakes.push(target); return "failed:fixture"; } });
+    expect(result.outcome).not.toBe("failed");
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(wakes).toEqual([]);
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0]?.destinationSession).toBe(seat); // carrier only, never a pane nudge
+    expect(alerts()[0]?.sourceSession).toBe("daemon@kernel"); // scheduling is OpenRig; member provenance remains in its own row
+    expect(JSON.stringify(posts)).toContain(row.qitemId);
+    await tick(port);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("a human operator setting uses a local carrier and preserves explicit-only for a choice", async () => {
+    vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "human-owner@external");
+    try {
+      await refusal(1, `Refused: '${seat}' is at an interactive prompt (selection_prompt). No text was sent.`);
+      const posts: unknown[] = [];
+      await tick(engine(posts), { humanRung: "explicit-only", loadHumanRegistry: () => registry });
+      expect(alerts()).toHaveLength(1);
+      expect(alerts()[0]!.destinationSession).not.toBe("human-owner@external");
+      expect(posts).toEqual([]);
+      expect(repo.getById(episodeRows[0]!)!.state).toBe("in-progress");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(["not-ready", "indeterminate"])("%s delivery retains one visible alert, then uses the same episode when ready", async status => {
+    await refusal(); let ready = false; const posts: unknown[] = [];
+    const port = engine(posts, true, undefined, async () => ({ ready, reason: status }));
+    await tick(port); await tick(port);
+    expect(posts).toEqual([]);
+    expect(alerts()).toHaveLength(1);
+    const id = alerts()[0]!.qitemId;
+    expect(notes(id).join("\n")).toContain("unavailable:human-delivery");
+    expect(notes(id).join("\n")).not.toContain("dispatched-to-engine");
+    ready = true; await tick(port, { now: new Date(Date.now() + 240_000) });
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    await tick(port); expect(posts).toHaveLength(1); expect(alerts()[0]!.qitemId).toBe(id);
+  });
+
+  it("the real readiness check keeps a disabled connector out of the dispatch buffer", async () => {
+    const row = await refusal(); const dispatch = vi.fn(() => ({ ok: true as const, decisionId: "disabled-fixture" }));
+    const secrets = join(home, "disabled.env"); writeFileSync(secrets, "SLACK_BOT_TOKEN=fixture-only\n");
+    saveConfig({ ...DEFAULT_CONFIG, enabled: false, channel: "CFIXTURE", secretsEnvFile: secrets }, home);
+    const port = makeOperatorDeliveryEngine({ home, queueRepo: repo, registry: { loadHumanRegistry: () => registry }, dispatch });
+    const result = await port.dispatchEscalation(row, "permission prompt");
+    expect(result).toMatchObject({ dispatched: false, resolved: false });
+    expect(result.decision).toContain("unavailable:human-delivery");
+    expect(dispatch).not.toHaveBeenCalled(); expect(new DispatchBuffer(home).pending()).toEqual([]);
+  });
+
+  it.each([true, false])("an undelivered notice about a ladder alert does not recurse (ladder=%s)", async ladderNotice => {
+    const notice = await repo.create({ sourceSession: "sender@fixture", destinationSession: "human-owner@external",
+      body: "original undelivered notice", tags: ladderNotice ? ["wake-escalation"] : [], nudge: false });
+    const finding = await refusal();
+    db.prepare("UPDATE queue_items SET tags=? WHERE qitem_id=?").run(JSON.stringify([
+      `stuck-sweep:undelivered-human-notice:${notice.qitemId}`, `recovery-for:${notice.qitemId}`,
+    ]), finding.qitemId);
+    const posts: unknown[] = []; const port = engine(posts);
+    await tick(port); await tick(port);
+    expect(alerts()).toHaveLength(ladderNotice ? 0 : 1);
+    if (!ladderNotice) await vi.waitFor(() => expect(posts).toHaveLength(1));
+    else expect(posts).toEqual([]);
+    expect(repo.getById(finding.qitemId)!.state).toBe("in-progress");
+    expect(repo.getById(notice.qitemId)!.state).toBe("pending");
+  });
+
+  it("an unreadable human registry still permits a valid agent carrier", async () => {
+    vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "ops@fixture");
+    try {
+      await refusal(); const posts: unknown[] = [];
+      await tick(engine(posts, false), { loadHumanRegistry: () => ({ ok: false, error: "no registered people" }) });
+      expect(alerts()).toHaveLength(1);
+      expect(alerts()[0]!.destinationSession).toBe("ops@fixture");
+      expect(posts).toEqual([]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each([
+    { choice: true, orchMarker: false }, { choice: true, orchMarker: true },
+    { choice: false, orchMarker: false }, { choice: false, orchMarker: true },
+  ])("an unaccepted old human carrier is repaired in place ($choice/$orchMarker)", async ({ choice, orchMarker }) => {
+    await refusal(1, `Refused: '${seat}' is at an interactive prompt (${choice ? "selection_prompt" : "target_needs_input"}). No text was sent.`);
+    let ready = false; const posts: unknown[] = [];
+    const port = engine(posts, true, undefined, async () => ({ ready, reason: "not-ready" }));
+    await tick(port, { humanRung: "always" });
+    const old = alerts()[0]!;
+    db.prepare("UPDATE queue_items SET destination_session=? WHERE qitem_id=?").run("human-owner@external", old.qitemId);
+    if (!orchMarker) db.prepare("DELETE FROM queue_transitions WHERE qitem_id=? AND transition_note LIKE 'escalation-rung: orchestrator%'").run(old.qitemId);
+    ready = choice; // a choice must not use restored readiness to bypass explicit-only
+    const wakes: string[] = [];
+    await tick(port, { humanRung: "explicit-only", loadHumanRegistry: () => registry, now: new Date(Date.now() + 240_000),
+      attemptWake: async (_id, target) => { wakes.push(target); return "failed:fixture"; } });
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0]!.qitemId).toBe(old.qitemId);
+    expect(alerts()[0]!.body).toBe(old.body);
+    expect(alerts()[0]!.destinationSession).not.toBe("human-owner@external");
+    expect(wakes).toEqual([]); expect(posts).toEqual([]);
+    expect(repo.getById(episodeRows[0]!)!.state).toBe("in-progress");
+    if (!choice) {
+      ready = true; await tick(port, { humanRung: "explicit-only", now: new Date(Date.now() + 360_000) });
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      expect(alerts()[0]!.qitemId).toBe(old.qitemId);
+    }
+  });
+
+  it.each([true, false])("a repaired carrier wakes its newly configured lead before the human rung (choice=%s)", async choice => {
+    await refusal(1, `Refused: '${seat}' is at an interactive prompt (${choice ? "selection_prompt" : "target_needs_input"}). No text was sent.`);
+    const posts: unknown[] = []; let ready = false;
+    const port = engine(posts, true, undefined, async () => ({ ready, reason: "fixture" }));
+    await tick(port, { humanRung: "always" });
+    const old = alerts()[0]!;
+    db.prepare("UPDATE queue_items SET destination_session=? WHERE qitem_id=?").run("human-owner@external", old.qitemId);
+    expect(notes(old.qitemId).join("\n")).toContain("orchestrator self-skip");
+    if (choice) repo.transitionLog.append({ qitemId: old.qitemId, state: old.state, actorSession: "wake-ladder@system",
+      transitionNote: "ladder-exhausted: explicit-only floor: a visible row, not posted to a person" });
+    ready = true; const wakes: string[] = [];
+    const opts = { humanRung: "explicit-only" as const, loadHumanRegistry: () => registry, resolveOrchestrator: () => "lead@fixture",
+      attemptWake: async (_id: string, target: string) => { wakes.push(target); return "failed:offline"; } };
+    await tick(port, opts);
+    expect(wakes).toEqual(["lead@fixture"]); expect(posts).toEqual([]);
+    expect(alerts()[0]!.qitemId).toBe(old.qitemId); expect(alerts()[0]!.body).toBe(old.body);
+    expect(alerts()[0]!.destinationSession).toBe("lead@fixture");
+    await tick(port, { ...opts, now: new Date(Date.now() + 240_000) });
+    if (choice) expect(posts).toEqual([]);
+    else await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(wakes).toEqual(["lead@fixture"]);
+    expect(repo.getById(episodeRows[0]!)!.state).toBe("in-progress");
+  });
+
+  it.each([
+    { kind: "posted", boundary: "progress" }, { kind: "terminated", boundary: "progress" },
+    { kind: "posted", boundary: "dispatch" }, { kind: "terminated", boundary: "dispatch" },
+  ])("a fixed-key old $kind does not resolve a later $boundary episode", async ({ kind, boundary }) => {
+    const row = await refusal(); const key = `${row.qitemId}:operator-rung`;
+    expect(repo.transitionLog.latestOwnerNotificationForQitem(row.qitemId)).toBeNull();
+    repo.transitionLog.append({ qitemId: row.qitemId, state: row.state, actorSession: "daemon@kernel",
+      transitionNote: `${kind === "posted" ? "slack-owner-notification-posted" : "delivery-termination:"} notification_key=${key}` });
+    if (boundary === "progress") await repo.update({ qitemId: row.qitemId, actorSession: seat, transitionNote: "continuing the obligation" });
+    else repo.transitionLog.append({ qitemId: row.qitemId, state: row.state, actorSession: "wake-ladder@system",
+      transitionNote: `escalation-rung: operator dispatched-to-engine notification_key=${key}` });
+    const posts: unknown[] = []; const port = engine(posts);
+    expect(port.hasAcceptedEscalation!(repo.getById(row.qitemId)!)).toBe(false);
+    expect(await port.dispatchEscalation(repo.getById(row.qitemId)!, "later episode")).toMatchObject({ dispatched: true, resolved: false });
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(port.hasAcceptedEscalation!(repo.getById(row.qitemId)!)).toBe(true);
+  });
+
+  it("a later ordinary episode posts once after the real gateway ACKed its earlier delivery", async () => {
+    const source = await repo.create({ sourceSession: "sender@fixture", destinationSession: "relay@fixture", body: "work", nudge: false });
+    const { created } = await repo.handoff({ qitemId: source.qitemId, fromSession: "relay@fixture", toSession: seat, nudge: false });
+    db.prepare("UPDATE queue_items SET last_nudge_result=?, last_nudge_attempt=? WHERE qitem_id=?")
+      .run("failed:offline", new Date(Date.now() - 600_000).toISOString(), created.qitemId);
+    const posts: unknown[] = []; const port = engine(posts); const buffer = new DispatchBuffer(home);
+    const delivered = new SeenStore(join(home, "state", "slack-delivered-decisions.jsonl"));
+    const opts = { humanRung: "always" as const, retryCap: 0, attemptWake: async () => "failed:offline" };
+    await tick(port, opts);
+    const firstKey = notes(created.qitemId).join(" ").match(/notification_key=(\S+)/)![1]!;
+    await vi.waitFor(() => { expect(posts).toHaveLength(1); expect(buffer.pending()).toEqual([]);
+      expect(delivered.load().has(`operator:${firstKey}`)).toBe(true); });
+    await tick(port, opts);
+    expect(notes(created.qitemId).some(n => n.startsWith("ladder-exhausted:"))).toBe(true);
+    await repo.update({ qitemId: created.qitemId, actorSession: seat, transitionNote: "continued work; another wake is needed" });
+    await tick(port, { ...opts, now: new Date(Date.now() + 240_000) });
+    await tick(port, { ...opts, now: new Date(Date.now() + 360_000) });
+    await vi.waitFor(() => { expect(posts).toHaveLength(2); expect(buffer.pending()).toEqual([]); });
+    const receipts = notes(created.qitemId).filter(n => n.startsWith("slack-owner-notification-posted "));
+    expect(receipts).toHaveLength(2);
+    const secondKey = receipts[1]!.match(/notification_key=(\S+)/)![1]!;
+    expect(secondKey).not.toBe(firstKey); expect(delivered.load().has(`operator:${secondKey}`)).toBe(true);
+    await tick(port, { ...opts, now: new Date(Date.now() + 480_000) });
+    const transitions = repo.listTransitions(created.qitemId);
+    expect(transitions.at(-1)!.transitionNote).toContain("ladder-exhausted:");
+    await tick(port, { ...opts, now: new Date(Date.now() + 600_000) });
+    expect(posts).toHaveLength(2); expect(buffer.pending()).toEqual([]);
+  });
+
+  it.each([false, true])("legacy fixed-key custody survives in the same ordinary episode (ACKed=%s)", async acked => {
+    const row = await refusal(); const posts: unknown[] = []; const port = engine(posts);
+    const key = `${row.qitemId}:operator-rung`;
+    const accepted = wires.at(-1)!.dispatcher.dispatch(OUTBOUND_OP, "human-owner@external", {
+      qitemId: row.qitemId, notificationKey: key, destinationSession: "human-owner@external", sourceSession: row.sourceSession,
+      body: row.body, ownerNotificationLevel: "ALERT", tags: ["escalation"],
+    }, { decisionId: `operator:${key}` });
+    expect(accepted.ok).toBe(true);
+    if (acked) await vi.waitFor(() => { expect(posts).toHaveLength(1); expect(new DispatchBuffer(home).pending()).toEqual([]); });
+    expect(port.hasAcceptedEscalation!(row)).toBe(true);
+    expect(await port.dispatchEscalation(row, "same episode")).toMatchObject({ dispatched: true, resolved: acked });
+    await vi.waitFor(() => { expect(posts).toHaveLength(1); expect(new DispatchBuffer(home).pending()).toEqual([]); });
+  });
+
+  it.each([false, true, "posted", "terminated"] as const)("an accepted old human carrier is not rerouted or woken (marker=%s)", async marker => {
+    await refusal(1, `Refused: '${seat}' is at an interactive prompt (selection_prompt). No text was sent.`);
+    await tick(engine([], false), { humanRung: "always" });
+    const old = alerts()[0]!;
+    db.prepare("UPDATE queue_items SET destination_session=? WHERE qitem_id=?").run("human-owner@external", old.qitemId);
+    db.prepare("DELETE FROM queue_transitions WHERE qitem_id=? AND transition_note LIKE 'escalation-rung: orchestrator%'").run(old.qitemId);
+    const buffer = new DispatchBuffer(home);
+    const dispatcher = new GatewayDispatcher({ buffer, send: () => { throw new Error("fixture interrupted after persistence"); } });
+    dispatcher.onCapability({ kind: "capability", connectorId: "fixture", platform: "slack", protocolVersion: 1, ops: ["post_message"] });
+    const accepting = makeOperatorDeliveryEngine({ home, queueRepo: repo, registry: { loadHumanRegistry: () => registry },
+      readiness: async () => ({ ready: true, reason: "fixture" }), dispatch: (op, ref, payload, opts) => dispatcher.dispatch(op, ref, payload, opts) });
+    const accepted = await accepting.dispatchEscalation(repo.getById(old.qitemId)!, "permission prompt");
+    expect(accepted.dispatched).toBe(true); const pending = buffer.pending(); expect(pending).toHaveLength(1);
+    if (marker === true) repo.transitionLog.append({ qitemId: old.qitemId, state: old.state, actorSession: "wake-ladder@system",
+      transitionNote: `escalation-rung: operator dispatched-to-engine decision=accepted-pending resolved=false notification_key=${accepted.notificationKey} decision_id=${accepted.decisionId}` });
+    if (marker === "posted" || marker === "terminated") {
+      buffer.ack(pending[0]!.decisionId);
+      repo.transitionLog.append({ qitemId: old.qitemId, state: old.state, actorSession: "gateway@system",
+        transitionNote: `${marker === "posted" ? "slack-owner-notification-posted" : "delivery-termination:"} notification_key=${accepted.notificationKey}` });
+    }
+    const expectedPending = buffer.pending();
+    const readReady = vi.fn(async () => ({ ready: false, reason: "unavailable after acceptance" }));
+    const send = vi.fn(() => { throw new Error("must not dispatch again"); }); const wakes = vi.fn(async () => "failed:fixture");
+    const port = makeOperatorDeliveryEngine({ home, queueRepo: repo, registry: { loadHumanRegistry: () => registry }, readiness: readReady, dispatch: send });
+    await tick(port, { humanRung: "explicit-only", loadHumanRegistry: () => registry, now: new Date(Date.now() + 240_000), attemptWake: wakes });
+    expect(repo.getById(old.qitemId)!.destinationSession).toBe("human-owner@external");
+    expect(repo.getById(old.qitemId)!.body).toBe(old.body);
+    expect(buffer.pending()).toEqual(expectedPending); expect(wakes).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled(); expect(readReady).not.toHaveBeenCalled();
+  });
+
+  it("an invalid sender does not turn an explicit-only choice alert into a human post", async () => {
+    const row = await refusal(1, `Refused: '${seat}' is at an interactive prompt (selection_prompt). No text was sent.`);
+    const staleSource = "sender@remote@retired-host";
+    db.prepare("UPDATE queue_items SET source_session=? WHERE qitem_id=?").run(staleSource, row.qitemId);
+    repo = new QueueRepository(db, new EventBus(db), { validateRig: target => target !== staleSource });
+    const posts: unknown[] = [];
+    await tick(engine(posts), { humanRung: "explicit-only", loadHumanRegistry: () => registry });
+    expect(alerts()).toHaveLength(1);
+    expect(posts).toEqual([]);
+    expect(notes(alerts()[0]!.qitemId).some(note => note.includes("human rung explicit-only"))).toBe(true);
+  });
+
   it("HUMAN RUNG EXPLICIT-ONLY: a prompt-blocked seat still reaches a person, since only a person can clear it", async () => {
     await refusal(); const posts: unknown[] = [];
     await runWakeLadderTick({ db, queueRepo: repo, resolveOrchestrator: () => null,
@@ -164,6 +411,219 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
       retryIntervalSeconds: 60, now: new Date(Date.now() + 120_000), deliveryEngine: port,
       attemptWake: async () => { throw new Error("unexpected seat input"); }, log: () => {}, ...opts });
   }
+
+  describe("kernel hook review without a refused wake", () => {
+    const observedAt = new Date("2030-01-01T00:00:00Z");
+    let hookState: "blocked" | "clear" | "unknown";
+    let sampledAt: string;
+    beforeEach(() => { hookState = "blocked"; sampledAt = observedAt.toISOString(); });
+    function hookTick(port: ReturnType<typeof engine>, opts: Partial<Parameters<typeof runWakeLadderTick>[0]> = {}) {
+      const observation = { destination: seat, episode: "session-1:%1:123", state: hookState, observedAt: sampledAt };
+      return tick(port, { now: observedAt, ...{ readHookReviews: async () => [observation] }, ...opts });
+    }
+
+    it("posts one named hook-review alert with no row or send and retires on a fresh clear", async () => {
+      expect(repo.list({ limit: 1000 })).toHaveLength(0);
+      const posts: unknown[] = []; const port = engine(posts);
+      expect((await hookTick(port)).outcome).not.toBe("failed");
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      const alert = alerts()[0]!;
+      expect(alert.body).toContain(seat);
+      expect(alert.body).toContain("Hooks need review");
+      expect(alert.body).toContain("Codex's hook review");
+      expect(alert.body).toContain("does not approve");
+      for (let n = 0; n < 3; n++) await hookTick(port);
+      expect(posts).toHaveLength(1);
+      expect(alerts()).toHaveLength(1);
+      hookState = "unknown";
+      await hookTick(port);
+      expect(alerts()).toHaveLength(1); // uncertainty cannot resolve or alert again
+      hookState = "clear";
+      await hookTick(port);
+      expect(alerts()).toHaveLength(0);
+      expect(repo.getById(alert.qitemId)?.state).toBe("done");
+      expect(posts).toHaveLength(1);
+    });
+
+    it.each(["unknown", "stale"])("does not create an ask from %s observation", async kind => {
+      if (kind === "unknown") hookState = "unknown";
+      else sampledAt = new Date(observedAt.getTime() - 60_000).toISOString();
+      const posts: unknown[] = [];
+      await hookTick(engine(posts));
+      expect(alerts()).toHaveLength(0);
+      expect(posts).toHaveLength(0);
+    });
+
+    it("joins the existing refused-wake episode rather than posting a second alert", async () => {
+      await refusal(1, `Refused: '${seat}' is at an interactive prompt (selection_prompt). No text was sent.`);
+      const posts: unknown[] = []; const port = engine(posts);
+      await hookTick(port);
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      expect(alerts()).toHaveLength(1);
+      expect(alerts()[0]!.tags).toContain(`recovery-for:${episodeRows[0]}`);
+      await hookTick(port);
+      expect(posts).toHaveLength(1);
+    });
+
+    it("adds hook guidance once to an earlier dispatched and exhausted alert without another delivery", async () => {
+      await refusal();
+      const posts: unknown[] = []; const port = engine(posts);
+      await tick(port, { now: observedAt }); // prior tick has no hook observation
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      const alert = alerts()[0]!;
+      expect(alert.body).not.toContain("Hooks need review");
+      await vi.waitFor(() => expect(notes(alert.qitemId).some(n => n.startsWith("slack-owner-notification-posted "))).toBe(true));
+      await tick(port, { now: observedAt });
+      expect(notes(alert.qitemId).some(n => n.startsWith("ladder-exhausted:"))).toBe(true);
+      repo.claim({ qitemId: alert.qitemId, destinationSession: alert.destinationSession });
+      const before = repo.getById(alert.qitemId)!;
+      const receipts = notes(alert.qitemId).filter(n => n.startsWith("slack-owner-notification-") || n.includes("dispatched-to-engine"));
+      await hookTick(port);
+      const updated = repo.getById(alert.qitemId)!;
+      expect(updated.summary).toContain("Hooks need review");
+      expect(updated.summary).toContain(tmuxAttachCommand(shellQuote(seat)));
+      expect(notes(alert.qitemId).filter(n => n.startsWith("hook-review observed:"))).toHaveLength(1);
+      expect(notes(alert.qitemId).join("\n")).toContain("through Codex's hook review");
+      expect(updated.body).toBe(before.body); // retain the original delivered content and receipt
+      expect([updated.qitemId, updated.state, updated.destinationSession, updated.claimedAt])
+        .toEqual([before.qitemId, before.state, before.destinationSession, before.claimedAt]);
+      for (let n = 0; n < 3; n++) await hookTick(port);
+      expect(posts).toHaveLength(1);
+      expect(alerts()).toHaveLength(1);
+      expect(notes(alert.qitemId).filter(n => n.startsWith("hook-review observed:"))).toHaveLength(1);
+      expect(notes(alert.qitemId).filter(n => n.startsWith("slack-owner-notification-") || n.includes("dispatched-to-engine")))
+        .toEqual(receipts);
+    });
+
+    it("retains unresolved routing without claiming delivery when no person is registered", async () => {
+      const posts: unknown[] = []; const port = engine(posts, false);
+      await hookTick(port);
+      expect(alerts()).toHaveLength(1);
+      const log = notes(alerts()[0]!.qitemId).join("\n");
+      expect(log).toContain("undeliverable:no-registered-human");
+      expect(log).not.toContain("operator rung resolved");
+      expect(posts).toHaveLength(0);
+    });
+
+    it("honors an intentional suspension and checks the gate again before delivery", async () => {
+      const posts: unknown[] = []; const port = engine(posts);
+      const old = process.env.OPENRIG_WAKE_SUSPEND;
+      process.env.OPENRIG_WAKE_SUSPEND = `${seat}:2030-01-01T01:00:00Z`;
+      try { await hookTick(port); expect(alerts()).toHaveLength(0); }
+      finally { if (old === undefined) delete process.env.OPENRIG_WAKE_SUSPEND; else process.env.OPENRIG_WAKE_SUSPEND = old; }
+      let reads = 0;
+      await hookTick(port, { ...{ readHookReviews: async () => [{ destination: seat, episode: "session-1:%1:123",
+        state: ++reads === 1 ? "blocked" as const : "clear" as const, observedAt: sampledAt }] } });
+      expect(posts).toHaveLength(0);
+    });
+  });
+
+  it("routes a real kernel binding's current hook screen through the production observation reader", async () => {
+    const rigs = new RigRepository(db); const sessions = new SessionRegistry(db);
+    const rig = rigs.createRig("kernel"); const node = rigs.addNode(rig.id, "operator", { runtime: "codex" });
+    const destination = "operator@kernel";
+    const session = sessions.registerSession(node.id, destination); sessions.updateStatus(session.id, "running");
+    sessions.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: destination, tmuxPane: "%17" });
+    let screen: string | null = "OpenAI Codex (v0.164.0)\nHooks need review\nTrust all and continue";
+    let dead: boolean | undefined = false;
+    let pane = "%17";
+    let changeBinding = false;
+    const tmux = {
+      getPanePid: vi.fn(async () => 123),
+      listPanes: vi.fn(async () => [{ id: pane, index: 0, cwd: "/fixture", width: 80, height: 24, active: true }]),
+      readAllPaneProcesses: vi.fn(async () => new Map([["%17", { pid: 123, command: "codex", dead }]])),
+      capturePaneScreen: vi.fn(async () => {
+        if (changeBinding) sessions.updateBinding(node.id, { tmuxPane: "%18" });
+        return screen;
+      }),
+    };
+    const now = new Date("2030-01-01T00:00:00Z");
+    const readHookReviews = makeKernelHookReviewReader({ db, tmux, now: () => now });
+    const posts: unknown[] = []; const port = engine(posts);
+    await tick(port, { now, readHookReviews });
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(alerts()[0]!.body).toContain(destination);
+    for (const unavailable of [null, "unrecognised screen"]) {
+      screen = unavailable;
+      await tick(port, { now, readHookReviews });
+      expect(alerts()).toHaveLength(1);
+      expect(posts).toHaveLength(1);
+    }
+    screen = "OpenAI Codex (v0.164.0)\nmodel: gpt-5\n› ";
+    expect((await readHookReviews())[0]?.state).toBe("clear");
+    await tick(port, { now, readHookReviews });
+    expect(alerts()).toHaveLength(0);
+    screen = "Hooks need review\nTrust all and continue";
+    for (dead of [true, undefined]) expect((await readHookReviews())[0]?.state).toBe("unknown");
+    dead = false; pane = "%18";
+    expect((await readHookReviews())[0]?.state).toBe("unknown");
+    pane = "%17"; changeBinding = true;
+    expect((await readHookReviews())[0]?.state).toBe("unknown");
+    expect(posts).toHaveLength(1);
+  });
+
+  function shellHookReaderFixture() {
+    const rigs = new RigRepository(db); const sessions = new SessionRegistry(db);
+    const rig = rigs.createRig("kernel"); const node = rigs.addNode(rig.id, "operator", { runtime: "codex" });
+    const destination = "operator@kernel";
+    const session = sessions.registerSession(node.id, destination); sessions.updateStatus(session.id, "running");
+    sessions.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: destination, tmuxPane: "%17" });
+    const hookScreen = "OpenAI Codex (v0.164.0)\nHooks need review\nTrust all and continue";
+    let screen = hookScreen;
+    let panePid = 123, nativePid = 126;
+    const processes = (): NativeProcessRow[] => [
+      { pid: panePid, ppid: 1, pgid: panePid, tpgid: 124, executableName: "zsh", command: "-zsh", startedAt: "start" },
+      { pid: 124, ppid: panePid, pgid: 124, tpgid: 124, executableName: "sh", command: "/bin/sh /fixture/start.sh", startedAt: "start" },
+      { pid: 125, ppid: 124, pgid: 124, tpgid: 124, executableName: "node", command: "node /opt/bin/codex", startedAt: "start" },
+      { pid: nativePid, ppid: 125, pgid: 124, tpgid: 124, executableName: "codex", command: "/opt/native/codex",
+        argv: ["/opt/native/codex"], startedAt: "start" },
+    ];
+    const tmux = {
+      getPanePid: vi.fn(async () => panePid),
+      listPanes: vi.fn(async () => [{ id: "%17", index: 0, cwd: "/fixture", width: 80, height: 24, active: true }]),
+      readAllPaneProcesses: vi.fn(async () => new Map([["%17", { pid: panePid, command: "sh", dead: false }]])),
+      capturePaneScreen: vi.fn(async () => screen),
+    };
+    const listProcesses = vi.fn(async () => processes()); const now = new Date("2030-01-01T00:00:00Z");
+    const deps = { db, tmux, listProcesses, now: () => now };
+    return { tmux, listProcesses, processes, now, destination, hookScreen, read: makeKernelHookReviewReader(deps),
+      screen: (value: string) => { screen = value; }, changeNative: () => { nativePid++; },
+      changePanePid: () => { panePid += 1000; }, changeBinding: () => sessions.updateBinding(node.id, { tmuxPane: "%18" }) };
+  }
+
+  it("escalates a verified shell-backed kernel Codex and leaves its alert unresolved while lineage is unknown", async () => {
+    const f = shellHookReaderFixture();
+    expect(await verifyCodexPaneProcess({ target: "%17", tmux: f.tmux, listProcesses: f.listProcesses })).not.toBeNull();
+    expect((await f.read())[0]?.state).toBe("blocked");
+    const posts: unknown[] = []; const port = engine(posts);
+    await tick(port, { now: f.now, readHookReviews: f.read });
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(alerts()[0]!.body).toContain(f.destination);
+    f.screen("OpenAI Codex (v0.164.0)\nmodel: gpt-5\n› ");
+    f.listProcesses.mockResolvedValue([]);
+    expect((await f.read())[0]?.state).toBe("unknown");
+    await tick(port, { now: f.now, readHookReviews: f.read });
+    expect(alerts()).toHaveLength(1); expect(posts).toHaveLength(1);
+    f.listProcesses.mockImplementation(async () => f.processes());
+    expect((await f.read())[0]?.state).toBe("clear");
+    await tick(port, { now: f.now, readHookReviews: f.read });
+    expect(alerts()).toHaveLength(0);
+  });
+
+  it.each(["missing", "unavailable", "changing", "capture-change", "pane-change", "binding-change"])(
+    "a shell-backed kernel observation stays unknown without a stable chain: %s", async kind => {
+      const f = shellHookReaderFixture();
+      if (kind === "missing") f.listProcesses.mockResolvedValue([]);
+      if (kind === "unavailable") f.listProcesses.mockRejectedValue(new Error("unavailable process table"));
+      if (kind === "changing") f.listProcesses.mockImplementation(async () => { f.changeNative(); return f.processes(); });
+      if (kind === "capture-change") f.tmux.capturePaneScreen.mockImplementation(async () => { f.changeNative(); return f.hookScreen; });
+      if (kind === "pane-change") f.tmux.capturePaneScreen.mockImplementation(async () => { f.changePanePid(); return f.hookScreen; });
+      if (kind === "binding-change") f.tmux.capturePaneScreen.mockImplementation(async () => { f.changeBinding(); return f.hookScreen; });
+      expect((await f.read())[0]?.state).toBe("unknown");
+      const posts: unknown[] = [];
+      await tick(engine(posts), { now: f.now, readHookReviews: f.read });
+      expect(alerts()).toHaveLength(0); expect(posts).toHaveLength(0);
+    });
 
   it("several rows share one alert, persisted acceptance and receipt across reconstructed ticks", async () => {
     await refusal(3); const posts: unknown[] = []; const port = engine(posts);
@@ -251,6 +711,8 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     expect(classifyPromptAfterRefusal({ ...idle, needsInput: { count: 1, reason: "permission prompt" } }, refusedAt)).toBe("blocked");
     expect(classifyPromptAfterRefusal({ ...idle, activity: "unknown", changedAt: after, needsInputEvidence: clearAt(after) }, refusedAt)).toBe("unknown");
     expect(classifyPromptAfterRefusal(null, refusedAt)).toBe("unknown");
+    expect(classifyPromptAfterRefusal({ ...idle, activity: "working", needsInputEvidence: clearAt(after) }, refusedAt)).toBe("clear");
+    expect(classifyPromptAfterRefusal({ ...idle, activity: "working", needsInputEvidence: null }, refusedAt)).toBe("unknown");
   });
 
   it("activity-only Codex and generic changes cannot clear a refused prompt", () => {
@@ -316,7 +778,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     ["invalid JSON holding both strings", (k: string) => `["wake-prompt-refusal","prompt-episode:${k}"`, "done", true],
     ["the episode tag without the alert tag", (k: string) => JSON.stringify(["review", `prompt-episode:${k}`]), "done", true],
     ["a longer key sharing this key as a prefix", (k: string) => exact(`${k}0`), "done", true],
-    ["the next ordinal of the same obligation set", (k: string) => exact(k.replace(/#1$/, "#2")), "done", true],
+    ["another attempt for the same obligation set", (k: string) => exact(`${k.split("#")[0]}#another-attempt`), "done", true],
     ["the episode tag in another case", (k: string) => exact(k.toUpperCase()), "done", true],
     ["the alert tag as an object key, not a value", (k: string) => JSON.stringify({ "wake-prompt-refusal": `prompt-episode:${k}` }), "done", true],
     ["both tags nested one level down", (k: string) => JSON.stringify([["wake-prompt-refusal", `prompt-episode:${k}`]]), "done", true],
@@ -472,7 +934,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     const row = await refusal(); const buffer = new DispatchBuffer(home); let sends = 0;
     const dispatcher = new GatewayDispatcher({ buffer, send: () => { sends++; throw new Error("connector disconnected after persist"); } });
     dispatcher.onCapability({ kind: "capability", connectorId: "fixture", platform: "slack", protocolVersion: 1, ops: ["post_message"] });
-    const port = makeOperatorDeliveryEngine({ home, queueRepo: repo, registry: { loadHumanRegistry: () => registry },
+    const port = makeOperatorDeliveryEngine({ home, queueRepo: repo, ...{ readiness: async () => ({ ready: true, reason: "fixture" }) }, registry: { loadHumanRegistry: () => registry },
       dispatch: (op, ref, payload, opts) => dispatcher.dispatch(op, ref, payload, opts) });
     expect(await port.dispatchEscalation(row, "blocked")).toMatchObject({ decision: "accepted-pending", dispatched: true, resolved: false });
     const pending = new DispatchBuffer(home).pending(); expect(pending).toHaveLength(1);
@@ -513,7 +975,7 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
   it("an unadvertised connector is unresolved with no buffer entry or repeated note", async () => {
     await refusal(); const sends = vi.fn();
     const dispatcher = new GatewayDispatcher({ buffer: new DispatchBuffer(home), send: sends });
-    const port = makeOperatorDeliveryEngine({ home, queueRepo: repo, registry: { loadHumanRegistry: () => registry },
+    const port = makeOperatorDeliveryEngine({ home, queueRepo: repo, ...{ readiness: async () => ({ ready: true, reason: "fixture" }) }, registry: { loadHumanRegistry: () => registry },
       dispatch: (op, ref, payload, opts) => dispatcher.dispatch(op, ref, payload, opts) });
     await tick(port); const id = alerts()[0]!.qitemId; const before = repo.listTransitions(id);
     await tick(port); await tick(port);
@@ -604,6 +1066,305 @@ describe("prompt-blocked outstanding work reaches the configured route", () => {
     db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = ?").run("[]", badId);
     await tick(port);
     expect(repo.getById(alert.qitemId)?.state).toBe("done");
+  });
+
+  // A two-hour reminder refused at the seat's prompt, recorded the way the watchdog engine records its attempts.
+  function reminder(outcomes: Array<"refused" | "sent">) {
+    const { jobId } = new WatchdogJobsRepository(db).register({ policy: "periodic-reminder", targetSession: seat, intervalSeconds: 7200,
+      specYaml: `policy: periodic-reminder\ntarget:\n  session: ${seat}\ninterval_seconds: 7200\nmessage: sweep\n`, registeredBySession: seat });
+    // Distinct default timestamps order history; tests crossing a queue clear marker must supply event times.
+    const log = new WatchdogHistoryLog(db); let last = 0;
+    const record = (outcome: "refused" | "sent", kind = "selection_prompt",
+      evaluatedAt = new Date(last = Math.max(Date.now(), last + 1)).toISOString()) => log.record({ jobId, evaluatedAt, outcome,
+      deliveryTargetSession: seat, deliveryStatus: outcome === "sent" ? "ok" : "failed",
+      evaluationNotes: outcome === "refused" ? { deliveryReason: `Refused: '${seat}' is at an interactive prompt (${kind}). No text was sent.` } : null });
+    outcomes.forEach(outcome => record(outcome));
+    return { jobId, record };
+  }
+
+  it("a reminder refused twice at the prompt reaches the seat's orchestrator, and the alert stands down once one lands", async () => {
+    const posts: unknown[] = []; const port = engine(posts); const wakes: string[] = [];
+    const opts = { resolveOrchestrator: () => "lead@fixture", attemptWake: async (_id: string, target: string) => { wakes.push(target); return "verified"; } };
+    const { jobId, record } = reminder(["refused"]);
+    await tick(port, opts);
+    expect(alerts()).toEqual([]);
+    record("refused");
+    await tick(port, opts);
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0]?.destinationSession).toBe("lead@fixture");
+    expect(alerts()[0]?.body).toContain(jobId);
+    record("sent");
+    await tick(port, opts);
+    expect(alerts()).toEqual([]);
+    expect(wakes).toEqual(["lead@fixture"]); expect(posts).toEqual([]);
+  });
+
+  it("a seat with no orchestrator: its twice-refused reminder reaches a person, never the blocked seat", async () => {
+    const posts: unknown[] = []; const port = engine(posts);
+    const { jobId } = reminder(["refused", "refused"]);
+    await tick(port);
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(JSON.stringify(posts)).toContain(jobId);
+  });
+
+
+  const toLead = (wakes: string[]) => ({ resolveOrchestrator: () => "lead@fixture",
+    attemptWake: async (_id: string, target: string) => { wakes.push(target); return "verified"; } });
+
+  it.each([[49, false], [50, false], [51, false], [51, true]] as const)("%i refusals after a delivered reminder stay one episode (first alert closed by hand: %s)", async (count, closed) => {
+    const port = engine([]); const wakes: string[] = [];
+    const { record } = reminder(["sent", "refused", "refused"]);
+    await tick(port, toLead(wakes));
+    const [alert] = alerts();
+    if (closed) repo.update({ qitemId: alert!.qitemId, actorSession: "lead@fixture", state: "done", closureReason: "no-follow-on", transitionNote: "handled by hand" });
+    for (let i = 2; i < count; i++) record("refused");
+    await tick(port, toLead(wakes));
+    expect(alerts().map(a => a.qitemId)).toEqual(closed ? [] : [alert!.qitemId]);
+    expect(wakes).toEqual(["lead@fixture"]);
+  });
+
+  it.each([-1, 0])("a prompt that clears and comes back between reminders raises a new alert after two new refusals (last old refusal at clear %i ms)", async lastOldOffset => {
+    const clearAt = Date.parse("2030-01-01T00:00:00Z");
+    const at = (offset: number) => new Date(clearAt + offset).toISOString();
+    vi.useFakeTimers({ toFake: ["Date"], now: clearAt - 3 });
+    try {
+      const port = engine([]); const wakes: string[] = [];
+      const { record } = reminder([]);
+      vi.setSystemTime(clearAt);
+      record("refused", "selection_prompt", at(-2));
+      record("refused", "selection_prompt", at(lastOldOffset));
+      await tick(port, toLead(wakes));
+      const [first] = alerts();
+      state = "clear"; await tick(port, toLead(wakes));
+      expect(alerts()).toEqual([]);
+      state = "blocked"; await tick(port, toLead(wakes));
+      vi.setSystemTime(clearAt + 1);
+      record("refused", "selection_prompt", at(1)); await tick(port, toLead(wakes));
+      expect(alerts()).toEqual([]);
+      record("refused", "selection_prompt", at(1)); await tick(port, toLead(wakes));
+      expect(alerts()).toHaveLength(1);
+      expect(alerts()[0]?.qitemId).not.toBe(first!.qitemId);
+      expect(wakes).toEqual(["lead@fixture", "lead@fixture"]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("another job's alert retiring while the prompt stays blocked doesn't restart an episode closed by hand", async () => {
+    const port = engine([]); const wakes: string[] = [];
+    const a = reminder(["sent", "refused", "refused"]);
+    await tick(port, toLead(wakes));
+    const [closedByHand] = alerts();
+    repo.update({ qitemId: closedByHand!.qitemId, actorSession: "lead@fixture", state: "done", closureReason: "no-follow-on", transitionNote: "handled by hand" });
+    const b = reminder(["refused", "refused"]);
+    await tick(port, toLead(wakes));
+    expect(alerts()).toHaveLength(1);
+    new WatchdogJobsRepository(db).stop(b.jobId);
+    await tick(port, toLead(wakes));
+    expect(alerts()).toEqual([]);
+    a.record("refused"); a.record("refused");
+    await tick(port, toLead(wakes));
+    expect(alerts()).toEqual([]);
+    expect(wakes).toEqual(["lead@fixture", "lead@fixture"]);
+  });
+
+  it("a prompt alert routed to a fallback still records a cleared prompt, so the next blocked episode alerts", async () => {
+    const clearAt = Date.parse("2030-01-01T00:00:00Z");
+    const at = (offset: number) => new Date(clearAt + offset).toISOString();
+    // Queue transitions use Date, not tick's injected now. History times describe the causal sequence explicitly.
+    vi.useFakeTimers({ toFake: ["Date"], now: clearAt - 4 });
+    try {
+      const port = engine([]); const wakes: string[] = [];
+      const { record } = reminder([]);
+      vi.setSystemTime(clearAt);
+      record("sent", "selection_prompt", at(-3));
+      record("refused", "selection_prompt", at(-2));
+      record("refused", "selection_prompt", at(-1));
+      await tick(port, toLead(wakes));
+      const first = alerts()[0]!;
+      repo.routeToFallback(first.qitemId, "backup@fixture", "lead removed");
+      state = "clear"; await tick(port, toLead(wakes));
+      expect(alerts()).toEqual([]);
+      state = "blocked"; vi.setSystemTime(clearAt + 1);
+      record("refused", "selection_prompt", at(1));
+      record("refused", "selection_prompt", at(1));
+      await tick(port, toLead(wakes));
+      expect(alerts()).toHaveLength(1);
+      expect(alerts()[0]!.qitemId).not.toBe(first.qitemId);
+      expect(repo.getById(first.qitemId)?.state).toBe("done");
+      expect(wakes).toEqual(["lead@fixture", "lead@fixture"]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("a reminder that joins a seat's existing prompt alert is named on it, and nothing is sent again", async () => {
+    await refusal(); const port = engine([]); const wakes: string[] = [];
+    await tick(port, toLead(wakes));
+    const [alert] = alerts();
+    const { jobId } = reminder(["refused", "refused"]);
+    await tick(port, toLead(wakes));
+    expect(alerts().map(a => a.qitemId)).toEqual([alert!.qitemId]);
+    expect(notes(alert!.qitemId)).toContain(`wake-escalation watchdog reminders added: ${jobId}`);
+    expect(wakes).toEqual(["lead@fixture"]);
+  });
+
+  // #81: a Claude seat at a choice prompt no hook announces (its weekly usage-limit dialog) holds open rows. Its own
+  // evidence stays unknown, so before this only the transport's refusal knew, and nothing escalated.
+  const choiceRefusal = `Refused: '${seat}' is at an interactive prompt (selection_prompt). A message must not select or approve it.`;
+
+  it("#81: a choice prompt no hook announces reaches the registry's first human after one retry interval, never the seat", async () => {
+    const row = await refusal(1, choiceRefusal); state = "unknown";
+    const posts: unknown[] = []; const to: string[] = []; const port = engine(posts, true, to);
+    // Inside the interval: a prompt someone answers within seconds never escalates.
+    await tick(port, { now: new Date() });
+    expect(alerts()).toEqual([]);
+    await tick(port);
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    // The operator rung's only route is the human registry's first entry; the blocked seat is never typed into.
+    expect(to).toEqual(["human-owner@external"]);
+    expect(JSON.stringify(posts)).toContain("assigned work");
+    expect(repo.getById(row.qitemId)?.state).toBe("in-progress");
+    await tick(port); expect(posts).toHaveLength(1);
+  });
+
+  it("#81: other refusals with no evidence keep waiting for it, as before", async () => {
+    await refusal(); state = "unknown"; const posts: unknown[] = []; const port = engine(posts);
+    await tick(port); await tick(port);
+    expect(alerts()).toEqual([]); expect(posts).toEqual([]);
+  });
+
+  it("#81: a choice prompt with newer clearing evidence stays quiet past the interval", async () => {
+    await refusal(1, choiceRefusal); state = "clear"; const posts: unknown[] = []; const port = engine(posts);
+    await tick(port);
+    expect(alerts()).toEqual([]); expect(posts).toEqual([]);
+    expect(notes(episodeRows[0]!).some(note => note.includes("interactive prompt cleared"))).toBe(true);
+  });
+
+  // An open refused episode at `who`, as the parked-owner policy records it; `at` backdates its notes.
+  async function refusedEpisode(who: string, kind = "selection_prompt", at?: string, n = 1) {
+    const row = await repo.create({ sourceSession: "sender@fixture", destinationSession: who, body: `work held by ${who}`, summary: `work held by ${who}`, nudge: false });
+    const key = `${who}|fixture#${n}`;
+    for (const transitionNote of [`${RESERVE_PREFIX} ${key}; obligations ${row.qitemId}`,
+      `${REFUSED_PREFIX} ${key}; Refused: '${who}' is at an interactive prompt (${kind}). No text was sent.`]) {
+      repo.transitionLog.append({ qitemId: row.qitemId, state: "pending", actorSession: "watchdog@system", transitionNote });
+    }
+    if (at) db.prepare("UPDATE queue_transitions SET ts = ? WHERE qitem_id = ? AND (transition_note LIKE ? OR transition_note LIKE ?)")
+      .run(at, row.qitemId, `${RESERVE_PREFIX}%`, `${REFUSED_PREFIX}%`);
+    return row;
+  }
+
+  it("#81: seats blocked at a prompt together (a shared usage limit) post to the person once; the next posts after that alert retires", async () => {
+    await refusedEpisode("first@fixture"); await refusedEpisode("second@fixture");
+    const posts: unknown[] = []; const to: string[] = []; const port = engine(posts, true, to);
+    const states: Record<string, "blocked" | "clear" | "unknown"> = { "first@fixture": "blocked", "second@fixture": "blocked" };
+    const read = { readPromptState: (dest: string) => states[dest] ?? "unknown" };
+    await tick(port, read); await tick(port, read);
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    const dispatched = alerts().filter(a => notes(a.qitemId).some(n => n.includes("operator dispatched-to-engine")));
+    const waiting = alerts().filter(a => notes(a.qitemId).some(n => n.includes("operator waiting on")));
+    expect(dispatched).toHaveLength(1); expect(waiting).toHaveLength(1);
+    expect(notes(waiting[0]!.qitemId).join("\n")).toContain(`operator waiting on ${dispatched[0]!.qitemId}`);
+    expect(to).toEqual(["human-owner@external"]);
+    const postedSeat = dispatched[0]!.tags!.find(t => t.startsWith("prompt-destination:"))!.slice("prompt-destination:".length);
+    states[postedSeat] = "clear";
+    await tick(port, read); await tick(port, read);
+    expect(repo.getById(dispatched[0]!.qitemId)?.state).toBe("done");
+    await vi.waitFor(() => expect(posts).toHaveLength(2));
+    expect(to).toEqual(["human-owner@external", "human-owner@external"]);
+  });
+
+  it("#81: a permission prompt never waits behind a posted choice-prompt alert", async () => {
+    await refusedEpisode("choice@fixture"); await refusedEpisode("approve@fixture", "permission_prompt");
+    const posts: unknown[] = []; const port = engine(posts);
+    const read = { readPromptState: () => "blocked" as const };
+    await tick(port, read); await tick(port, read);
+    await vi.waitFor(() => expect(posts).toHaveLength(2));
+    expect(alerts().some(a => notes(a.qitemId).some(n => n.includes("operator waiting on")))).toBe(false);
+  });
+
+  const ago = (base: number, seconds: number) => new Date(base - seconds * 1000).toISOString();
+
+  it.each(["selection_prompt", "permission_prompt"])("#81: a choice prompt cleared before a new %s refusal lends it no age", async kind => {
+    const base = Date.now(); const clearedAt = Date.parse(ago(base, 2));
+    await refusedEpisode("again@fixture", "selection_prompt", ago(base, 300), 1);
+    await refusedEpisode("again@fixture", kind, ago(base, 1), 2);
+    const posts: unknown[] = []; const port = engine(posts);
+    // Evidence at T-2s cleared the first prompt; the new refusal at T-1s has nothing newer.
+    await tick(port, { now: new Date(base), readPromptState: (_dest, refusedAt) => Date.parse(refusedAt) < clearedAt ? "clear" : "unknown" });
+    expect(alerts()).toEqual([]); expect(posts).toEqual([]);
+  });
+
+  it("#81: a choice prompt that never cleared keeps its age when new work's refusal arrives", async () => {
+    const base = Date.now();
+    await refusedEpisode("again@fixture", "selection_prompt", ago(base, 300), 1);
+    await refusedEpisode("again@fixture", "selection_prompt", ago(base, 1), 2);
+    const posts: unknown[] = []; const port = engine(posts);
+    await tick(port, { now: new Date(base), readPromptState: () => "unknown" });
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+  });
+
+  const toOps = { humanRung: "explicit-only" as const, loadHumanRegistry: () => ({ ok: true as const, entities: [] }) };
+
+  it("#81: under explicit-only a choice-prompt alert stays with an agent operator seat; a permission prompt beside it still posts", async () => {
+    vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "ops@fixture");
+    try {
+      await refusedEpisode("choice@fixture"); await refusedEpisode("approve@fixture", "permission_prompt");
+      const posts: unknown[] = []; const port = engine(posts);
+      const opts = { ...toOps, readPromptState: () => "blocked" as const };
+      await tick(port, opts); await tick(port, opts);
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      await tick(port, opts); expect(posts).toHaveLength(1);
+      expect(JSON.stringify(posts)).toContain("approve@fixture");
+      const alertFor = (dest: string) => alerts().find(a => a.tags?.includes(`prompt-destination:${dest}`))!;
+      expect(alertFor("choice@fixture").destinationSession).toBe("ops@fixture");
+      expect(alertFor("choice@fixture").tags).toContain("prompt-kind:choice");
+      expect(alertFor("approve@fixture").tags).not.toContain("prompt-kind:choice");
+      expect(notes(alertFor("choice@fixture").qitemId).join("\n")).toContain("human rung explicit-only; not posted to a person");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("#81: a reminder refused twice at a choice prompt follows explicit-only too", async () => {
+    vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "ops@fixture");
+    try {
+      const posts: unknown[] = []; const port = engine(posts);
+      reminder(["refused", "refused"]);
+      await tick(port, toOps);
+      const [alert] = alerts();
+      expect(alert?.tags).toContain("prompt-kind:choice");
+      expect(notes(alert!.qitemId).join("\n")).toContain("human rung explicit-only; not posted to a person");
+      expect(new DispatchBuffer(home).pending()).toEqual([]);
+      expect(posts).toEqual([]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("#81: a permission prompt that joins a choice alert the explicit-only floor kept from a person still posts, once", async () => {
+    vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "ops@fixture");
+    try {
+      await refusedEpisode("mixed@fixture", "selection_prompt", undefined, 1);
+      const posts: unknown[] = []; const port = engine(posts);
+      const opts = { ...toOps, readPromptState: () => "blocked" as const };
+      await tick(port, opts);
+      const [alert] = alerts();
+      expect(posts).toEqual([]);
+      await refusedEpisode("mixed@fixture", "permission_prompt", undefined, 2);
+      await tick(port, { ...opts, now: new Date(Date.now() + 240_000) });
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      await tick(port, { ...opts, now: new Date(Date.now() + 360_000) }); expect(posts).toHaveLength(1);
+      expect(alerts().map(a => a.qitemId)).toEqual([alert!.qitemId]);
+      expect(alerts()[0]!.tags).not.toContain("prompt-kind:choice");
+      expect(notes(alert!.qitemId).join("\n")).toContain("explicit-only floor");
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("#81: a reminder whose latest refusal turns from a choice to a permission prompt still posts after the explicit-only floor", async () => {
+    vi.stubEnv("OPENRIG_WORKSPACE_OPERATOR_SEAT_NAME", "ops@fixture");
+    try {
+      const posts: unknown[] = []; const port = engine(posts);
+      const { record } = reminder(["refused", "refused"]);
+      await tick(port, toOps);
+      expect(posts).toEqual([]);
+      record("refused", "permission_prompt");
+      await tick(port, { ...toOps, now: new Date(Date.now() + 240_000) });
+      await vi.waitFor(() => expect(posts).toHaveLength(1));
+      expect(alerts()[0]!.tags).not.toContain("prompt-kind:choice");
+    } finally { vi.unstubAllEnvs(); }
   });
 
 });

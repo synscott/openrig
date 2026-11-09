@@ -16,6 +16,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
 import { ClaimService } from "../src/domain/claim-service.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
+import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 
 
@@ -39,9 +40,11 @@ describe("ClaimService FR-3 — adoption-boundary resume-token capture", () => {
   let readSidecar: ReturnType<typeof vi.fn>;
   let captureCodexThreadId: ReturnType<typeof vi.fn>;
   let claudeProcessStartedAt: ((sessionName: string) => Promise<string | null>) | undefined;
+  let listProcesses: (() => Promise<NativeProcessRow[]>) | undefined;
 
   beforeEach(() => {
     claudeProcessStartedAt = undefined;
+    listProcesses = undefined;
     db = createDb();
     migrate(db, ALL_MIGRATIONS);
     rigRepo = new RigRepository(db);
@@ -70,6 +73,7 @@ describe("ClaimService FR-3 — adoption-boundary resume-token capture", () => {
       contextUsageStore: { readSidecar: readSidecar as unknown as (n: string) => SidecarResult },
       resumeTokenCapturer: { captureCodexThreadId: captureCodexThreadId as unknown as (n: string) => Promise<string | undefined> },
       ...(claudeProcessStartedAt ? { claudeProcessStartedAt } : {}),
+      ...(listProcesses ? { listProcesses } : {}),
     });
   }
 
@@ -132,7 +136,8 @@ describe("ClaimService FR-3 — adoption-boundary resume-token capture", () => {
     expect(row.resume_token).toBe("codex-thread-abcd");
     expect(row.resume_type).toBe("codex_id");
     expect(row.resume_provenance).toBe("adoption");
-    expect(captureCodexThreadId).toHaveBeenCalledWith("dev-qa@test-rig");
+    // The bound node goes with it, so a seat with its own CODEX_HOME is searched there.
+    expect(captureCodexThreadId).toHaveBeenCalledWith("dev-qa@test-rig", { nodeId: node.id });
   });
 
   it("bind captures only an OMP seat's own runner session file", async () => {
@@ -338,6 +343,97 @@ describe("ClaimService FR-3 — adoption-boundary resume-token capture", () => {
     sessionRegistry.markDetached(s.id);
     return { rig, node, session: s };
   }
+
+  it("#2279 does not infer the current conversation from unchanged resume argv after an in-app switch", async () => {
+    const { node, session } = seedDetachedManagedSeat("claude-code", "dev-driver@test-rig");
+    const token = "01a15d9d-bbfc-7559-845f-83cdd04d3f3e";
+    sessionRegistry.updateResumeToken(session.id, "claude_id", token, "hook");
+    mockTmux.listPanes = vi.fn(async () => [{ id: "%0" }] as never);
+    mockTmux.getPanePid = vi.fn(async () => 4242);
+    listProcesses = async () => [
+      { pid: 4242, ppid: 1, pgid: 4242, tpgid: 4243, executableName: "bash", command: "bash", startedAt: "start" },
+      { pid: 4243, ppid: 4242, pgid: 4243, tpgid: 4243, executableName: "claude", command: `claude --resume ${token}`, startedAt: "start" },
+    ];
+    const result = await buildService().reconcileSession({ sessionName: "dev-driver@test-rig" });
+    expect(result.ok).toBe(true);
+    // The process still names A after its conversation has moved to B without a hook.
+    // That indistinguishable observation cannot prove either current identity.
+    expect(tokenRow(node.id).resume_token).toBeNull();
+    if (result.ok) expect(result.result.resumeMetadata?.status).toBe("missing");
+    expect(JSON.stringify(result)).not.toContain(token);
+    expect(mockTmux.sendText).not.toHaveBeenCalled();
+    expect(mockTmux.sendKeys).not.toHaveBeenCalled();
+  });
+
+  it.each(["other conversation", "foreign process", "unstable process", "changed pane", "unreadable process"])('#2279 does not recover an unproved prior token: %s', async (kind) => {
+    const { node, session } = seedDetachedManagedSeat("claude-code", "dev-driver@test-rig");
+    const token = "01a15d9d-bbfc-7559-845f-83cdd04d3f3e";
+    sessionRegistry.updateResumeToken(session.id, "claude_id", token, "hook");
+    mockTmux.listPanes = vi.fn(async () => [{ id: "%0" }] as never);
+    let pidReads = 0;
+    mockTmux.getPanePid = vi.fn(async () => kind === "changed pane" && ++pidReads >= 3 ? 9999 : 4242);
+    let samples = 0;
+    listProcesses = async () => {
+      samples++;
+      if (kind === "unreadable process") throw new Error("process table unavailable");
+      return [
+        { pid: 4242, ppid: 1, pgid: 4242, tpgid: 4243, executableName: "bash", command: "bash", startedAt: "start" },
+        { pid: 4243, ppid: kind === "foreign process" ? 99 : 4242, pgid: 4243, tpgid: 4243,
+          executableName: "claude", command: `claude --resume ${kind === "other conversation" ? "other-session" : token}`,
+          startedAt: kind === "unstable process" && samples % 2 === 0 ? "changed" : "start" },
+      ];
+    };
+    const result = await buildService().reconcileSession({ sessionName: "dev-driver@test-rig" });
+    expect(result.ok).toBe(true);
+    expect(tokenRow(node.id).resume_token).toBeNull();
+    expect(mockTmux.sendText).not.toHaveBeenCalled();
+  });
+
+  it.each(["codex", "claude-code"].flatMap(runtime => [false, true].map(captured => ({ runtime, captured }))))(
+    "reconcile reports future resume metadata for $runtime (captured=$captured), keeping binding success",
+    async ({ runtime, captured }) => {
+      const { node, session } = seedDetachedManagedSeat(runtime, "dev-driver@test-rig");
+      const type = runtime === "codex" ? "codex_id" : "claude_id";
+      sessionRegistry.updateResumeToken(session.id, type, "synthetic-old-conversation", "operator");
+      if (captured) {
+        captureCodexThreadId.mockResolvedValue("synthetic-current-conversation");
+        readSidecar.mockReturnValue({ ok: true, data: { session_id: "synthetic-current-conversation" } });
+      }
+      const result = await buildService().reconcileSession({ sessionName: "dev-driver@test-rig" });
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.result.resumeMetadata).toMatchObject({
+        capture: { outcome: captured ? "captured" : "skipped" }, status: captured ? "recorded" : "missing",
+      });
+      if (!captured) {
+        expect(result.result.resumeMetadata?.capture.reason).toBe(runtime === "codex" ? "not_obtained" : "missing_sidecar");
+        expect(result.result.resumeMetadata?.guidance).toContain("After confirming the live conversation");
+        expect(result.result.resumeMetadata?.guidance).toContain("rig seat set-resume-token");
+        expect(result.result.resumeMetadata?.guidance).toContain("--token-stdin --reason");
+      } else expect(result.result.resumeMetadata?.guidance).toBeUndefined();
+      expect(tokenRow(node.id).resume_token).toBe(captured ? "synthetic-current-conversation" : null);
+      expect(db.prepare("SELECT resume_token FROM sessions WHERE id=?").get(session.id)).toEqual({ resume_token: "synthetic-old-conversation" });
+      expect(sessionRegistry.getBindingForNode(node.id)?.tmuxSession).toBe("dev-driver@test-rig");
+      expect(result.result.continuity).toBe("unverified");
+      expect(mockTmux.sendText).not.toHaveBeenCalled();
+      expect(mockTmux.sendKeys).not.toHaveBeenCalled();
+      expect(JSON.stringify(result)).not.toContain("synthetic-");
+    },
+  );
+
+  it.each(["codex", "claude-code", "terminal"])("keeps a %s binding successful when capture throws or is inapplicable", async runtime => {
+    seedDetachedManagedSeat(runtime, "dev-driver@test-rig");
+    captureCodexThreadId.mockRejectedValue(new Error("internal native detail"));
+    readSidecar.mockImplementation(() => { throw new Error("internal native detail"); });
+    const result = await buildService().reconcileSession({ sessionName: "dev-driver@test-rig" });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.resumeMetadata).toMatchObject({
+      capture: { outcome: runtime === "codex" ? "skipped" : runtime === "claude-code" ? "error" : "exempt" }, status: runtime === "terminal" ? "not_applicable" : "missing",
+    });
+    expect(Boolean(result.result.resumeMetadata?.guidance)).toBe(runtime !== "terminal");
+    expect(JSON.stringify(result)).not.toContain("internal native detail");
+  });
 
   it("reconcileSession captures a Codex token at the no-launch adoption boundary", async () => {
     captureCodexThreadId.mockResolvedValue("codex-thread-reconcile");

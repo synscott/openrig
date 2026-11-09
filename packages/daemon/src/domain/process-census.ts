@@ -1,6 +1,6 @@
 // OPR.0.5.3.10 — the ONE process census.
 //
-// The measured collapse (parent incident qitem-20260823031444-cec9cafb; live
+// The measured collapse (parent incident; live
 // slow-span sample: 171 resume_metadata.list_processes calls, mean 9.39s, max
 // 40.31s): every consumer that needed the process table spawned its own
 // `ps -Ao` — the model-divergence poll once PER SEAT, the snapshot refresher up
@@ -17,7 +17,7 @@
 import type { ProcessRow } from "./model-divergence/current-generation-record.js";
 
 export interface ProcessCensusOpts {
-  /** The underlying enumeration (default: the shared `ps -Ao` lister). */
+  /** The underlying enumeration (default: the shared process-table lister). */
   list?: () => Promise<ProcessRow[]>;
   /** Reuse window for a successful census. Default 2000ms. */
   freshnessMs?: number;

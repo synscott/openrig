@@ -12,10 +12,10 @@ vi.mock("node:child_process", async importOriginal => {
     },
   }) };
 });
-import { execArgvCommand } from "../src/adapters/tmux-exec.js";
+import { execArgvCommand, TMUX_EXEC_TIMEOUT_MS } from "../src/adapters/tmux-exec.js";
 afterEach(() => { vi.unstubAllEnvs(); calls.length = 0; behavior.error = null; });
 describe("checked-create bounded transport with injected process boundary", () => {
-  it("binds exactly one root selector and limits only the explicit creation deadline", async () => {
+  it("binds exactly one root selector and keeps the default deadline and caps an explicit creation deadline", async () => {
     vi.stubEnv("PSMUX_DATA_DIR", "/old"); vi.stubEnv("psmux_data_dir", "/conflicting");
     const before = process.env.PSMUX_DATA_DIR;
     await execArgvCommand(["tmux", "checked-create", "--file", "/fixture/request"], { timeoutMs: 99999, psmuxDataDir: "/frozen" });
@@ -26,7 +26,7 @@ describe("checked-create bounded transport with injected process boundary", () =
     expect(Object.keys(env).filter(key => key.toUpperCase() === "PSMUX_DATA_DIR")).toEqual(["PSMUX_DATA_DIR"]);
     expect(env.PSMUX_DATA_DIR).toBe("/frozen"); expect(process.env.PSMUX_DATA_DIR).toBe(before);
     await execArgvCommand(["tmux", "list-sessions"]);
-    expect(calls[1]!.options).not.toHaveProperty("timeout"); expect(calls[1]!.options).not.toHaveProperty("env");
+    expect(calls[1]!.options.timeout).toBe(TMUX_EXEC_TIMEOUT_MS); expect(calls[1]!.options).not.toHaveProperty("env");
   });
   it("preserves exact exit/output without another dispatch", async () => {
     const error = Object.assign(new Error("fixture"), { code: 2, stdout: '{"status":"collision"}\n', stderr: "" });

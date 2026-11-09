@@ -7,16 +7,79 @@ import type {
   ActivityValue,
   AdapterRungInventory,
   ArbitratedSeatState,
+  EvidenceRoute,
   EvidenceRungId,
   RungHealthEvent,
   RungTrust,
 } from "./activity-taxonomy.js";
-import { AGENT_APP_RUNG_INVENTORY, EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
-import { sessionAgentAppSelect } from "./session-registry.js";
+import { COMMUNITY_HARNESS_RUNG_INVENTORY, COMMUNITY_RUNNER_RUNG_INVENTORY, EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
+import { sessionCommunityHarnessSelect, sessionCommunityRunnerSelect } from "./session-registry.js";
+import { hookPrecedes } from "./agent-activity-store.js";
+import type { SeatStructuralActivityService } from "./seat-structural-activity-service.js";
+import { DEFAULT_STRUCTURAL_STALE_MS } from "./seat-structural-activity-service.js";
+import { SettingsStore } from "./user-settings/settings-store.js";
 
 /** Default polling cadence: 1Hz. The default silence window is 3s, so
- *  1Hz polling gives at-most ~1s freshness lag on the cached observation. */
+ *  1Hz polling gives at-most ~1s freshness lag on the cached observation (a slower cadence from
+ *  daemon.seat_poll_interval_ms adds to that lag and to the idle debounce, which counts ticks). */
 export const DEFAULT_POLL_INTERVAL_MS = 1000;
+/** daemon.seat_poll_interval_ms only slows the pollers down: below the default it would cost more CPU, not less. */
+export const MIN_SEAT_POLL_INTERVAL_MS = DEFAULT_POLL_INTERVAL_MS;
+/** The ceiling of daemon.seat_poll_interval_ms (the settings store's bound too). The structural observation and the proofs read from it (the Codex
+ *  working frame, node inventory, the idle-at-prompt fallback) expire after DEFAULT_STRUCTURAL_STALE_MS (5000 ms).
+ *  The sampler can hold a working-frame proof for about two intervals before the next one replaces it, so
+ *  2 x ceiling must stay below that expiry, with the rest as margin for event-loop lag. Separately, the single-flight
+ *  guard skips a tick that lands while a sweep runs, and the working-frame proof expires 5 s after the capture that
+ *  produced it, so a slower cadence leaves less room for slow tmux, not more: at 2000 ms a structural sweep slower
+ *  than about 2 s (about 3 s at the default) can let a working Codex seat briefly read idle. */
+export const MAX_SEAT_POLL_INTERVAL_MS = 2000;
+/** The setting behind the cadence: `daemon.seat_poll_interval_ms`, mapped from OPENRIG_SEAT_POLL_INTERVAL_MS. */
+export const SEAT_POLL_INTERVAL_KEY = "daemon.seat_poll_interval_ms";
+type ReadSeatPollSetting = () => { value: unknown; source?: string };
+/** The cadence of the seat-activity and structural-activity pollers, from the typed setting
+ *  `daemon.seat_poll_interval_ms` (config.json, or OPENRIG_SEAT_POLL_INTERVAL_MS; `rig config` shows it with its
+ *  source). STARTUP-ONLY: read once when the daemon starts; changing it takes a daemon restart. Each tick both read
+ *  tmux for the running seats (the sampler in one batch when it can, the structural poller by listing the windows and
+ *  capturing panes); on a large fleet those spawned tmux clients are a large share of the daemon's CPU, and a slower
+ *  cadence trades activity freshness for that load. Unset keeps the 1 s default. The settings store validates the
+ *  value: `rig config set` refuses one outside MIN..MAX, and an env value outside it is dropped with a warning on
+ *  stderr (the default is used). A value that still reaches here outside MIN..MAX (a hand-edited config.json the store
+ *  could not check) keeps the default, with a warning. */
+export function resolveSeatPollIntervalMs(
+  read: ReadSeatPollSetting = () => new SettingsStore().resolveOne(SEAT_POLL_INTERVAL_KEY as never),
+  warn: (message: string) => void = (message) => console.warn(message),
+): number {
+  let setting: { value: unknown; source?: string };
+  try {
+    setting = read();
+  } catch (err) {
+    warn(`[seat-activity] ${SEAT_POLL_INTERVAL_KEY} could not be read (${err instanceof Error ? err.message : String(err)});`
+      + ` using ${DEFAULT_POLL_INTERVAL_MS} ms`);
+    return DEFAULT_POLL_INTERVAL_MS;
+  }
+  const ms = Number(setting.value);
+  if (!Number.isSafeInteger(ms) || ms < MIN_SEAT_POLL_INTERVAL_MS || ms > MAX_SEAT_POLL_INTERVAL_MS) {
+    warn(`[seat-activity] ${SEAT_POLL_INTERVAL_KEY}=${JSON.stringify(setting.value)} is not a whole number of milliseconds`
+      + ` in ${MIN_SEAT_POLL_INTERVAL_MS}..${MAX_SEAT_POLL_INTERVAL_MS}; using ${DEFAULT_POLL_INTERVAL_MS} ms`);
+    return DEFAULT_POLL_INTERVAL_MS;
+  }
+  return ms;
+}
+/** Starts both seat pollers on the cadence of `daemon.seat_poll_interval_ms` (read once, here) and returns it. */
+export function startSeatPollers(
+  pollers: {
+    activity?: { start(db: Database.Database, intervalMs?: number): void };
+    structural?: { start(db: Database.Database, intervalMs?: number): void };
+  },
+  db: Database.Database,
+  read?: ReadSeatPollSetting,
+  warn?: (message: string) => void,
+): number {
+  const ms = resolveSeatPollIntervalMs(read, warn);
+  pollers.activity?.start(db, ms);
+  pollers.structural?.start(db, ms);
+  return ms;
+}
 /** Allow automatic review to settle before checking the visible human prompt. */
 export const PERMISSION_REQUEST_GRACE_MS = 3_000;
 
@@ -43,10 +106,15 @@ export interface SeatActivityServiceDeps {
   eventBus?: EventBus;
   now?: () => Date;
   /** Visible prompt observation: null means capture could not establish a state. */
-  permissionPromptReader?: (sessionName: string) => Promise<boolean | null>;
-  permissionPromptChanged?: (sessionName: string, confirmed: boolean) => void;
+  permissionPromptReader?: (sessionName: string, runtime: string) => Promise<boolean | null>;
+  permissionPromptChanged?: (sessionName: string, confirmed: boolean, runtime: string) => void;
   /** Claude pid.json, consulted for seats declaring self-report. */
   selfReportReader?: (sessionName: string, seatNodeId: string) => ActivityEvidence | null;
+  /** Existing bounded pane observations; only a fresh Codex working frame contributes activity. */
+  structuralActivity?: Pick<SeatStructuralActivityService, "getStructuralActivity">;
+  /** A runner seat's last recorded hook, restored when its inventory is declared with no hook evidence yet (after a
+   *  daemon restart). Null when nothing qualifies: another generation or session, or nothing recorded. */
+  restoreHookEvidence?: (seat: { seatNodeId: string; sessionName: string }, runtime: string) => ActivityEvidence | null;
 }
 
 export interface PollSeatOptions {
@@ -63,19 +131,25 @@ export class SeatActivityService {
   // seat-structural-activity-service (MUST-FIX 2). A slowed tmux can never accumulate
   // overlapping whole-fleet sweeps — at most one sweep's worth is ever in flight.
   private sweeping = false;
+  private samplingAuthorityWindowMs = SAMPLING_AUTHORITY_WINDOW_MS;
   private readonly permissionPromptReader?: SeatActivityServiceDeps["permissionPromptReader"];
   private readonly permissionPromptChanged?: SeatActivityServiceDeps["permissionPromptChanged"];
+  private readonly structuralActivity?: SeatActivityServiceDeps["structuralActivity"];
 
   private readonly selfReportReader: ((sessionName: string, seatNodeId: string) => ActivityEvidence | null) | null;
+
+  private readonly restoreHookEvidence: SeatActivityServiceDeps["restoreHookEvidence"] | null;
 
   constructor(deps: SeatActivityServiceDeps) {
     this.permissionPromptReader = deps.permissionPromptReader;
     this.permissionPromptChanged = deps.permissionPromptChanged;
+    this.structuralActivity = deps.structuralActivity;
     this.tmux = deps.tmux;
     this.defaultWindowSeconds = deps.defaultWindowSeconds;
     this.eventBus = deps.eventBus ?? null;
     this.now = deps.now ?? (() => new Date());
     this.selfReportReader = deps.selfReportReader ?? null;
+    this.restoreHookEvidence = deps.restoreHookEvidence ?? null;
   }
 
   /**
@@ -96,12 +170,14 @@ export class SeatActivityService {
     return this.observeSeat(paneId, opts, null);
   }
 
-  /** pollSeat with the sweep's batched read: the seat's timestamp comes from `batch` when it has one, and
-   *  only a seat missing from it is read per target, so a sweep costs one tmux spawn instead of one per seat. */
+  /** pollSeat with the sweep's batched read: the seat's timestamp comes from `batch` when it has one, so a sweep costs
+   *  one tmux spawn instead of one per seat. A seat missing from a batch that was read is not asked about by target:
+   *  its session is gone, or its value is the same malformed one a per-target read returns, and tmux 3.2a (Ubuntu
+   *  22.04's) exits its whole server when asked about a vanished target. Only with no batch is each seat read per target. */
   private async observeSeat(paneId: string, opts: PollSeatOptions | undefined, batch: Map<string, number> | null): Promise<SeatActivity | null> {
     const silenceWindowSeconds = opts?.silenceWindowSeconds ?? this.defaultWindowSeconds;
     let lastActivityEpochSeconds: number | null = batch?.get(paneId) ?? null;
-    if (lastActivityEpochSeconds === null) {
+    if (lastActivityEpochSeconds === null && batch === null) {
       try {
         lastActivityEpochSeconds = await this.tmux.readPaneLastActivity(paneId);
       } catch {
@@ -109,7 +185,12 @@ export class SeatActivityService {
       }
     }
     await this.pollPermissionPrompt(paneId);
-    if (lastActivityEpochSeconds === null) return null;
+    if (lastActivityEpochSeconds === null) {
+      const seatNodeId = this.sessionToSeat.get(paneId);
+      const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+      if (seat) this.arbitrate(seat);
+      return null;
+    }
 
     const observedAt = this.now();
     const ageSeconds = observedAt.getTime() / 1000 - lastActivityEpochSeconds;
@@ -138,16 +219,32 @@ export class SeatActivityService {
     if (seatNodeId) {
       const seq = (this.samplerSeqBySession.get(paneId) ?? 0) + 1;
       this.samplerSeqBySession.set(paneId, seq);
+      const seat = this.ladder.get(seatNodeId);
+      let codexFrameWorking = false;
+      let codexFrameProofAt: string | undefined;
+      if (seat?.inventory?.runtime === "codex" && this.structuralActivity) {
+        const frame = this.structuralActivity.getStructuralActivity(paneId);
+        const capturedAt = frame ? Date.parse(frame.observedAt) : NaN;
+        const frameStarted = frame?.codexWorkingFrame ? Date.parse(frame.codexWorkingFrame.captureStartedAt) : NaN;
+        const proofAt = frame?.codexWorkingFrame ? Date.parse(frame.codexWorkingFrame.proofAt) : NaN;
+        const previousStarted = frame?.codexWorkingFrame?.previousCaptureStartedAt;
+        codexFrameWorking = frame !== null && frame?.state !== "attention" && Number.isFinite(capturedAt)
+          && Number.isFinite(frameStarted) && frameStarted >= seat.inventorySinceMs
+          && (previousStarted === undefined || Date.parse(previousStarted) >= seat.inventorySinceMs)
+          && Number.isFinite(proofAt) && proofAt <= capturedAt && proofAt <= observedAt.getTime()
+          && observedAt.getTime() - proofAt < DEFAULT_STRUCTURAL_STALE_MS && frameStarted <= proofAt;
+        if (codexFrameWorking) codexFrameProofAt = frame!.codexWorkingFrame!.proofAt;
+      }
+      const paneOverridesQuietWindow = codexFrameWorking && !isActiveWithinWindow;
       this.reportEvidence({
         seatNodeId,
         sessionName: paneId,
         rung: "window-sampling",
-        sourceId: "tmux:window-activity",
+        sourceId: paneOverridesQuietWindow ? "codex:working-frame-fallback" : "tmux:window-activity",
         seq,
-        observedAt: record.lastObservedAt,
-        activity: isActiveWithinWindow ? "working" : "idle-at-prompt",
+        observedAt: paneOverridesQuietWindow ? codexFrameProofAt! : record.lastObservedAt,
+        activity: isActiveWithinWindow || codexFrameWorking ? "working" : "idle-at-prompt",
       });
-      const seat = this.ladder.get(seatNodeId);
       if (this.selfReportReader && seat?.inventory?.rungs.some((r) => r.rung === "self-report")) {
         const evd = this.selfReportReader(paneId, seatNodeId);
         if (evd) this.reportEvidence(evd); // null = unreadable ⇒ the rung simply stales
@@ -159,35 +256,89 @@ export class SeatActivityService {
   private async pollPermissionPrompt(sessionName: string, canCapture = true): Promise<void> {
     const seatNodeId = this.sessionToSeat.get(sessionName);
     const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
-    if (!seat || seat.retired) return;
+    if (!seat || seat.retired || seat.permissionPolling) return;
+    const runtime = seat.inventory?.runtime ?? "codex";
+    const claude = runtime === "claude-code";
     const nowMs = this.now().getTime();
     const snapshot = [...seat.permissions].filter(([, request]) =>
-      nowMs - request.sinceMs >= PERMISSION_REQUEST_GRACE_MS && nowMs >= request.nextCheckMs);
+      (claude || nowMs - request.sinceMs >= PERMISSION_REQUEST_GRACE_MS) && nowMs >= request.nextCheckMs);
     if (snapshot.length === 0) return;
     const permissionRevision = seat.permissionRevision;
-    const visible = canCapture && this.permissionPromptReader
-      ? await this.permissionPromptReader(sessionName).catch(() => null)
-      : null;
-    if (seat.retired || seat.sessionName !== sessionName) return;
-    if (visible === false && seat.permissionRevision !== permissionRevision) return;
-    let updated = false;
-    for (const [id, request] of snapshot) {
-      if (seat.permissions.get(id) !== request) continue;
-      request.confirmed = visible !== false;
-      request.nextCheckMs = this.now().getTime()
-        + (visible === false && this.now().getTime() - request.sinceMs >= 10_000 ? 5_000 : DEFAULT_POLL_INTERVAL_MS);
-      updated = true;
+    const occupant = seat.arbitrated.lastSwap;
+    seat.permissionPolling = true;
+    try {
+      const visible = canCapture && this.permissionPromptReader
+        ? await this.permissionPromptReader(sessionName, runtime).catch(() => null)
+        : null;
+      if (seat.retired || seat.sessionName !== sessionName || seat.arbitrated.lastSwap !== occupant) return;
+      if (visible === false && seat.permissionRevision !== permissionRevision) return;
+      let updated = false;
+      for (const [id, request] of snapshot) {
+        if (seat.permissions.get(id) !== request) continue;
+        // A screen does not identify which Claude actor owns a dialog. With overlapping actors, only a
+        // scoped batch or turn boundary can settle their unseen notifications.
+        request.seen ||= visible === true && (!claude || seat.permissions.size === 1);
+        request.confirmed = visible !== false || (claude && !request.seen);
+        request.nextCheckMs = this.now().getTime()
+          + (visible === false && this.now().getTime() - request.sinceMs >= 10_000 ? 5_000 : DEFAULT_POLL_INTERVAL_MS);
+        if (claude && !request.confirmed) seat.permissions.delete(id);
+        updated = true;
+      }
+      if (!updated) return;
+      this.reportPermissionObservation(seatNodeId!, seat, "needs-input-chrome", this.now().toISOString(),
+        !claude && visible === null ? "permission_request_unverified" : "permission_prompt");
+    } finally {
+      seat.permissionPolling = false;
     }
-    if (!updated) return;
-    seat.permissionObservedAt = this.now().toISOString();
+  }
+
+  /** A native Claude PostToolBatch resolves only this actor's earlier permission notifications. The route checks
+   *  the emitting occupant first. Missing actor attribution and unordered timestamps retain the pane/turn fallback. */
+  completeClaudeToolBatch(sessionName: string, hookAgentId: string | null, observedAt: string): boolean {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = Date.parse(observedAt);
+    if (!Number.isFinite(completedAt)) return false;
+    // A notification may arrive after its completion, including when no request was observed yet.
+    seat.claudeToolBatches.set(hookAgentId, Math.max(completedAt, seat.claudeToolBatches.get(hookAgentId) ?? -Infinity));
+    let settled = false;
+    for (const [id, request] of seat.permissions) {
+      if (request.hookAgentId === undefined || request.hookAgentId !== hookAgentId
+          || !(Date.parse(request.observedAt) < completedAt)) continue;
+      seat.permissions.delete(id);
+      settled = true;
+    }
+    if (!settled) return false;
+    seat.permissionRevision++;
+    this.reportPermissionObservation(seatNodeId!, seat, "lifecycle-hooks", observedAt, "permission_prompt");
+    return true;
+  }
+
+  /** Whether this occupant's actor already completed a strictly later batch. Equal timestamps do not establish order. */
+  hasLaterClaudeToolBatch(sessionName: string, hookAgentId: string | null | undefined, observedAt: string): boolean {
+    if (hookAgentId === undefined) return false;
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired || seat.inventory?.runtime !== "claude-code") return false;
+    const completedAt = seat.claudeToolBatches.get(hookAgentId);
+    return completedAt !== undefined && Date.parse(observedAt) < completedAt;
+  }
+
+  private reportPermissionObservation(seatNodeId: string, seat: SeatLadderState, rung: EvidenceRungId,
+    observedAt: string, reason: string): void {
+    const runtime = seat.inventory?.runtime ?? "codex";
+    seat.permissionEvidence = { rung, observedAt };
     const count = [...seat.permissions.values()].filter(request => request.confirmed).length;
-    const sourceId = "codex:permission-prompt";
-    this.reportEvidence({
-      seatNodeId: seatNodeId!, sessionName, rung: "needs-input-chrome", sourceId,
-      seq: (seat.sources.get(sourceId)?.latest.seq ?? 0) + 1,
-      observedAt: seat.permissionObservedAt,
-      needsInput: { count, reason: count ? (visible === null ? "permission_request_unverified" : "permission_prompt") : null },
-    });
+    if (runtime === "claude-code" && count === 0) {
+      for (const source of seat.sources.values()) {
+        if (source.latest.permissionRequest) source.latest = { ...source.latest, needsInput: undefined };
+      }
+    }
+    const sourceId = `${runtime}:permission-prompt`;
+    this.reportEvidence({ seatNodeId, sessionName: seat.sessionName, rung, sourceId,
+      seq: (seat.sources.get(sourceId)?.latest.seq ?? 0) + 1, observedAt,
+      needsInput: { count, reason: count ? reason : null } });
   }
 
   /**
@@ -212,7 +363,8 @@ export class SeatActivityService {
     seat.retired = true;
     seat.sources.clear();
     seat.permissions.clear();
-    seat.permissionObservedAt = null;
+    seat.claudeToolBatches.clear();
+    seat.permissionEvidence = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
     seat.promotion.clear();
@@ -236,14 +388,15 @@ export class SeatActivityService {
     try {
       const rows = db.prepare(`
         SELECT s.session_name as session_name, n.id as node_id, n.runtime as runtime,
-          COALESCE(b.attachment_type, 'tmux') as attachment_type, ${sessionAgentAppSelect(db)} as agent_app
+          COALESCE(b.attachment_type, 'tmux') as attachment_type, ${sessionCommunityHarnessSelect(db)} as community_harness,
+          ${sessionCommunityRunnerSelect(db)} as community_runner
         FROM nodes n
         JOIN sessions s ON s.node_id = n.id
           AND s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
         LEFT JOIN bindings b ON b.node_id = n.id
         WHERE s.status = 'running'
           AND s.session_name IS NOT NULL
-      `).all() as Array<{ session_name: string; node_id: string; runtime: string | null; attachment_type: string; agent_app: string | null }>;
+      `).all() as Array<{ session_name: string; node_id: string; runtime: string | null; attachment_type: string; community_harness: string | null; community_runner: number | null }>;
       const tmuxRows = rows.filter((r) => r.attachment_type === "tmux");
       const liveTmux = new Set(tmuxRows.map((r) => r.session_name));
       for (const pane of this.latestByPaneId.keys()) {
@@ -265,16 +418,18 @@ export class SeatActivityService {
       // touching the launch machinery.
       for (const r of tmuxRows) {
         const known = this.ladder.get(r.node_id);
-        const inventory = runtimeRungInventory(r.runtime, r.agent_app);
+        const inventory = runtimeRungInventory(r.runtime, r.community_harness, r.community_runner === 1);
         // A replacement occupant can keep the seat's session name; its own recorded app selection (or none) decides.
-        const agentAppChanged = !!known && (known.inventory === AGENT_APP_RUNG_INVENTORY) !== (inventory === AGENT_APP_RUNG_INVENTORY);
-        if (!known || known.inventory === null || known.sessionName !== r.session_name || agentAppChanged) {
+        // A plain and a runner launch of the same app read differently, so a change between them re-declares too.
+        const communityHarnessChanged = !!known && communityKind(known.inventory) !== communityKind(inventory);
+        if (!known || known.inventory === null || known.sessionName !== r.session_name || communityHarnessChanged) {
           this.declareRungInventory({ seatNodeId: r.node_id, sessionName: r.session_name }, inventory);
+          this.restoreDurableHook({ seatNodeId: r.node_id, sessionName: r.session_name }, inventory, r.runtime);
         }
       }
 
-      // One tmux call reads every session's window activity for this tick; a seat missing from it (or no
-      // batch at all) falls back to its own read, exactly as before.
+      // One tmux call reads every session's window activity for this tick; only with no batch at all does each seat
+      // fall back to its own read, as before.
       let batch: Map<string, number> | null = null;
       if (tmuxRows.length > 0 && this.tmux.readAllSessionWindowActivity) {
         try { batch = await this.tmux.readAllSessionWindowActivity(); } catch { batch = null; }
@@ -299,6 +454,7 @@ export class SeatActivityService {
    */
   start(db: Database.Database, intervalMs: number = DEFAULT_POLL_INTERVAL_MS): void {
     if (this.timer) return;
+    this.samplingAuthorityWindowMs = Math.max(SAMPLING_AUTHORITY_WINDOW_MS, intervalMs * 3);
     this.timer = setInterval(() => {
       void this.pollAllRunningTmuxSeats(db);
     }, intervalMs);
@@ -338,6 +494,7 @@ export class SeatActivityService {
     seat.retired = false;
     this.sessionToSeat.set(binding.sessionName, binding.seatNodeId);
     seat.inventory = inventory;
+    seat.inventorySinceMs = this.now().getTime();
     seat.trust.clear();
     for (const decl of inventory.rungs) seat.trust.set(decl.rung, decl.initialTrust);
     seat.promotion.clear();
@@ -353,16 +510,30 @@ export class SeatActivityService {
     this.sessionToSeat.set(evidence.sessionName, evidence.seatNodeId);
     const prior = seat.sources.get(evidence.sourceId);
     if (prior && evidence.seq <= prior.latest.seq) return; // stale/reordered — dropped
+    // A durable source's posts can arrive out of their own order: an older boundary arriving later is dropped.
+    if (prior && this.durableBoundaries(seat, evidence.rung)
+        && hookPrecedes({ eventAt: evidence.observedAt, sourceSequence: evidence.sourceSequence },
+          { eventAt: prior.latest.observedAt, sourceSequence: prior.latest.sourceSequence })) return;
+    const runtime = seat.inventory?.runtime ?? "codex";
+    const claude = runtime === "claude-code";
+    const wasConfirmed = seat.arbitrated.needsInput.count > 0;
     if (evidence.permissionRequest) {
-      seat.permissionRevision++;
       const request = evidence.permissionRequest;
-      if (!seat.permissions.has(request.id)) {
-        seat.permissions.set(request.id, { sinceMs: this.now().getTime(), confirmed: false, nextCheckMs: 0 });
+      if (claude && this.hasLaterClaudeToolBatch(evidence.sessionName, request.hookAgentId, evidence.observedAt)) return;
+      const previousRequest = seat.permissions.get(request.id);
+      // Relay posts can arrive out of order. Keep the newer actor request so an older batch cannot settle it.
+      if (claude && previousRequest && Date.parse(evidence.observedAt) < Date.parse(previousRequest.observedAt)) return;
+      seat.permissionRevision++;
+      if (claude || !seat.permissions.has(request.id)) {
+        seat.permissions.set(request.id, { sinceMs: this.now().getTime(), observedAt: evidence.observedAt,
+          hookAgentId: request.hookAgentId, confirmed: claude, seen: false, nextCheckMs: 0 });
       }
-    } else if (evidence.rung === "lifecycle-hooks" && evidence.activity === "idle-at-prompt") {
+    } else if ((evidence.rung === "lifecycle-hooks" && (evidence.activity === "idle-at-prompt" || evidence.permissionResolved
+        || (claude && evidence.needsInput?.count && evidence.needsInput.reason !== "permission_prompt")))
+        || (claude && seat.permissions.size === 0 && evidence.needsInput?.count && evidence.needsInput.reason !== "permission_prompt")) {
       seat.permissions.clear();
-      seat.permissionObservedAt = null;
-      seat.sources.delete("codex:permission-prompt");
+      seat.permissionEvidence = null;
+      seat.sources.delete(`${runtime}:permission-prompt`);
     }
     seat.sources.set(evidence.sourceId, {
       latest: evidence,
@@ -372,9 +543,28 @@ export class SeatActivityService {
     this.arbitrate(seat);
     // Recording another pending request must not hide an already confirmed
     // outstanding prompt in the persisted activity consumer.
-    if (evidence.permissionRequest && seat.arbitrated.needsInput.count > 0) {
-      this.permissionPromptChanged?.(seat.sessionName, true);
+    if (wasConfirmed && (evidence.permissionRequest || (claude && seat.permissions.size > 0 && evidence.rung === "lifecycle-hooks"
+        && evidence.activity === "working" && !evidence.permissionResolved))
+        && seat.arbitrated.needsInput.count > 0) {
+      this.permissionPromptChanged?.(seat.sessionName, true, runtime);
     }
+    if (claude && evidence.permissionRequest) void this.pollPermissionPrompt(seat.sessionName).catch(() => {});
+  }
+
+  /** A person attested that the prompt this seat waited on is gone (`clear-attention --reason`): settle it here as a
+   *  resolving hook does, so the oracle, the wake ladder and the inventory agree with the cleared hook. A new permission
+   *  hook starts a new request, and each send still reads the pane. */
+  settlePermissionPrompt(sessionName: string): void {
+    const seatNodeId = this.sessionToSeat.get(sessionName);
+    const seat = seatNodeId ? this.ladder.get(seatNodeId) : undefined;
+    if (!seat || seat.retired) return;
+    seat.permissions.clear();
+    seat.permissionEvidence = null;
+    seat.sources.delete(`${seat.inventory?.runtime ?? "codex"}:permission-prompt`);
+    for (const source of seat.sources.values()) {
+      if (source.latest.needsInput?.count) source.latest = { ...source.latest, needsInput: undefined };
+    }
+    this.arbitrate(seat);
   }
 
   /** A handover/generation swap: its OWN visible event, never an activity transition.
@@ -386,7 +576,8 @@ export class SeatActivityService {
     if (!seat) return;
     seat.sources.clear();
     seat.permissions.clear();
-    seat.permissionObservedAt = null;
+    seat.claudeToolBatches.clear();
+    seat.permissionEvidence = null;
     seat.pendingIdle = null;
     seat.contradictionSinceMs = null;
     seat.promotion.clear();
@@ -398,6 +589,7 @@ export class SeatActivityService {
       activity: "unknown",
       needsInput: { count: 0, reason: null },
       needsInputEvidence: null,
+      backgroundWork: null, // a new occupant never inherits the old one's shell
       decidedBy: null,
       seq: seat.arbitrated.seq + 1, // the swap IS a visible event
       changedAt: at,
@@ -467,10 +659,13 @@ export class SeatActivityService {
         sessionName,
         retired: false,
         inventory: null,
+        inventorySinceMs: this.now().getTime(),
         sources: new Map(),
         permissions: new Map(),
+        claudeToolBatches: new Map(),
         permissionRevision: 0,
-        permissionObservedAt: null,
+        permissionPolling: false,
+        permissionEvidence: null,
         trust: new Map(),
         promotion: new Map(),
         contradictionSinceMs: null,
@@ -481,6 +676,7 @@ export class SeatActivityService {
           activity: "unknown",
           needsInput: { count: 0, reason: null },
           needsInputEvidence: null,
+          backgroundWork: null,
           decidedBy: null,
           seq: 0,
           changedAt: this.now().toISOString(),
@@ -523,29 +719,34 @@ export class SeatActivityService {
   /** AM-2: a TRIAL rung's evidence is measured against the current authoritative
    *  CANDIDATE value (raw ladder decision, pre-debounce) — evidence against evidence,
    *  never against the debounced display. Enough agreements over at least the minimum
-   *  window promote the rung to authoritative, visibly. */
+   *  window promote the rung to authoritative, visibly.
+   *
+   *  Agreements are counted per relay route, because one event can be posted by more than one route; one route must
+   *  reach the bar on its own, over its own window. A disagreement from any route resets every route's run. */
   private measureTrialAgreement(seat: SeatLadderState, evidence: ActivityEvidence): void {
     if (evidence.activity === undefined) return;
     if (this.rungTrust(seat, evidence.rung) !== "trial") return;
     const authority = this.rawCandidate(seat, { excludeRung: evidence.rung });
     if (!authority || authority.activity === undefined) return;
-    const entry = seat.promotion.get(evidence.rung) ?? { agreements: 0, firstAgreementAtMs: null };
-    if (authority.activity === evidence.activity) {
-      entry.agreements += 1;
-      if (entry.firstAgreementAtMs === null) entry.firstAgreementAtMs = this.now().getTime();
-      const spanMs = this.now().getTime() - (entry.firstAgreementAtMs ?? 0);
-      if (entry.agreements >= RUNG_PROMOTION_AGREEMENT_COUNT && spanMs >= RUNG_PROMOTION_MIN_WINDOW_MS) {
-        seat.trust.set(evidence.rung, "authoritative");
-        this.emitRungHealth(seat, evidence.rung, evidence.sourceId, "trial", "authoritative",
-          `promoted: ${entry.agreements} agreeing observations over ${Math.round(spanMs / 60000)}min (threshold ${RUNG_PROMOTION_AGREEMENT_COUNT} over ${Math.round(RUNG_PROMOTION_MIN_WINDOW_MS / 60000)}min)`);
-        seat.promotion.delete(evidence.rung);
-        return;
-      }
-    } else {
-      entry.agreements = 0; // agreement must be consecutive within the measured window
-      entry.firstAgreementAtMs = null;
+    const routes = seat.promotion.get(evidence.rung) ?? new Map<EvidenceRoute | "untagged", PromotionRun>();
+    if (authority.activity !== evidence.activity) {
+      seat.promotion.delete(evidence.rung); // agreement must be consecutive within the measured window, on every route
+      return;
     }
-    seat.promotion.set(evidence.rung, entry);
+    const route = evidence.route ?? "untagged";
+    const entry = routes.get(route) ?? { agreements: 0, firstAgreementAtMs: null };
+    entry.agreements += 1;
+    if (entry.firstAgreementAtMs === null) entry.firstAgreementAtMs = this.now().getTime();
+    const spanMs = this.now().getTime() - entry.firstAgreementAtMs;
+    if (entry.agreements >= RUNG_PROMOTION_AGREEMENT_COUNT && spanMs >= RUNG_PROMOTION_MIN_WINDOW_MS) {
+      seat.trust.set(evidence.rung, "authoritative");
+      this.emitRungHealth(seat, evidence.rung, evidence.sourceId, "trial", "authoritative",
+        `promoted: ${entry.agreements} agreeing observations over ${Math.round(spanMs / 60000)}min (threshold ${RUNG_PROMOTION_AGREEMENT_COUNT} over ${Math.round(RUNG_PROMOTION_MIN_WINDOW_MS / 60000)}min)`);
+      seat.promotion.delete(evidence.rung);
+      return;
+    }
+    routes.set(route, entry);
+    seat.promotion.set(evidence.rung, routes);
   }
 
   /** The raw ladder decision for working/idle: highest authoritative rung with usable,
@@ -559,12 +760,46 @@ export class SeatActivityService {
       if (trust !== "authoritative" && trust !== "positive-only") continue;
       const evd = this.latestByRung(seat, rung, "activity");
       if (!evd || evd.activity === undefined) continue;
+      if (rung === "window-sampling" && nowMs - Date.parse(evd.observedAt) > this.samplingAuthorityWindowMs) continue;
+      // A working frame only overrides the quiet window while its proof is fresh, even if polling stops.
+      if (rung === "window-sampling" && evd.sourceId === "codex:working-frame-fallback"
+          && nowMs - Date.parse(evd.observedAt) >= DEFAULT_STRUCTURAL_STALE_MS) return { ...evd, activity: "idle-at-prompt" };
       // A positive-only rung answers only "working"; its silence leaves the state to the rungs below, or unknown.
       if (trust === "positive-only" && evd.activity !== "working") continue;
-      if (rung === "lifecycle-hooks" && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
+      // A durable rung's idle or attention boundary holds; a bare working boundary still expires, then falls to the
+      // rungs below, so a turn whose end was lost can't read working forever.
+      // A runner's counted working beat lasts its own livenessSeconds instead (the runner contract §4).
+      if (rung === "lifecycle-hooks" && !(this.durableBoundaries(seat, rung) && (evd.activity !== "working"
+          || (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) > 0))
+          && nowMs - Date.parse(evd.observedAt) > (evd.activity === "working" && evd.workingLivenessSeconds
+            ? evd.workingLivenessSeconds * 1000 : HOOK_AUTHORITY_WINDOW_MS)) continue;
+      // An idle boundary whose source promised to keep reporting holds for two reports. A source that goes quiet (a runner
+      // killed or out of memory) stops reading idle, but only when nothing is waiting on a person: attention holds.
+      if (rung === "lifecycle-hooks" && evd.activity === "idle-at-prompt" && evd.livenessSeconds
+          && (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) === 0
+          && nowMs - Date.parse(evd.observedAt) > 2 * 1000 * evd.livenessSeconds) continue;
       return evd;
     }
     return null;
+  }
+
+  /** A runner seat declared with no hook evidence (after a daemon restart) takes its last recorded hook, so an idle seat
+   *  that posts nothing still reads idle. Its seq is 0: any live hook outranks it. The seat's own runtime reads the
+   *  record, as its live hooks are read: a community runner's inventory names no runtime of its own. */
+  private restoreDurableHook(seat: { seatNodeId: string; sessionName: string }, inventory: AdapterRungInventory,
+    seatRuntime: string | null): void {
+    if (!this.restoreHookEvidence || !inventory.rungs.some((r) => r.rung === "lifecycle-hooks" && r.durableBoundaries)) return;
+    const ladder = this.ladder.get(seat.seatNodeId);
+    if (!ladder || this.latestByRung(ladder, "lifecycle-hooks")) return;
+    let evidence: ActivityEvidence | null = null;
+    try { evidence = this.restoreHookEvidence(seat, seatRuntime ?? inventory.runtime); } catch { evidence = null; }
+    if (evidence && evidence.seatNodeId === seat.seatNodeId && evidence.sessionName === seat.sessionName
+        && evidence.rung === "lifecycle-hooks") this.reportEvidence({ ...evidence, seq: 0 });
+  }
+
+  /** Whether the seat's declared inventory says this rung's last boundary holds until the next one. */
+  private durableBoundaries(seat: SeatLadderState, rung: EvidenceRungId): boolean {
+    return seat.inventory?.rungs.some((r) => r.rung === rung && r.durableBoundaries === true) ?? false;
   }
 
   private emitRungHealth(
@@ -599,7 +834,8 @@ export class SeatActivityService {
     const nowMs = this.now().getTime();
     const hookFresh = hook && hook.activity !== undefined
       && nowMs - Date.parse(hook.observedAt) <= HOOK_AUTHORITY_WINDOW_MS;
-    const contradicts = hookFresh && hook!.activity === "working"
+    const samplerFresh = sampler && nowMs - Date.parse(sampler.observedAt) <= this.samplingAuthorityWindowMs;
+    const contradicts = hookFresh && hook!.activity === "working" && samplerFresh
       && sampler?.activity === "idle-at-prompt"
       && this.rungTrust(seat, "window-sampling") === "authoritative";
     if (!contradicts) {
@@ -673,9 +909,9 @@ export class SeatActivityService {
       }
     }
 
-    // Codex permission hooks are pending observations. Only the visible prompt probe,
-    // after grace, can turn them into attention; unavailable capture fails safe.
-    // Other runtime prompts retain their existing rung arbitration.
+    // Codex permission hooks need probe confirmation after grace; Claude hooks latch
+    // attention until a seen prompt disappears or the same actor's tool batch completes. Unavailable capture fails safe.
+    // Other prompts retain their existing rung arbitration.
     const chrome = this.latestByRung(seat, "needs-input-chrome");
     const hooksEv = this.latestByRung(seat, "lifecycle-hooks");
     const selfEv = this.latestByRung(seat, "self-report");
@@ -688,15 +924,22 @@ export class SeatActivityService {
             ? selfEv
             : null;
     const confirmedCount = [...seat.permissions.values()].filter(p => p.confirmed).length;
-    const permissionTracked = seat.inventory?.runtime === "codex"
-      && (seat.permissions.size > 0 || seat.permissionObservedAt !== null);
+    const permissionTracked = (seat.inventory?.runtime === "codex" || seat.inventory?.runtime === "claude-code")
+      && (seat.permissions.size > 0 || seat.permissionEvidence !== null);
     const needsInput: NeedsInputShape = permissionTracked
       ? { count: confirmedCount, reason: confirmedCount ? chrome?.needsInput?.reason ?? "permission_prompt" : null }
       : decider?.needsInput ?? { count: 0, reason: null };
     if (permissionTracked && Boolean(confirmedCount) !== Boolean(seat.arbitrated.needsInput.count)) {
-      this.permissionPromptChanged?.(seat.sessionName, Boolean(confirmedCount));
+      this.permissionPromptChanged?.(seat.sessionName, Boolean(confirmedCount), seat.inventory!.runtime);
     }
-    const needsInputEvidence = permissionTracked ? (seat.permissionObservedAt ? { rung: "needs-input-chrome" as const, observedAt: seat.permissionObservedAt } : null) : decider ? { rung: decider.rung, observedAt: decider.observedAt } : null;
+    const needsInputEvidence = permissionTracked ? seat.permissionEvidence : decider ? { rung: decider.rung, observedAt: decider.observedAt } : null;
+    // #2661 (b): the latest self-report says a background shell outlives the turn. Kept beside activity (never an
+    // ActivityValue), anchored at the first observation of this shell so a consumer's grace cannot slide, and left
+    // out of `changed`: it moves no seq, wakes no waiter and restarts no waiting grace.
+    const backgroundWork = nextActivity === "idle-at-prompt" && selfEv?.backgroundWork
+      && this.rungTrust(seat, "self-report") === "authoritative"
+      ? { rung: selfEv.rung, observedAt: seat.arbitrated.backgroundWork?.observedAt ?? selfEv.observedAt }
+      : null;
 
     // Which rung answers is part of the answer: default zero → observed zero changes what
     // consumers may conclude, so it advances seq and pushes like a count change.
@@ -709,6 +952,7 @@ export class SeatActivityService {
       activity: nextActivity,
       needsInput,
       needsInputEvidence,
+      backgroundWork,
       decidedBy,
       seq: changed ? seat.arbitrated.seq + 1 : seat.arbitrated.seq,
       changedAt: changed ? this.now().toISOString() : seat.arbitrated.changedAt,
@@ -754,16 +998,26 @@ interface NeedsInputShape {
   reason: string | null;
 }
 
+/** One relay route's consecutive agreements toward promoting a trial rung. */
+interface PromotionRun {
+  agreements: number;
+  firstAgreementAtMs: number | null;
+}
+
 interface SeatLadderState {
-  permissions: Map<string, { sinceMs: number; confirmed: boolean; nextCheckMs: number }>;
+  permissions: Map<string, { sinceMs: number; observedAt: string; hookAgentId?: string | null;
+    confirmed: boolean; seen: boolean; nextCheckMs: number }>;
+  claudeToolBatches: Map<string | null, number>;
   permissionRevision: number;
-  permissionObservedAt: string | null;
+  permissionPolling: boolean;
+  permissionEvidence: ArbitratedSeatState["needsInputEvidence"];
   sessionName: string;
   retired: boolean;
   inventory: AdapterRungInventory | null;
+  inventorySinceMs: number;
   sources: Map<string, { latest: ActivityEvidence; latestActivity: ActivityEvidence | null }>;
   trust: Map<EvidenceRungId, RungTrust>;
-  promotion: Map<EvidenceRungId, { agreements: number; firstAgreementAtMs: number | null }>;
+  promotion: Map<EvidenceRungId, Map<EvidenceRoute | "untagged", PromotionRun>>;
   contradictionSinceMs: number | null;
   pendingIdle: { sinceMs: number; ticks: number; lastSeq: number } | null;
   waiters: SeatWaiter[];
@@ -774,6 +1028,8 @@ interface SeatLadderState {
 // requires the numbers recorded; rationale in the GREEN commit + reference doc):
 /** Hook evidence older than this no longer decides working/idle (time-bounded authority). */
 export const HOOK_AUTHORITY_WINDOW_MS = 15_000;
+/** Sampling is refreshed once per second by default; old evidence must not be an oracle forever if polling stops. */
+export const SAMPLING_AUTHORITY_WINDOW_MS = 15_000;
 /** Persistent hook-vs-sampler contradiction beyond this window degrades the hook rung. */
 export const CROSS_RUNG_CONTRADICTION_WINDOW_MS = 10_000;
 /** Sampling-decided working→idle needs this many consecutive idle evaluations… */
@@ -784,3 +1040,8 @@ export const SAMPLING_IDLE_DEBOUNCE_CAP_MS = 2_500;
 export const RUNG_PROMOTION_AGREEMENT_COUNT = 50;
 /** …spread over at least this window of production time. */
 export const RUNG_PROMOTION_MIN_WINDOW_MS = 60 * 60 * 1000;
+
+/** Which community inventory a seat has, if any: the reconcile pass re-declares when this changes for a session. */
+function communityKind(inventory: unknown): "runner" | "plain" | null {
+  return inventory === COMMUNITY_RUNNER_RUNG_INVENTORY ? "runner" : inventory === COMMUNITY_HARNESS_RUNG_INVENTORY ? "plain" : null;
+}

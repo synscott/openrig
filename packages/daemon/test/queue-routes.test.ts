@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Hono } from "hono";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -19,7 +25,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { InboxHandler } from "../src/domain/inbox-handler.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
-import { CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
+import { DONE_CLOSURE_REASONS } from "../src/domain/hot-potato-enforcer.js";
 import { queueRoutes } from "../src/routes/queue.js";
 import { setSelfHostId, getSelfHostId } from "../src/domain/hosts/fanout-contract.js";
 import { expectLimitParsing } from "./helpers/limit-query-cases.js";
@@ -29,13 +35,18 @@ function buildApp(opts: {
   queueRepo: QueueRepository;
   inboxHandler: InboxHandler;
   outboxHandler: OutboxHandler;
+  settingsStore?: { resolveOne: (key: string) => { value: unknown } };
+  /** The configured missions root, for routes that resolve work nodes. */
+  slicesRoot?: string;
 }): Hono {
   const app = new Hono();
   app.use("*", async (c, next) => {
+    if (opts.slicesRoot) c.set("settingsStore" as never, { resolveOne: () => ({ value: opts.slicesRoot }) } as never);
     c.set("eventBus" as never, opts.eventBus);
     c.set("queueRepo" as never, opts.queueRepo);
     c.set("inboxHandler" as never, opts.inboxHandler);
     c.set("outboxHandler" as never, opts.outboxHandler);
+    if (opts.settingsStore) c.set("settingsStore" as never, opts.settingsStore);
     await next();
   });
   app.route("/api/queue", queueRoutes());
@@ -49,6 +60,7 @@ describe("queue routes", () => {
   let inbox: InboxHandler;
   let outbox: OutboxHandler;
   let app: Hono;
+  let temporaryWorkspace: string | undefined;
 
   beforeEach(() => {
     db = createDb();
@@ -75,7 +87,11 @@ describe("queue routes", () => {
     app = buildApp({ eventBus: bus, queueRepo, inboxHandler: inbox, outboxHandler: outbox });
   });
 
-  afterEach(() => db.close());
+  afterEach(() => {
+    db.close();
+    if (temporaryWorkspace) fs.rmSync(temporaryWorkspace, { recursive: true, force: true });
+    temporaryWorkspace = undefined;
+  });
 
   it.each(["create", "handoff", "handoff-and-complete"])("keeps committed %s successful when the destination advisory throws", async (verb) => {
     queueRepo = new QueueRepository(db, bus, {
@@ -889,6 +905,9 @@ describe("queue routes", () => {
       const err = await res.json() as { error: string; message: string };
       expect(err.error).toBe("actor_required");
       expect(err.message).toMatch(/X-OpenRig-Session/);
+      // The header is set by the CLI from the seat's environment; it isn't called authenticated.
+      expect(err.message).toContain("no transport identity (no X-OpenRig-Session header, which the CLI sets from the seat's OPENRIG_SESSION_NAME)");
+      expect(err.message).not.toMatch(/authenticated/i);
     });
   });
 
@@ -1408,11 +1427,11 @@ describe("queue routes", () => {
     expect(update.status).toBe(400);
     const data = (await update.json()) as { error: string; validReasons: string[] };
     expect(data.error).toBe("missing_closure_reason");
-    expect(data.validReasons).toEqual(CLOSURE_REASONS);
+    expect(data.validReasons).toEqual(DONE_CLOSURE_REASONS);
   });
 
   it("POST /api/queue/:id/update accepts each valid closure reason", async () => {
-    for (const reason of CLOSURE_REASONS) {
+    for (const reason of DONE_CLOSURE_REASONS) {
       const create = await app.request("/api/queue/create", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-OpenRig-Session": "a@r" },
@@ -1420,7 +1439,7 @@ describe("queue routes", () => {
       });
       const item = (await create.json()) as { qitemId: string };
 
-      const requiresTarget = reason === "handed_off_to" || reason === "blocked_on" || reason === "escalation";
+      const requiresTarget = reason === "handed_off_to" || reason === "escalation";
       const closureTarget = reason === "handed_off_to" ? "c@r" : "downstream-target";
       if (reason === "handed_off_to") await queueRepo.create({
         sourceSession: "b@r", destinationSession: closureTarget,
@@ -1441,6 +1460,22 @@ describe("queue routes", () => {
       expect(data.state).toBe("done");
       expect(data.closureReason).toBe(reason);
     }
+  });
+
+  it("POST /api/queue/:id/update rejects done + blocked_on as a client error", async () => {
+    const item = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "wait for work", nudge: false });
+    const update = await app.request(`/api/queue/${item.qitemId}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify({ state: "done", closureReason: "blocked_on", closureTarget: "qitem-child" }),
+    });
+    expect(update.status).toBe(400);
+    const data = (await update.json()) as { error: string; message: string; validReasons: string[] };
+    expect(data.error).toBe("invalid_closure_reason");
+    expect(data.message).toContain("state=done is terminal");
+    expect(data.message).toContain("rig queue block <id> --on <child>");
+    expect(data.validReasons).not.toContain("blocked_on");
+    expect(queueRepo.getByIdOrThrow(item.qitemId).state).toBe("pending");
   });
 
   it("POST /api/queue/:id/handoff returns closed + created in one transaction", async () => {
@@ -1538,6 +1573,23 @@ describe("queue routes", () => {
     expect(data[0]!.body).toBe("fyi");
   });
 
+  it("outbox list for a rig returns what its seats sent and what was sent to them, in one read", async () => {
+    for (const [from, to, body] of [["a@r", "b@r", "inside"], ["c@other", "b@r", "into r"], ["c@other", "d@other", "elsewhere"]]) {
+      const record = await app.request("/api/queue/outbox/record", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": from! },
+        body: JSON.stringify({ senderSession: from, destinationSession: to, body }),
+      });
+      expect(record.status).toBe(201);
+    }
+    const list = await app.request("/api/queue/outbox/list?rig=r");
+    expect(list.status).toBe(200);
+    expect(((await list.json()) as Array<{ body: string }>).map((e) => e.body).sort()).toEqual(["inside", "into r"]);
+    // Control: the per-seat read is unchanged, one sender's messages wherever they went.
+    const seat = await app.request("/api/queue/outbox/list?senderSession=c@other");
+    expect(((await seat.json()) as Array<{ body: string }>).map((e) => e.body).sort()).toEqual(["elsewhere", "into r"]);
+    expect((await app.request("/api/queue/outbox/list")).status).toBe(400);
+  });
+
   it("queue, inbox and outbox list refuse only a non-numeric or unbindable limit (#586)", async () => {
     for (const body of ["one", "two", "three"]) {
       const res = await app.request("/api/queue/create", {
@@ -1598,6 +1650,117 @@ describe("queue routes", () => {
     const res = await app.request("/api/queue/list?destinationSession=b@r");
     const data = (await res.json()) as unknown[];
     expect(data).toHaveLength(1);
+  });
+
+  it("GET /api/queue/list follows a handoff to its successor and filters by updatedSince", async () => {
+    const post = (path: string, session: string, body: Record<string, unknown>) => app.request(path, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": session }, body: JSON.stringify(body),
+    });
+    const source = ((await (await post("/api/queue/create", "a@r", { destinationSession: "a@r", body: "source", nudge: false })).json()) as { qitemId: string }).qitemId;
+    await post("/api/queue/create", "a@r", { destinationSession: "c@r", body: "unrelated", nudge: false });
+    const handoff = await post(`/api/queue/${source}/handoff`, "a@r", { toSession: "c@r", nudge: false });
+    expect(handoff.status).toBe(201);
+    const successor = ((await handoff.json()) as { created: { qitemId: string } }).created.qitemId;
+    const ids = async (query: string) => {
+      const res = await app.request(`/api/queue/list?${query}`);
+      expect(res.status).toBe(200);
+      return ((await res.json()) as Array<{ qitemId: string }>).map((q) => q.qitemId);
+    };
+
+    expect(await ids(`handedOffFrom=${source}`)).toEqual([successor]);
+    expect(await ids("handedOffFrom=qitem-none")).toEqual([]);
+
+    // Rows store ts_updated as toISOString(); any ISO-8601 time is normalized to that form first.
+    expect(await ids(`destinationSession=c@r&updatedSince=${encodeURIComponent("2999-01-01T00:00:00Z")}`)).toEqual([]);
+    expect((await ids(`destinationSession=c@r&updatedSince=${encodeURIComponent("2000-01-01T02:00:00+02:00")}`)).length).toBe(2);
+    const invalid = await app.request("/api/queue/list?updatedSince=yesterday");
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ error: "updated_since_invalid" });
+
+    // The attention path takes the same filters.
+    await post("/api/queue/create", "a@r", { destinationSession: "human-founder@external", body: "approve", tier: "human-gate", summary: "approve", evidenceRef: "proof/e.md", nudge: false });
+    expect((await ids("attention=1")).length).toBe(1);
+    expect(await ids(`attention=1&updatedSince=${encodeURIComponent("2999-01-01T00:00:00Z")}`)).toEqual([]);
+    expect(await ids(`attention=1&handedOffFrom=${source}`)).toEqual([]);
+  });
+
+  it("GET /api/queue/list?sort=updated picks a bounded window by latest update, so an old item closed last is in it", async () => {
+    const post = (path: string, session: string, body: Record<string, unknown>) => app.request(path, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": session }, body: JSON.stringify(body),
+    });
+    const create = async (body: string) => ((await (await post("/api/queue/create", "a@r", { destinationSession: "b@r", body, nudge: false })).json()) as { qitemId: string }).qitemId;
+    const close = (qitemId: string, ts: string) => {
+      db.prepare("UPDATE queue_items SET state = 'done', ts_updated = ? WHERE qitem_id = ?").run(ts, qitemId);
+    };
+    const oldest = await create("started first, finished last");
+    db.prepare("UPDATE queue_items SET ts_created = '2026-01-01T00:00:00.000Z' WHERE qitem_id = ?").run(oldest);
+    const middle = await create("middle");
+    db.prepare("UPDATE queue_items SET ts_created = '2026-01-02T00:00:00.000Z' WHERE qitem_id = ?").run(middle);
+    const newest = await create("started last");
+    db.prepare("UPDATE queue_items SET ts_created = '2026-01-03T00:00:00.000Z' WHERE qitem_id = ?").run(newest);
+    close(middle, "2026-01-04T00:00:00.000Z");
+    close(newest, "2026-01-05T00:00:00.000Z");
+    close(oldest, "2026-01-06T00:00:00.000Z");
+    const ids = async (query: string) => ((await (await app.request(`/api/queue/list?${query}`)).json()) as Array<{ qitemId: string }>).map((q) => q.qitemId);
+
+    expect(await ids("state=done,handed-off&sort=updated&limit=2")).toEqual([oldest, newest]);
+    // Without it the window stays newest created, and a sort it doesn't know changes nothing.
+    expect(await ids("state=done,handed-off&limit=2")).toEqual([newest, middle]);
+    expect(await ids("state=done,handed-off&sort=other&limit=2")).toEqual([newest, middle]);
+  });
+
+  it("GET /api/queue/list trims each state name and otherwise keeps today's matching", async () => {
+    const post = (path: string, session: string, body: Record<string, unknown>) => app.request(path, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": session }, body: JSON.stringify(body),
+    });
+    const create = async (body: Record<string, unknown>) =>
+      ((await (await post("/api/queue/create", "a@r", { nudge: false, ...body })).json()) as { qitemId: string }).qitemId;
+    const pending = await create({ destinationSession: "b@r", body: "pending" });
+    const inProgress = await create({ destinationSession: "b@r", body: "in progress" });
+    const done = await create({ destinationSession: "b@r", body: "done" });
+    expect((await post(`/api/queue/${inProgress}/claim`, "b@r", {})).status).toBe(200);
+    expect((await post(`/api/queue/${done}/claim`, "b@r", {})).status).toBe(200);
+    expect((await post(`/api/queue/${done}/update`, "b@r", { state: "done", closureReason: "no-follow-on", transitionNote: "done" })).status).toBe(200);
+    const gate = await create({
+      destinationSession: "human-founder@external", body: "approve me", tier: "human-gate",
+      summary: "approve", evidenceRef: "proof/evidence.md",
+    });
+
+    const ids = async (query: string) => {
+      const res = await app.request(`/api/queue/list?${query}`);
+      expect(res.status).toBe(200);
+      return ((await res.json()) as Array<{ qitemId: string }>).map((q) => q.qitemId).sort();
+    };
+    const plain = (rest: string) => ids(`destinationSession=b@r${rest}`);
+    const attention = (rest: string) => ids(`attention=1&destinationSession=human-founder@external${rest}`);
+    const state = (value: string) => `&state=${encodeURIComponent(value)}`;
+
+    // The fix: a space around a name no longer drops it.
+    expect(await plain(state("pending, in-progress"))).toEqual([pending, inProgress].sort());
+    expect(await plain(state(" pending , in-progress "))).toEqual([pending, inProgress].sort());
+    expect(await attention(state(" pending"))).toEqual([gate]);
+    expect(await plain(`&activeOnly=1${state(" done")}`)).toEqual([done]);
+
+    // Unchanged: an unknown name matches nothing, alone or beside a known one.
+    expect(await plain(state("pending,in-progress"))).toEqual([pending, inProgress].sort());
+    expect(await plain(state("pending,inprogress"))).toEqual([pending]);
+    expect(await plain(state("in_progress"))).toEqual([]);
+    expect(await attention(state("pending,inprogress"))).toEqual([gate]);
+    expect(await attention(state("in_progress"))).toEqual([]);
+
+    // Unchanged: only commas or spaces is an explicit filter that matches nothing, with or without activeOnly.
+    for (const value of [",", " ", " , "]) {
+      expect(await plain(state(value))).toEqual([]);
+      expect(await plain(`&activeOnly=1${state(value)}`)).toEqual([]);
+      expect(await attention(state(value))).toEqual([]);
+    }
+
+    // Unchanged: an absent or empty state keeps each path's default.
+    for (const rest of ["", "&state="]) {
+      expect(await plain(rest)).toEqual([pending, inProgress, done].sort());
+      expect(await plain(`&activeOnly=1${rest}`)).toEqual([pending, inProgress].sort());
+      expect(await attention(rest)).toEqual([gate]);
+    }
   });
 
   // OPR.0.3.2.20 — `?attention=1` filter for the For You priority
@@ -2253,6 +2416,258 @@ describe("queue routes", () => {
       expect(body.asSource.total).toBe(0);
     });
 
+    it("resolves project-tagged current work against that catalog project's missions root", async () => {
+      temporaryWorkspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openrig-whoami-project-")));
+      fs.writeFileSync(path.join(temporaryWorkspace, "workspace.yaml"), "projects:\n  - id: alpha\n    root: alpha\n  - id: beta\n    root: beta\n");
+      for (const project of ["alpha", "beta"]) {
+        const root = path.join(temporaryWorkspace, project);
+        const slice = path.join(root, "work-items", "release", "slices", "01-work");
+        fs.mkdirSync(slice, { recursive: true });
+        fs.writeFileSync(path.join(root, "project.yaml"), `id: ${project}\nmissions:\n  root: work-items\n`);
+        fs.writeFileSync(path.join(root, "SPEC.md"), `---\nid: ${project}\n---\n# ${project}\n`);
+        fs.writeFileSync(path.join(root, "work-items", "release", "SPEC.md"), "---\nid: release\n---\n# Release\n");
+        fs.writeFileSync(path.join(slice, "SPEC.md"), "---\nid: 01-work\n---\n# Work\n");
+      }
+      app = buildApp({
+        eventBus: bus,
+        queueRepo,
+        inboxHandler: inbox,
+        outboxHandler: outbox,
+        settingsStore: { resolveOne: (key) => ({ value: key === "workspace.root"
+          ? temporaryWorkspace
+          : key === "workspace.catalog_path"
+            ? path.join(temporaryWorkspace!, "workspace.yaml")
+            // The legacy implementation used this root for every project, so
+            // point it at beta to prove alpha is not silently misread as beta.
+            : path.join(temporaryWorkspace!, "beta", "work-items") }) },
+      });
+      const created = await app.request("/api/queue/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": "alice@r" },
+        body: JSON.stringify({ sourceSession: "alice@r", destinationSession: "bob@r", body: "alpha work",
+          tags: ["project:alpha", "mission:release", "slice:01-work"], nudge: false }),
+      });
+      expect(created.status).toBe(201);
+      const { qitemId } = await created.json() as { qitemId: string };
+      const claimed = await app.request(`/api/queue/${qitemId}/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": "bob@r" },
+        body: JSON.stringify({ destinationSession: "bob@r" }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const response = await app.request("/api/queue/whoami?session=bob@r");
+      expect(response.status).toBe(200);
+      const body = await response.json() as { currentWork: { workNodePath: string } | null; currentWorkBasis: string; workRoots: string[] };
+      expect(body.currentWork?.workNodePath).toBe(path.join(temporaryWorkspace, "alpha", "work-items", "release", "slices", "01-work"));
+      expect(body.currentWorkBasis).toContain("one typed in-progress work node");
+      // The refocus hook passes these to the trace, so work in a catalogued project traces to its own root (#2693).
+      expect(body.workRoots).toEqual([path.join(temporaryWorkspace, "alpha"), path.join(temporaryWorkspace, "beta")]);
+
+      const withCandidates = await app.request("/api/queue/whoami?session=bob@r&candidates=1");
+      const candidateBody = await withCandidates.json() as { workCandidates: { candidates: Array<{ workNodePath: string | null }> } };
+      expect(candidateBody.workCandidates.candidates).toEqual([
+        expect.objectContaining({ workNodePath: path.join(temporaryWorkspace, "alpha", "work-items", "release", "slices", "01-work") }),
+      ]);
+      expect((candidateBody.workCandidates as { missionsRoot: string }).missionsRoot)
+        .toBe(path.join(temporaryWorkspace, "beta", "work-items"));
+      expect((candidateBody.workCandidates as { missionsOnHost: string[] }).missionsOnHost).toEqual(["release"]);
+    });
+
+    it.each([
+      {
+        name: "an unknown project tag",
+        catalog: "projects:\n  - id: alpha\n    root: alpha\n",
+        tags: ["project:missing", "mission:release", "slice:01-work"],
+        reason: "project:missing is not in the project catalogue; used configured root",
+      },
+      {
+        name: "several distinct project tags",
+        catalog: "projects:\n  - id: alpha\n    root: alpha\n  - id: beta\n    root: beta\n",
+        tags: ["project:alpha", "project:beta", "mission:release", "slice:01-work"],
+        reason: "multiple project tags (alpha, beta); used configured root",
+      },
+      {
+        name: "a missing catalog",
+        catalog: null,
+        tags: ["project:alpha", "mission:release", "slice:01-work"],
+        reason: "project:alpha could not be used because the workspace catalog is not configured; used configured root",
+      },
+      {
+        name: "an invalid catalog",
+        catalog: "projects: invalid\n",
+        tags: ["project:alpha", "mission:release", "slice:01-work"],
+        reason: "project:alpha could not be used because the workspace catalog is unavailable; used configured root",
+      },
+      {
+        name: "duplicate catalog IDs",
+        catalog: "projects:\n  - id: alpha\n    root: alpha\n  - id: alpha\n    root: other\n",
+        tags: ["project:alpha", "mission:release", "slice:01-work"],
+        reason: "project:alpha could not be used because the workspace catalog is unavailable; used configured root",
+      },
+      {
+        name: "a catalog entry with a project error",
+        catalog: "projects:\n  - id: alpha\n    root: alpha\n",
+        tags: ["project:alpha", "mission:release", "slice:01-work"],
+        projectError: true,
+        reason: "project:alpha is unavailable in the project catalogue; used configured root",
+      },
+    ])("falls back to the configured root for $name and explains why", async ({ catalog, tags, projectError, reason }) => {
+      temporaryWorkspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openrig-whoami-project-fallback-")));
+      if (catalog !== null) fs.writeFileSync(path.join(temporaryWorkspace, "workspace.yaml"), catalog);
+      const configuredRoot = path.join(temporaryWorkspace, "configured", "work-items");
+      const mission = path.join(configuredRoot, "release");
+      const slice = path.join(mission, "slices", "01-work");
+      fs.mkdirSync(slice, { recursive: true });
+      fs.writeFileSync(path.join(mission, "SPEC.md"), "---\nid: release\n---\n# Release\n");
+      fs.writeFileSync(path.join(slice, "SPEC.md"), "---\nid: 01-work\n---\n# Work\n");
+      if (catalog !== null && catalog.includes("id: alpha")) {
+        const projectRoot = path.join(temporaryWorkspace, "alpha");
+        fs.mkdirSync(projectRoot, { recursive: true });
+        fs.writeFileSync(path.join(projectRoot, "project.yaml"), projectError ? "id: not-alpha\n" : "id: alpha\n");
+        fs.writeFileSync(path.join(projectRoot, "SPEC.md"), "---\nid: alpha\n---\n# Alpha\n");
+      }
+      app = buildApp({
+        eventBus: bus,
+        queueRepo,
+        inboxHandler: inbox,
+        outboxHandler: outbox,
+        settingsStore: { resolveOne: (key) => ({ value: key === "workspace.root"
+          ? temporaryWorkspace
+          : key === "workspace.catalog_path"
+            ? path.join(temporaryWorkspace!, "workspace.yaml")
+            : configuredRoot }) },
+      });
+      const created = await app.request("/api/queue/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": "alice@r" },
+        body: JSON.stringify({ sourceSession: "alice@r", destinationSession: "bob@r", body: "fallback work", tags, nudge: false }),
+      });
+      expect(created.status).toBe(201);
+      const { qitemId } = await created.json() as { qitemId: string };
+      const claimed = await app.request(`/api/queue/${qitemId}/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-OpenRig-Session": "bob@r" },
+        body: JSON.stringify({ destinationSession: "bob@r" }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const response = await app.request("/api/queue/whoami?session=bob@r&candidates=1");
+      expect(response.status).toBe(200);
+      const body = await response.json() as {
+        currentWork: { workNodePath: string } | null;
+        currentWorkBasis: string;
+        workCandidates: {
+          missionsRoot: string | null;
+          missionsOnHost: string[];
+          candidates: Array<{ workNodePath: string | null; unresolved: string | null }>;
+        };
+      };
+      expect(body.currentWork?.workNodePath).toBe(slice);
+      expect(body.currentWorkBasis).toContain(reason);
+      expect(body.workCandidates.missionsRoot).toBe(configuredRoot);
+      expect(body.workCandidates.missionsOnHost).toEqual(["release"]);
+      expect(body.workCandidates.candidates).toEqual([
+        expect.objectContaining({ workNodePath: slice, unresolved: null, source: expect.stringContaining(reason) }),
+      ]);
+    });
+
+    it("does not fall back to the configured root when a selected project's node is missing", async () => {
+      temporaryWorkspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openrig-whoami-project-no-fallback-")));
+      fs.writeFileSync(path.join(temporaryWorkspace, "workspace.yaml"), "projects:\n  - id: alpha\n    root: alpha\n");
+      const configuredRoot = path.join(temporaryWorkspace, "configured", "work-items");
+      const configuredSlice = path.join(configuredRoot, "release", "slices", "01-work");
+      fs.mkdirSync(configuredSlice, { recursive: true });
+      fs.writeFileSync(path.join(configuredRoot, "release", "SPEC.md"), "---\nid: release\n---\n# Release\n");
+      fs.writeFileSync(path.join(configuredSlice, "SPEC.md"), "---\nid: 01-work\n---\n# Work\n");
+      const projectRoot = path.join(temporaryWorkspace, "alpha");
+      fs.mkdirSync(projectRoot, { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, "project.yaml"), "id: alpha\nmissions:\n  root: work-items\n");
+      fs.writeFileSync(path.join(projectRoot, "SPEC.md"), "---\nid: alpha\n---\n# Alpha\n");
+      app = buildApp({
+        eventBus: bus,
+        queueRepo,
+        inboxHandler: inbox,
+        outboxHandler: outbox,
+        settingsStore: { resolveOne: (key) => ({ value: key === "workspace.root"
+          ? temporaryWorkspace
+          : key === "workspace.catalog_path"
+            ? path.join(temporaryWorkspace!, "workspace.yaml")
+            : configuredRoot }) },
+      });
+      const item = await queueRepo.create({ sourceSession: "alice@r", destinationSession: "bob@r", body: "project work",
+        tags: ["project:alpha", "mission:release", "slice:01-work"], nudge: false });
+      const claimed = await app.request(`/api/queue/${item.qitemId}/claim`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "bob@r" },
+        body: JSON.stringify({ destinationSession: "bob@r" }),
+      });
+      expect(claimed.status).toBe(200);
+
+      const response = await app.request("/api/queue/whoami?session=bob@r&candidates=1");
+      const body = await response.json() as {
+        currentWork: { workNodePath: string } | null;
+        currentWorkBasis: string;
+        workCandidates: { candidates: Array<{ workNodePath: string | null; unresolved: string | null }> };
+      };
+      expect(body.currentWork).toBeNull();
+      expect(body.currentWorkBasis).toContain("mission release resolves to 0 directories");
+      expect(body.workCandidates.candidates).toEqual([
+        expect.objectContaining({ workNodePath: null, unresolved: expect.stringContaining("resolves to 0 directories") }),
+      ]);
+    });
+
+    it("keeps same-named work distinct when in-progress rows select different projects", async () => {
+      temporaryWorkspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "openrig-whoami-project-same-name-")));
+      fs.writeFileSync(path.join(temporaryWorkspace, "workspace.yaml"), "projects:\n  - id: alpha\n    root: alpha\n  - id: beta\n    root: beta\n");
+      const projectPaths = new Map<string, string>();
+      for (const project of ["alpha", "beta"]) {
+        const root = path.join(temporaryWorkspace, project);
+        const slice = path.join(root, "work-items", "release", "slices", "01-work");
+        projectPaths.set(project, slice);
+        fs.mkdirSync(slice, { recursive: true });
+        fs.writeFileSync(path.join(root, "project.yaml"), `id: ${project}\nmissions:\n  root: work-items\n`);
+        fs.writeFileSync(path.join(root, "SPEC.md"), `---\nid: ${project}\n---\n# ${project}\n`);
+        fs.writeFileSync(path.join(root, "work-items", "release", "SPEC.md"), "---\nid: release\n---\n# Release\n");
+        fs.writeFileSync(path.join(slice, "SPEC.md"), "---\nid: 01-work\n---\n# Work\n");
+      }
+      app = buildApp({
+        eventBus: bus,
+        queueRepo,
+        inboxHandler: inbox,
+        outboxHandler: outbox,
+        settingsStore: { resolveOne: (key) => ({ value: key === "workspace.root"
+          ? temporaryWorkspace
+          : key === "workspace.catalog_path"
+            ? path.join(temporaryWorkspace!, "workspace.yaml")
+            : path.join(temporaryWorkspace!, "configured", "work-items") }) },
+      });
+      const claim = async (project: string) => {
+        const item = await queueRepo.create({ sourceSession: "alice@r", destinationSession: "bob@r", body: `${project} work`,
+          tags: [`project:${project}`, "mission:release", "slice:01-work"], nudge: false });
+        const response = await app.request(`/api/queue/${item.qitemId}/claim`, {
+          method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "bob@r" },
+          body: JSON.stringify({ destinationSession: "bob@r" }),
+        });
+        expect(response.status).toBe(200);
+        return item.qitemId;
+      };
+      const alphaId = await claim("alpha");
+      const betaId = await claim("beta");
+
+      const response = await app.request("/api/queue/whoami?session=bob@r");
+      const body = await response.json() as {
+        currentWork: { workNodePath: string } | null;
+        currentWorkBasis: string;
+        currentWorkChoice?: { candidates: Array<{ qitemId: string; projects: string[]; workNodePath: string | null }> };
+      };
+      expect(body.currentWork).toBeNull();
+      expect(body.currentWorkBasis).toBe("2 distinct typed work nodes — refusing to guess");
+      expect(body.currentWorkChoice?.candidates).toEqual(expect.arrayContaining([
+        expect.objectContaining({ qitemId: alphaId, projects: ["alpha"], workNodePath: projectPaths.get("alpha") }),
+        expect.objectContaining({ qitemId: betaId, projects: ["beta"], workNodePath: projectPaths.get("beta") }),
+      ]));
+    });
+
     // OPR.0.7.0.12 — work candidates ride only an explicit request, and the read writes nothing.
     it("GET /api/queue/whoami adds workCandidates only with candidates=1, read-only", async () => {
       const created = await app.request("/api/queue/create", {
@@ -2274,6 +2689,56 @@ describe("queue routes", () => {
       expect(body.workCandidates.next).toEqual([expect.objectContaining({ missions: ["m"] })]);
       expect(body.workCandidates.candidates).toEqual([]);
       expect(counts()).toEqual(before);
+    });
+
+    // Plain whoami names every candidate and asks the agent to choose when no single work node is
+    // settled; ordinary unambiguous work and a seat with no rows carry no choice.
+    it("GET /api/queue/whoami names each in-progress candidate when current work is not settled", async () => {
+      const top = mkdtempSync(join(tmpdir(), "whoami-choice-"));
+      try {
+        const missions = join(top, "missions");
+        for (const [mission, slice] of [["release", "01-work"], ["release-b", "02-other"]]) {
+          mkdirSync(join(missions, mission!, "slices", slice!), { recursive: true });
+          writeFileSync(join(missions, mission!, "SPEC.md"), "---\nintent: x\n---\n", "utf8");
+        }
+        app = buildApp({ eventBus: bus, queueRepo, inboxHandler: inbox, outboxHandler: outbox, slicesRoot: missions });
+        const claimed = async (tags: string[]) => {
+          const item = await queueRepo.create({ sourceSession: "alice@r", destinationSession: "bob@r", body: "w", tags, nudge: false });
+          const res = await app.request(`/api/queue/${item.qitemId}/claim`, {
+            method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "bob@r" },
+            body: JSON.stringify({ destinationSession: "bob@r" }),
+          });
+          expect(res.status).toBe(200);
+          return item.qitemId;
+        };
+        const whoami = async () => (await (await app.request("/api/queue/whoami?session=bob@r")).json()) as {
+          currentWork: { workNodePath: string } | null; currentWorkBasis: string;
+          currentWorkChoice?: { instruction: string; candidates: Array<Record<string, unknown>> };
+        };
+
+        expect(await whoami()).not.toHaveProperty("currentWorkChoice");
+        const first = await claimed(["project:alpha", "mission:release", "slice:01-work"]);
+        const settled = await whoami();
+        expect(settled.currentWork?.workNodePath).toBe(join(missions, "release", "slices", "01-work"));
+        expect(settled).not.toHaveProperty("currentWorkChoice");
+
+        const second = await claimed(["project:beta", "mission:release-b", "slice:02-other"]);
+        const open = await whoami();
+        expect(open.currentWork).toBeNull();
+        expect(open.currentWorkBasis).toBe("2 distinct typed work nodes — refusing to guess");
+        expect(open.currentWorkChoice?.instruction).toMatch(/^OpenRig did not choose your current work\. Choose/);
+        expect(open.currentWorkChoice?.candidates).toEqual([
+          expect.objectContaining({ qitemId: first, projects: ["alpha"], mission: "release", slice: "01-work",
+            workNodePath: join(missions, "release", "slices", "01-work") }),
+          expect.objectContaining({ qitemId: second, projects: ["beta"], mission: "release-b", slice: "02-other",
+            workNodePath: join(missions, "release-b", "slices", "02-other") }),
+        ]);
+        const asked = (await (await app.request("/api/queue/whoami?session=bob@r&candidates=1")).json()) as Record<string, unknown>;
+        expect(asked).toHaveProperty("currentWorkChoice");
+        expect(asked).toHaveProperty("workCandidates");
+      } finally {
+        rmSync(top, { recursive: true, force: true });
+      }
     });
 
     // A set-aside row must stay in "held" however many newer pending rows the seat has: the two

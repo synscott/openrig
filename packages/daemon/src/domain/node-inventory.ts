@@ -1,29 +1,39 @@
+import { sessionCommunityRunnerSelect } from "./session-registry.js";
+import { physicalSessionName } from "./session-registry.js";
+import fs from "node:fs";
 import type { CaptureObserver, ObservedBinding } from "./capture-observer.js";
 import type Database from "better-sqlite3";
 import { decodeTime } from "ulid";
 import { resolveActiveOccupantRow } from "./active-occupant.js";
 import type { NodeInventoryEntry, NodeDetailEntry, NodeDetailPeer, NodeDetailEdge, NodeDetailCompactSpec, NodeRestoreOutcome, NodeOriented, NodeLifecycleState, Binding, RestoreResult, NodeRecoveryGuidance, Snapshot, WorkspaceSpec, SeatIdentityVerdict, SeatIdentityVerdictKind, AgentActivity, SeatActivity } from "./types.js";
-import { identityVerdictConfirmsSessionMissing, identityVerdictDownranksRunning } from "./types.js";
+import { identityVerdictConfirmsSessionMissing, identityVerdictConfirmsExecutorStopped, identityVerdictDownranksRunning } from "./types.js";
+import { resolveSeatEffort } from "./seat-effort.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { buildOrientedMap } from "./startup-proof.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
 import type { ContextUsageStore } from "./context-usage-store.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import type { AgentActivityStore } from "./agent-activity-store.js";
+import { isClaudeRateLimitHook } from "./provider/claude-interruption.js";
 import type { SeatActivityService } from "./seat-activity-service.js";
-import { deriveDisplayActivity } from "./activity-taxonomy.js";
+import { deriveDisplayActivity, type ArbitratedSeatState, type EvidenceRungId } from "./activity-taxonomy.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import { probeSessionActivity, mapPaneState } from "./session-transport.js";
-import type { StructuralObservation } from "./seat-structural-activity-service.js";
-import { findLatestUsableSnapshot, findLatestUsableSnapshotsForAllRigs } from "./rig-repository.js";
+import { DEFAULT_STRUCTURAL_STALE_MS, type StructuralObservation } from "./seat-structural-activity-service.js";
+import { RigRepository, findLatestUsableSnapshot, findLatestUsableSnapshotsForAllRigs } from "./rig-repository.js";
+import { hasCompleteGuidanceBlock, seatGuidanceFile } from "./restore-guidance.js";
 import { resolveNodeWorkspace } from "./workspace/workspace-resolver.js";
 import { deriveCanonicalSessionName } from "./session-name.js";
 import { buildNativeResumeCommand, buildCodexResumeCore } from "./native-resume-probe.js";
 import { AppliedLaunchObservationStore } from "./applied-launch-observation-store.js";
-import { tmuxAttachCommand } from "../adapters/tmux-server.js";
-import { agentAppLabel } from "./agent-app-presets.js";
-import { agentAppOf } from "./built-in-runtimes.js";
-import { sessionAgentAppSelect } from "./session-registry.js";
+import { readReadyFreshLaunchFences } from "./fresh-occupant-relation.js";
+import { daemonTmuxServerArgs, daemonTmuxServerInfo, tmuxAttachCommand } from "../adapters/tmux-server.js";
+import { communityHarnessLabel } from "./community-harness-presets.js";
+import { communityHarnessOf } from "./built-in-runtimes.js";
+import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { claudeMcpArgs, readSeatClaudeMcp, type ClaudeMcp } from "./claude-mcp.js";
+import { isLaunchWrapperRuntime, parseStoredLaunchWrapper } from "./launch-wrapper.js";
+import { shellQuote } from "../adapters/shell-quote.js";
 
 // -- Row types for SQL results --
 
@@ -37,7 +47,11 @@ interface InventoryRow {
   role: string | null;
   runtime: string | null;
   model: string | null;
+  effort: string | null;
+  effort_choice: string | null;
   codex_config_profile: string | null;
+  claude_mcp: ClaudeMcp | null;
+  launch_wrapper: string | null;
   agent_ref: string | null;
   profile: string | null;
   cwd: string | null;
@@ -55,11 +69,13 @@ interface InventoryRow {
   session_name: string | null;
   session_created_at: string | null;
   session_status: string | null;
-  session_agent_app?: string | null;
+  session_community_harness?: string | null;
+  session_community_runner?: number | null;
   intentionally_stopped: number | null;
   startup_status: string | null;
   resume_type: string | null;
   resume_token: string | null;
+  resume_provenance?: string | null;
   startup_completed_at: string | null;
   binding_attachment_type: string | null;
   binding_id: string | null;
@@ -98,8 +114,8 @@ interface BindingRow {
 
 // -- Helpers --
 
-function computeResumeCommand(runtime: string | null, resumeToken: string | null, codexConfigProfile?: string | null, codexDaemonOptOut?: boolean): string | null {
-  return buildNativeResumeCommand(runtime, resumeToken, null, codexConfigProfile, codexDaemonOptOut);
+function computeResumeCommand(runtime: string | null, resumeToken: string | null, codexConfigProfile?: string | null, codexDaemonOptOut?: boolean, claudeMcp?: ClaudeMcp | null): string | null {
+  return buildNativeResumeCommand(runtime, resumeToken, null, codexConfigProfile, codexDaemonOptOut, claudeMcp);
 }
 
 const CODEX_DAEMON_CHOICE_NOT_RECORDED = "Not recorded whether this seat's last managed launch used --no-daemon. If `codex --help` lists --no-daemon, "
@@ -113,21 +129,22 @@ function computeRecoveryGuidance(input: {
   codexConfigProfile?: string | null;
   /** Codex: the current generation's recorded daemon choice; undefined when none was recorded. */
   codexDaemonOptOut?: boolean;
+  claudeMcp?: ClaudeMcp;
 }): NodeRecoveryGuidance | null {
-  const { runtime, resumeToken, cwd, sessionName, codexConfigProfile, codexDaemonOptOut } = input;
+  const { runtime, resumeToken, cwd, sessionName, codexConfigProfile, codexDaemonOptOut, claudeMcp } = input;
 
   if (runtime === "claude-code") {
     const commands: string[] = [];
     const notes: string[] = [];
 
     if (resumeToken) {
-      const cmd = buildNativeResumeCommand(runtime, resumeToken, sessionName);
+      const cmd = buildNativeResumeCommand(runtime, resumeToken, sessionName, undefined, undefined, claudeMcp);
       if (cmd) commands.push(cmd);
     }
     if (cwd) {
       commands.push(`cd ${cwd}`);
     }
-    commands.push("claude --resume");
+    commands.push(["claude --resume", ...claudeMcpArgs(claudeMcp).map(shellQuote)].join(" "));
 
     if (sessionName) {
       notes.push(`Look for session name: ${sessionName}`);
@@ -260,7 +277,7 @@ function deriveOccupantLifecycle(
   row: InventoryRow,
   identityVerdict: SeatIdentityVerdict | null,
 ): NodeInventoryEntry["occupantLifecycle"] {
-  if (row.occupant_lifecycle === "active" && identityVerdictConfirmsSessionMissing(identityVerdict)) {
+  if (row.occupant_lifecycle === "active" && identityVerdictConfirmsExecutorStopped(identityVerdict)) {
     return "unknown";
   }
   if (row.occupant_lifecycle) {
@@ -333,6 +350,8 @@ function buildRestoreOutcomeMap(db: Database.Database, rigId?: string): Map<stri
     type: string; payload: string; seq: number; rig_id: string; node_id: string | null;
   }[];
   const map = new Map<string, RestoreProjection>();
+  // Each entry's attempt, by its start seq; a subset restore records no start.
+  const attemptOf = new Map<string, { nodeId: string; seq: number }>();
   const attempts = new Map<string, {
     seq: number;
     start?: Record<string, any>;
@@ -376,18 +395,34 @@ function buildRestoreOutcomeMap(db: Database.Database, rigId?: string): Map<stri
         && !!attempt && attempt.seq === event.attemptId && attempt.outcomes.get(event.nodeId) === event.from
         && evidence?.tmux === true && evidence.resumeTokenUsed === true && evidence.paneState === "usable"
         && (evidence.fgProcess === "claude" || evidence.fgProcess === "codex");
-      map.set(restoreKey(row.rig_id, event.nodeId), {
+      const key = restoreKey(row.rig_id, event.nodeId);
+      map.set(key, {
         outcome: mapStatus(event.to),
         ...(strict ? { resumedRuntime: evidence!.fgProcess === "claude" ? "claude-code" : "codex" } : {}),
       });
+      // A zero attemptId names no attempt (every subset clear writes it): it acknowledges the outcome it
+      // replaces, so it is as current as that outcome. With nothing replaced, it describes no attempt.
+      const scoped = typeof event.attemptId === "number" && event.attemptId > 0;
+      attemptOf.set(key, { nodeId: event.nodeId, seq: scoped ? event.attemptId : attemptOf.get(key)?.seq ?? 0 });
       continue;
     }
     if (!Array.isArray(event.result?.nodes)) continue;
+    const attemptSeq = row.type === "restore.completed" && attempt ? attempt.seq : row.seq;
     for (const node of [...event.result.nodes].reverse()) {
       if (typeof node?.nodeId === "string") {
-        map.set(restoreKey(row.rig_id, node.nodeId), { outcome: mapStatus(node.status) });
+        const key = restoreKey(row.rig_id, node.nodeId);
+        map.set(key, { outcome: mapStatus(node.status) });
+        attemptOf.set(key, { nodeId: node.nodeId, seq: attemptSeq });
       }
     }
+  }
+  // An attempt that started before the node's ready fresh launch describes the
+  // retired occupant: no restore outcome applies to the current one. History
+  // is unchanged; a subset completion after the launch stays current.
+  const fences = readReadyFreshLaunchFences(db, rigId);
+  for (const [key, entry] of attemptOf) {
+    const fence = fences.get(entry.nodeId);
+    if (fence !== undefined && entry.seq < fence) map.delete(key);
   }
   return map;
 }
@@ -416,9 +451,11 @@ function deriveHeldReason(db: Database.Database, rigId: string, nodeId: string, 
 
   // Superseded by a later rig-scoped restore event containing this node.
   // restore.completed/restore.subset_completed are rig-scoped (no top-level nodeId),
-  // so query by rig_id and parse payloads for node containment.
+  // so query by rig_id and parse payloads for node containment. The first type list
+  // is idx_events_restore_rig_seq's own condition, which lets the read use that index
+  // instead of every later event of the rig; the second keeps the two types read.
   const laterRestoreRows = db.prepare(
-    "SELECT payload FROM events WHERE rig_id = ? AND type IN ('restore.completed', 'restore.subset_completed') AND seq > ? ORDER BY seq DESC"
+    "SELECT payload FROM events WHERE rig_id = ? AND type IN ('restore.completed', 'restore.subset_completed', 'restore.outcome_reconciled') AND type IN ('restore.completed', 'restore.subset_completed') AND seq > ? ORDER BY seq DESC"
   ).all(rigId, heldRow.seq) as { payload: string }[];
   for (const row of laterRestoreRows) {
     try {
@@ -455,9 +492,26 @@ function getLatestError(db: Database.Database, rigId: string, nodeId: string): s
  * The startup-orchestrator persists: { category, effectiveId, sourceSpec, sourcePath, resourcePath, absolutePath, mergeStrategy, target }
  * We normalize to: { id, category, targetPath }
  */
-function mapProjectionEntries(entries: unknown[]): Array<{ id: string; category: string; targetPath: string }> {
+function mapProjectionEntries(
+  entries: unknown[],
+  guidance?: { file: string | null; content: string | null },
+): NodeDetailEntry["installedResources"] {
   return entries.map((e: unknown) => {
     const entry = e as Record<string, string>;
+    if (entry.category === "guidance") {
+      // The runtime decides the file a guidance block goes into; a spec's `target` is only declared. An installed path
+      // is shown only while that file holds the block, never inferred from the declaration.
+      const id = entry.effectiveId ?? entry.id ?? "";
+      const installed = entry.mergeStrategy === "managed_block" && guidance?.file && guidance.content !== null
+        && hasCompleteGuidanceBlock(guidance.content, id);
+      return {
+        id,
+        category: "guidance",
+        targetPath: installed ? guidance!.file! : "",
+        ...(entry.target ? { declaredTarget: entry.target } : {}),
+        ...(guidance?.file ? { effectiveTarget: guidance.file } : {}),
+      };
+    }
     return {
       id: entry.effectiveId ?? entry.id ?? "",
       category: entry.category ?? "",
@@ -505,6 +559,36 @@ function applicableVerdict(
   return verdict;
 }
 
+/** Read only identity evidence applicable to this session, binding and occupant. Unknown stays null. */
+function currentIdentityVerdict(db: Database.Database, nodeId: string): SeatIdentityVerdict | null {
+  try {
+    const row = db.prepare(`
+      SELECT n.handover_at, s.id AS session_id, s.session_name, s.created_at AS session_created_at, b.tmux_pane AS binding_tmux_pane
+        FROM nodes n
+        LEFT JOIN sessions s ON s.id = (SELECT s2.id FROM sessions s2 WHERE s2.node_id = n.id ORDER BY s2.id DESC LIMIT 1)
+        LEFT JOIN bindings b ON b.node_id = n.id
+       WHERE n.id = ?
+    `).get(nodeId) as Pick<InventoryRow, "session_id" | "session_name" | "session_created_at" | "binding_tmux_pane" | "handover_at"> | undefined;
+    return row ? applicableVerdict(new SeatIdentityStore(db).getForNode(nodeId), row) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function nodeSessionConfirmedMissing(db: Database.Database, nodeId: string): boolean {
+  return identityVerdictConfirmsSessionMissing(currentIdentityVerdict(db, nodeId));
+}
+
+/** Current positive stopped-executor evidence, without conflating a retained pane with a missing session. */
+export function nodeExecutorStoppedReason(db: Database.Database, nodeId: string): "session_missing" | "pane_exited" | null {
+  const reason = currentIdentityVerdict(db, nodeId)?.reason;
+  return reason === "session_missing" || reason === "pane_exited" ? reason : null;
+}
+
+export function nodeExecutorConfirmedStopped(db: Database.Database, nodeId: string): boolean {
+  return nodeExecutorStoppedReason(db, nodeId) !== null;
+}
+
 // -- Public API --
 
 /**
@@ -524,9 +608,9 @@ export function getNodeInventory(db: Database.Database, rigId: string): NodeInve
   const identityVerdicts = new SeatIdentityStore(db).getForRig(rigId);
   // FS-1 W1.3 S1/S2 — the per-node restore-outcome + oriented reads built ONCE
   // for the rig (was a query per node inside the rows.map). rig-scoped restore
-  // map = the prior WHERE rig_id=? filter; oriented map is node-scoped/global.
+  // map = the prior WHERE rig_id=? filter; oriented history follows the rig's nodes.
   const restoreOutcomes = buildRestoreOutcomeMap(db, rigId);
-  const orienteds = buildOrientedMap(db);
+  const orienteds = buildOrientedMap(db, rigId);
   const codexDaemonOptOuts = new AppliedLaunchObservationStore(db).readCurrentDaemonOptOuts();
 
   const rows = queryInventoryRows(db, rigId);
@@ -551,11 +635,12 @@ export function getNodeInventory(db: Database.Database, rigId: string): NodeInve
 function runInventoryRowQuery(db: Database.Database, whereClause: string, orderClause: string, params: readonly string[]): InventoryRow[] {
   // Join nodes with newest session (max ULID = max session.id string comparison)
   // and the rig name
-  const hasCodexConfigProfile = db.prepare("PRAGMA table_info(nodes)").all()
-    .some((row) => (row as { name?: string }).name === "codex_config_profile");
-  const codexConfigProfileSelect = hasCodexConfigProfile
-    ? "n.codex_config_profile"
-    : "NULL";
+  // Older databases predate some node columns. Select NULL for a missing one so
+  // the projection keeps its pre-column behaviour instead of failing the read.
+  const nodeColumns = new Set(db.prepare("PRAGMA table_info(nodes)").all()
+    .map((row) => (row as { name?: string }).name));
+  const nodeColumnOrNull = (name: string) => nodeColumns.has(name) ? `n.${name}` : "NULL";
+  const codexConfigProfileSelect = nodeColumnOrNull("codex_config_profile");
   const stmt = db.prepare(`
     SELECT
       n.id as node_id,
@@ -567,7 +652,11 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       n.role,
       n.runtime,
       n.model,
+      ${nodeColumnOrNull("effort")} as effort,
+      ${nodeColumnOrNull("effort_choice")} as effort_choice,
       ${codexConfigProfileSelect} as codex_config_profile,
+      ${nodeColumnOrNull("claude_mcp")} as claude_mcp,
+      ${nodeColumnOrNull("launch_wrapper")} as launch_wrapper,
       n.agent_ref,
       n.profile,
       n.cwd,
@@ -584,11 +673,13 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       s.session_name,
       s.created_at as session_created_at,
       s.status as session_status,
-      ${sessionAgentAppSelect(db)} as session_agent_app,
+      ${sessionCommunityHarnessSelect(db)} as session_community_harness,
+      ${sessionCommunityRunnerSelect(db)} as session_community_runner,
       s.intentionally_stopped,
       s.startup_status,
       s.resume_type,
       s.resume_token,
+      s.resume_provenance,
       s.startup_completed_at,
       b.attachment_type as binding_attachment_type,
       b.id as binding_id,
@@ -653,6 +744,11 @@ function buildInventoryEntry(
   ctx: InventoryBuildContext,
 ): NodeInventoryEntry {
   const { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts } = ctx;
+  const launchWrapper = parseStoredLaunchWrapper(row.launch_wrapper, `Seat ${row.node_id} launch_wrapper`);
+  if (launchWrapper && !isLaunchWrapperRuntime(row.runtime)) {
+    throw new Error(`Seat ${row.node_id} launch_wrapper: only valid when runtime is "pi", "codex" or "claude-code"`);
+  }
+  const effortResolution = resolveSeatEffort({ effort: row.effort, effortChoice: row.effort_choice });
   // FS-1 W1.3 S1 — O(1) lookup into the once-per-rig restore-outcome map
   // (byte-identical to the prior per-node deriveRestoreOutcome; "n-a" when a node
   // is referenced by no restore event, matching the prior fall-through).
@@ -672,11 +768,14 @@ function buildInventoryEntry(
   const identityVerdict = applicableVerdict(identityVerdicts.get(row.node_id) ?? null, row);
   // Keep registry history intact; only an applicable, explicit absence changes
   // the current status. Unavailable tmux and process mismatches are not absence.
-  const sessionStatus = row.session_status === "running" && identityVerdictConfirmsSessionMissing(identityVerdict)
-    ? "detached" : row.session_status;
+  const paneExited = row.session_status === "running" && identityVerdict?.reason === "pane_exited";
+  const sessionStatus = paneExited ? "exited"
+    : row.session_status === "running" && identityVerdictConfirmsSessionMissing(identityVerdict) ? "detached" : row.session_status;
+  const startupStatus = paneExited || (sessionStatus === "running" && identityVerdictDownranksRunning(identityVerdict?.verdict))
+    ? "attention_required" : row.startup_status as NodeInventoryEntry["startupStatus"];
   const lifecycleState = deriveNodeLifecycleState({
     sessionStatus,
-    startupStatus: row.startup_status,
+    startupStatus,
     restoreOutcome,
     nodeId: row.node_id,
     usableSnapshot,
@@ -697,18 +796,17 @@ function buildInventoryEntry(
     attachmentType: (row.binding_attachment_type as NodeInventoryEntry["attachmentType"]) ?? null,
     nodeKind: deriveNodeKind(row.runtime),
     runtime: row.runtime,
-    ...(agentAppOf(row.session_agent_app, row.runtime) ? { agentApp: agentAppLabel(row.runtime!) } : {}),
+    ...(communityHarnessOf(row.session_community_harness, row.runtime) ? { communityHarness: communityHarnessLabel(row.runtime!, undefined, { resumeType: row.resume_type, resumeToken: row.resume_token, resumeProvenance: row.resume_provenance ?? null, runner: row.session_community_runner === 1 }) } : {}),
+    ...(launchWrapper ? { launchWrapper } : {}),
     sessionStatus,
     storedSessionStatus: row.session_status,
+    // An explicit down records a failed start's rolled-back session without changing its superseded status.
     intentionallyStopped: row.intentionally_stopped === 1
-      && row.session_status === "exited" && row.binding_id === null,
+      && (row.session_status === "exited" || row.session_status === "superseded") && row.binding_id === null,
     // Match the graph's current-status projection without rewriting the startup
     // result. Applicable mismatch (including ambiguity) or pane_missing overrides it.
     storedStartupStatus: row.startup_status as NodeInventoryEntry["startupStatus"],
-    startupStatus: sessionStatus === "running"
-      && identityVerdictDownranksRunning(identityVerdict?.verdict)
-      ? "attention_required"
-      : row.startup_status as NodeInventoryEntry["startupStatus"],
+    startupStatus,
     restoreOutcome,
     // FS-1 W1.3 S2 — O(1) lookup into the fleet-batched oriented map
     // (byte-identical to the prior per-node deriveOriented; "n-a" when a node has
@@ -721,7 +819,11 @@ function buildInventoryEntry(
     previousOccupant: row.previous_occupant,
     handoverAt: row.handover_at,
     tmuxAttachCommand: row.binding_attachment_type === "tmux" && row.session_name ? tmuxAttachCommand(row.session_name) : null,
-    resumeCommand: computeResumeCommand(row.runtime, row.resume_token, row.codex_config_profile, codexDaemonOptOuts.get(row.node_id)),
+    ...(row.binding_attachment_type === "tmux" && row.session_name && daemonTmuxServerArgs().length
+      ? { tmuxServerArgs: [...daemonTmuxServerArgs()] } : {}),
+    ...(row.binding_attachment_type === "tmux" && row.session_name && daemonTmuxServerInfo()
+      ? { tmuxServerMode: daemonTmuxServerInfo()!.mode } : {}),
+    resumeCommand: computeResumeCommand(row.runtime, row.resume_token, row.codex_config_profile, codexDaemonOptOuts.get(row.node_id), row.claude_mcp),
     // OPR.0.4.0.26: recoveryGuidance is NOT inlined per node in the LIST
     // payload. It duplicated ~47KB of templated prose across all nodes and
     // no node-list consumer reads it. The full guidance is recomputed on
@@ -731,6 +833,10 @@ function buildInventoryEntry(
     latestError: row.startup_status === "ready" ? null : getLatestError(db, row.rig_id, row.node_id),
     // Extended fields
     model: row.model,
+    // Configured launch effort only; an observed level is reported by the
+    // seat-effort route, which reads the running process and native transcript.
+    effort: effortResolution.effective,
+    effortSource: effortResolution.source,
     agentRef: row.agent_ref,
     profile: row.profile,
     codexConfigProfile: row.codex_config_profile,
@@ -750,7 +856,26 @@ function buildInventoryEntry(
     // never observed; carries evidence on mismatch/missing.
     identityVerdict,
     heldReason: deriveHeldReason(db, row.rig_id, row.node_id, sessionStatus),
+    ...(row.handover_at ? startedWithoutRequired(db, row.node_id, row.session_id) : {}),
   };
+}
+
+/** #2456: the required startup files the seat's current occupant started without, as its handover recorded them. Only
+ *  the handover whose successor session is still the current one counts, so a later launch or handover clears it. Read
+ *  only for a seat that has had a handover. */
+function startedWithoutRequired(db: Database.Database, nodeId: string, sessionId: string | null): { startedWithoutRequired?: string[] } {
+  if (!sessionId) return {};
+  const row = db.prepare(
+    "SELECT payload FROM events WHERE node_id = ? AND type = 'seat.handover_completed' ORDER BY seq DESC LIMIT 1"
+  ).get(nodeId) as { payload: string } | undefined;
+  if (!row) return {};
+  try {
+    const event = JSON.parse(row.payload) as { startedWithoutRequired?: unknown; successorSessionId?: unknown };
+    const files = Array.isArray(event.startedWithoutRequired) ? event.startedWithoutRequired.filter((f): f is string => typeof f === "string") : [];
+    return event.successorSessionId === sessionId && files.length > 0 ? { startedWithoutRequired: files } : {};
+  } catch {
+    return {};
+  }
 }
 
 /** FS-1 W1.2 — all-rigs batched form of `readRigWorkspaceJson`: one query,
@@ -893,6 +1018,17 @@ export function getNodeDetail(
   const startupFiles = ctxRow ? JSON.parse(ctxRow.resolved_files_json) : [];
   const startupActions = ctxRow ? JSON.parse(ctxRow.startup_actions_json) : [];
   const projectionEntries = ctxRow ? JSON.parse(ctxRow.projection_entries_json) : [];
+  // The seat's guidance file as its runtime resolves it now, and what it holds, read once for the guidance entries.
+  const guidanceEvidence = (): { file: string | null; content: string | null } => {
+    const runtime = (ctxRow as { runtime?: string | null } | undefined)?.runtime ?? entry.runtime;
+    const recorded = (ctxRow as { guidance_file?: string | null } | undefined)?.guidance_file;
+    const file = entry.cwd ? seatGuidanceFile(runtime, entry.cwd, new RigRepository(db).getRigClaudeManagedBlockFile(rigId), recorded) : null;
+    let content: string | null = null;
+    if (file) {
+      try { content = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : null; } catch { content = null; }
+    }
+    return { file, content };
+  };
 
   // Installed resources: override (from async adapter call) > projection fallback
   let installedResources: NodeDetailEntry["installedResources"];
@@ -914,14 +1050,14 @@ export function getNodeDetail(
         }));
       } else {
         // Async — fall through to projection
-        installedResources = mapProjectionEntries(projectionEntries);
+        installedResources = mapProjectionEntries(projectionEntries, guidanceEvidence());
       }
     } catch {
-      installedResources = mapProjectionEntries(projectionEntries);
+      installedResources = mapProjectionEntries(projectionEntries, guidanceEvidence());
     }
   } else {
     // Projection fallback
-    installedResources = mapProjectionEntries(projectionEntries);
+    installedResources = mapProjectionEntries(projectionEntries, guidanceEvidence());
   }
 
   // Recent events (last 20 for this node)
@@ -1000,6 +1136,7 @@ export function getNodeDetail(
       sessionName: entry.canonicalSessionName,
       codexConfigProfile: entry.codexConfigProfile,
       codexDaemonOptOut: entry.runtime === "codex" ? new AppliedLaunchObservationStore(db).readCurrent(nodeId)?.daemonOptOut : undefined,
+      claudeMcp: entry.runtime === "claude-code" ? readSeatClaudeMcp(db, nodeId) : undefined,
     }),
     binding,
     startupFiles,
@@ -1087,6 +1224,67 @@ export function getNodeDetailWithContext(
   return detail;
 }
 
+/** The rungs that can answer the needs-input signal (the ones `arbitrate` consults,
+ *  chrome > hooks > self-report). Sampling carries no needs-input evidence. */
+const NEEDS_INPUT_RUNGS: readonly EvidenceRungId[] = ["needs-input-chrome", "lifecycle-hooks", "self-report"];
+
+/**
+ * The shared per-seat and rig-rollup attention predicate. Clients render the
+ * served result rather than repeating this rule. A seat
+ * needs attention iff ANY of:
+ *   - lifecycle `attention_required`
+ *   - startup `attention_required`/`failed` — counted DIRECTLY from
+ *     startupStatus; `latestError` may legitimately be null here
+ *   - `needs_input`: the ARBITRATED seat state is the first answer when it has one
+ *     (`arbitratedNeedsInput` — the same oracle the per-seat row renders, pane chrome
+ *     included), and the served activity's `needs_input` is the fallback when the
+ *     arbitrated signal is `null`: a live hook, else the cached pane reading
+ *     (`hookOrPaneActivity`), which sees a prompt no hook reported. Stale hooks
+ *     arrive as `unknown` and contribute nothing — never guessed. The rig total
+ *     and the seat row must not disagree about the same seat.
+ *   - a held seat (`heldReason` present)
+ *   - a recorded startup error (`latestError` present)
+ *   - an occupant a handover started without a required startup file (`startedWithoutRequired`, #2456)
+ */
+export function seatNeedsAttention(
+  entry: NodeInventoryEntry,
+  activity: AgentActivity | null,
+  arbitratedNeedsInput: boolean | null = null,
+): boolean {
+  return entry.lifecycleState === "attention_required"
+    || entry.startupStatus === "attention_required"
+    || entry.startupStatus === "failed"
+    || (arbitratedNeedsInput ?? activity?.state === "needs_input")
+    || entry.heldReason != null
+    || entry.latestError != null
+    || (entry.startedWithoutRequired?.length ?? 0) > 0;
+}
+
+/**
+ * #180 review — the arbitrated needs-input answer is TRI-STATE; collapsing it to
+ * `needsInput.count > 0` treats `count: 0` as a definite "no" even when no source said
+ * "no". `count: 0` is also the default when no authoritative rung reported needs-input:
+ * a Codex seat (hooks at `trial`), a generic/Pi/OMP seat (sampling floor only), a seat
+ * with no declaration, or a Claude seat whose declared rungs have not reported (after a
+ * daemon restart, or once its hook rung is downgraded). A live `PermissionRequest` in
+ * the hook store must still count there. Rules:
+ *   - count > 0                                    → true  (the service only reports a
+ *     positive count from an authoritative source)
+ *   - count is 0 AND needs-input evidence from an authoritative rung supplied it → false
+ *     (an observed clear legitimately supersedes a stale hook)
+ *   - otherwise                                    → null (let the hook store decide).
+ *     A declared rung is a capability, not an observation that the seat is clear.
+ */
+export function arbitratedNeedsInputSignal(
+  state: Pick<ArbitratedSeatState, "needsInput" | "needsInputEvidence"> | null,
+): boolean | null {
+  if (!state) return null;
+  if (state.needsInput.count > 0) return true;
+  const observedClear = state.needsInputEvidence != null
+    && NEEDS_INPUT_RUNGS.includes(state.needsInputEvidence.rung);
+  return observedClear ? false : null;
+}
+
 /**
  * Slice 15 — populate `terminalActive` + `hasAssignedWork` per node.
  *
@@ -1102,12 +1300,13 @@ export function getNodeDetailWithContext(
  */
 export function attachTerminalActivityAndWork(
   entries: NodeInventoryEntry[],
-  deps: { db: Database.Database; seatActivity?: SeatActivityService },
+  deps: { db: Database.Database; seatActivity?: SeatActivityService; agentActivity?: AgentActivityStore; now?: Date },
 ): NodeInventoryEntry[] {
   const seatActivity = deps.seatActivity ?? null;
   const assignedByDest = readAssignedWorkBySession(deps.db);
+  const now = deps.now ?? new Date();
   return entries.map((entry) => {
-    const sessionMissing = identityVerdictConfirmsSessionMissing(entry.identityVerdict);
+    const sessionMissing = identityVerdictConfirmsExecutorStopped(entry.identityVerdict);
     let terminalActive: boolean | null | undefined = sessionMissing ? false : undefined;
     // ARCH RULING 3a947fb1 (FR-7 additive): project the RAW lastActivityAt fact
     // alongside terminalActive from the SAME observation — honest-absence ladder
@@ -1124,8 +1323,9 @@ export function attachTerminalActivityAndWork(
     let activityState: NodeInventoryEntry["activityState"] = sessionMissing ? null : undefined;
     // Capability-checked: a partial injected double without the S19 surface keeps the
     // pre-taxonomy shape (undefined) rather than faking a null oracle answer.
+    const arb = !sessionMissing && seatActivity && entry.canonicalSessionName && typeof seatActivity.getSeatStateBySession === "function"
+      ? seatActivity.getSeatStateBySession(entry.canonicalSessionName) : null;
     if (!sessionMissing && seatActivity && entry.canonicalSessionName && typeof seatActivity.getSeatStateBySession === "function") {
-      const arb = seatActivity.getSeatStateBySession(entry.canonicalSessionName);
       activityState = arb
         ? {
             activity: arb.activity,
@@ -1138,11 +1338,20 @@ export function attachTerminalActivityAndWork(
         : null;
     }
     const work = countAssignedWorkForEntry(entry, assignedByDest);
+    const arbitratedNeedsInput = arbitratedNeedsInputSignal(arb);
+    const hook = !sessionMissing && entry.agentActivity == null && entry.canonicalSessionName
+      ? deps.agentActivity?.getLatestForNode({ nodeId: entry.nodeId, sessionName: entry.canonicalSessionName, now,
+        order: entry.runtime === "claude-code" ? "source" : "arrival" }) ?? null : null;
     return {
       ...entry,
       terminalActive,
       lastActivityAt,
       activityState,
+      // The activity this row serves (a live hook, else the cached pane reading) when it was attached, so a prompt
+      // only the pane shows counts; the hook store alone where it wasn't.
+      needsAttention: seatNeedsAttention(entry, entry.agentActivity ?? hook, arbitratedNeedsInput),
+      arbitratedNeedsInput,
+      needsInputEvidence: arb?.needsInputEvidence ?? null,
       hasAssignedWork: work.assignedWorkCount > 0,
       ...work,
     };
@@ -1150,7 +1359,7 @@ export function attachTerminalActivityAndWork(
 }
 
 /**
- * QA baseline-deep-dogfood BLOCKING-A2 (qitem-20260518063900-85745917):
+ * QA baseline-deep-dogfood BLOCKING-A2:
  * adopted/live-session rigs do NOT surface assigned queue work because
  * the prior lookup matched destination_session ONLY against
  * canonicalSessionName.
@@ -1244,14 +1453,74 @@ export function readAssignedWorkBySession(db: Database.Database): Map<string, As
   }>;
   const out = new Map<string, AssignedWorkCounts>();
   for (const r of rows) {
-    out.set(r.destination_session, {
-      assignedWorkCount: r.assigned_count,
-      pendingWorkCount: r.pending_count,
-      inProgressWorkCount: r.in_progress_count,
-      blockedWorkCount: r.blocked_count,
+    const address = physicalSessionName(db, r.destination_session);
+    const prior = out.get(address);
+    out.set(address, {
+      assignedWorkCount: (prior?.assignedWorkCount ?? 0) + r.assigned_count,
+      pendingWorkCount: (prior?.pendingWorkCount ?? 0) + r.pending_count,
+      inProgressWorkCount: (prior?.inProgressWorkCount ?? 0) + r.in_progress_count,
+      blockedWorkCount: (prior?.blockedWorkCount ?? 0) + r.blocked_count,
     });
   }
   return out;
+}
+
+/**
+ * The capture-free answer from a seat's newest hook and its cached pane reading, before motion is applied, or `null`
+ * when neither answers. The per-seat activity below and the rig attention count both read it, so a prompt that only
+ * the pane shows counts in both.
+ */
+export function hookOrPaneActivity(
+  hookActivity: AgentActivity | null | undefined,
+  structural: StructuralObservation | null,
+  /** A positive idle hook gives way to a current complete idle frame (D2). */
+  idleYieldsToFrame = false,
+  runtime?: string | null,
+): { source: "hook" | "limit" | "pane"; activity: AgentActivity } | null {
+  // Running/needs_input hooks keep their meaning.
+  if (hookActivity && hookActivity.state !== "unknown" && !(hookActivity.state === "idle" && idleYieldsToFrame)) {
+    return { source: "hook", activity: hookActivity };
+  }
+
+  // A typed provider-interruption row (Codex at_limit or Claude StopFailure/rate_limit) is positive evidence
+  // even though its state is unknown by construction (it must never count
+  // as waiting-on-a-person). Deliver it instead of the cached pane reading
+  // so a limited seat shows the limit, not idle — but only while current.
+  // Terminal redraws are not recovery evidence and must not erase the limit.
+  // Only a strictly newer, current attention observation outranks it.
+  // A demoted row (aged out or generation-mismatched) falls through to the
+  // structural reading like any other stale hook.
+  if (hookActivity && (
+    hookActivity.rawEvent === "at_limit"
+    || (hookActivity.runtime === runtime
+      && isClaudeRateLimitHook(hookActivity.runtime, hookActivity.rawEvent, hookActivity.rawSubtype))
+  ) && hookActivity.stale !== true && !(
+    structural?.state === "attention" &&
+    Date.parse(structural.observedAt) > Date.parse(hookActivity.eventAt ?? "")
+  )) {
+    return { source: "limit", activity: hookActivity };
+  }
+
+  // Hook ABSENT or unknown/stale → consult the CACHED structural observation. This read is
+  // capture-FREE: the pane capture already happened on the background SeatStructuralActivityService
+  // tick, never here (the healthz-wedge no-per-request-capture invariant is preserved). A structural
+  // motion verdict is a LIVENESS signal that OVERRIDES an absent/stale hook (constraint 2 — liveness
+  // beats hook-arrival age) and makes ACTIVITY real on the DEFAULT path for hook-less / Codex /
+  // just-finished-a-turn seats: the exact fleet-blindness this fix targets. Structural discrimination
+  // is STRUCTURAL (spinner shapes / esc-to-interrupt / idle prompt), never a verb allowlist.
+  if (structural && structural.state !== "unknown") {
+    return {
+      source: "pane",
+      activity: {
+        state: mapPaneState(structural.state),
+        reason: structural.reason,
+        evidenceSource: "pane_heuristic",
+        sampledAt: structural.observedAt,
+        evidence: structural.evidence,
+      },
+    };
+  }
+  return null;
 }
 
 export async function attachAgentActivity(
@@ -1293,15 +1562,15 @@ export async function attachAgentActivity(
   const sampledAt = deps.now ?? new Date();
   const captureFallback = deps.captureFallback ?? false;
   return Promise.all(entries.map(async (entry) => {
-    // A cached hook, pane sample or motion cannot revive a confirmed absent
-    // session. Preserve the identity observation's provenance without probing.
-    if (identityVerdictConfirmsSessionMissing(entry.identityVerdict)) {
+    // A cached hook, pane sample or motion cannot revive a confirmed absent executor.
+    // Preserve the applicable missing-session or exited-pane observation without probing.
+    if (identityVerdictConfirmsExecutorStopped(entry.identityVerdict)) {
       return {
         ...entry,
         agentActivity: {
           state: "unknown",
-          reason: "session_missing",
-          evidenceSource: "tmux_session",
+          reason: entry.identityVerdict!.reason!,
+          evidenceSource: entry.identityVerdict!.evidenceSource ?? "tmux_session",
           sampledAt: entry.identityVerdict!.observedAt,
           evidence: entry.canonicalSessionName,
         },
@@ -1348,7 +1617,9 @@ export async function attachAgentActivity(
      *
      *     needs_input > running > MOTION > idle / unknown
      *
-     * Live motion UPGRADES a verdict of `idle` or `unknown`; it never touches `needs_input` or an
+     * A current, target-bound complete idle frame is the narrow exception to motion below.
+     * A generic footer or old idle capture is not that evidence; D2 remains unchanged.
+     * Live motion otherwise UPGRADES a verdict of `idle` or `unknown`; it never touches `needs_input` or an
      * already-`running` verdict, and it never MANUFACTURES `idle`. That asymmetry is the whole
      * safety argument, and it is what each half of the defect needs:
      *
@@ -1372,8 +1643,8 @@ export async function attachAgentActivity(
      * "not unknown" by relabelling the default, which is the closed union rotting rather than the
      * signal improving. Silence therefore leaves the prior verdict exactly as it was.
      */
-    const withMotion = (activity: AgentActivity): AgentActivity => {
-      if (!motionRunning) return activity;
+    const withMotion = (activity: AgentActivity, currentIdleFrame = false): AgentActivity => {
+      if (!motionRunning || (currentIdleFrame && activity.state === "idle")) return activity;
       if (activity.state !== "idle" && activity.state !== "unknown") return activity;
       return {
         state: "running",
@@ -1387,61 +1658,34 @@ export async function attachAgentActivity(
       };
     };
 
-    const hookActivity = deps.activityStore?.getLatestForNode({
+    const hookActivity = entry.canonicalSessionName ? deps.activityStore?.getLatestForNode({
+      nodeId: entry.nodeId,
       sessionName: entry.canonicalSessionName,
       now: sampledAt,
-    });
-    // A fresh POSITIVE hook (running/needs_input/idle) is authoritative — EXCEPT that a positive
-    // `idle` hook now yields to live motion (D2). running/needs_input hooks are untouched.
-    if (hookActivity && hookActivity.state !== "unknown") {
-      return {
-        ...entry,
-        agentActivity: withMotion(hookActivity),
-      };
-    }
-
-    // Capture-free cache read; the service rejects expired observations.
+      order: entry.runtime === "claude-code" ? "source" : "arrival",
+    }) : null;
+    // Reuse the existing cached capture. Only a complete supported idle frame, bound to this
+    // target and started in a later second than the last write, distinguishes idle redraw from resumed work.
+    // window_activity has second precision: same-second ordering is unknown. Poll/completion time is not write time.
     const structural = entry.canonicalSessionName
-      ? deps.structuralActivity?.getStructuralActivity(entry.canonicalSessionName)
+      ? deps.structuralActivity?.getStructuralActivity(entry.canonicalSessionName) ?? null
       : null;
+    const capturedMs = Date.parse(structural?.idleFrame?.captureStartedAt ?? "");
+    const motionMs = Date.parse(motion?.lastActivityAt ?? "");
+    const currentIdleFrame = structural?.state === "agent_idle"
+      && structural.idleFrame?.sessionName === entry.canonicalSessionName
+      && structural.idleFrame?.runtime === entry.runtime
+      && Number.isFinite(capturedMs) && capturedMs <= sampledAt.getTime()
+      && sampledAt.getTime() - capturedMs < DEFAULT_STRUCTURAL_STALE_MS
+      && (!motionRunning || (Number.isFinite(motionMs)
+        && Math.floor(capturedMs / 1000) > Math.floor(motionMs / 1000)));
 
-    // #763: a typed provider-interruption row (at_limit) is positive evidence
-    // even though its state is unknown by construction (it must never count
-    // as waiting-on-a-person). Deliver it instead of the cached pane reading
-    // so a limited seat shows the limit, not idle — but only while current.
-    // Terminal redraws are not recovery evidence and must not erase the limit.
-    // Only a strictly newer, current attention observation outranks it.
-    // A demoted row (aged out or generation-mismatched) falls through to the
-    // structural reading like any other stale hook.
-    if (hookActivity?.rawEvent === "at_limit" && hookActivity.stale !== true && !(
-      structural?.state === "attention" &&
-      Date.parse(structural.observedAt) > Date.parse(hookActivity.eventAt ?? "")
-    )) {
-      return {
-        ...entry,
-        agentActivity: hookActivity,
-      };
-    }
-
-    // Hook ABSENT or unknown/stale → consult the CACHED structural observation. This read is
-    // capture-FREE: the pane capture already happened on the background SeatStructuralActivityService
-    // tick, never here (the healthz-wedge no-per-request-capture invariant is preserved). A structural
-    // motion verdict is a LIVENESS signal that OVERRIDES an absent/stale hook (constraint 2 — liveness
-    // beats hook-arrival age) and makes ACTIVITY real on the DEFAULT path for hook-less / Codex /
-    // just-finished-a-turn seats: the exact fleet-blindness this fix targets. Structural discrimination
-    // is STRUCTURAL (spinner shapes / esc-to-interrupt / idle prompt), never a verb allowlist.
-    if (structural && structural.state !== "unknown") {
-      return {
-        ...entry,
-        agentActivity: withMotion({
-          state: mapPaneState(structural.state),
-          reason: structural.reason,
-          evidenceSource: "pane_heuristic",
-          sampledAt: structural.observedAt,
-          evidence: structural.evidence,
-        }),
-      };
-    }
+    // An idle hook alone still yields to motion (D2); when a current complete idle frame exists, report
+    // that frame's provenance instead.
+    const resolved = hookOrPaneActivity(hookActivity, structural, motionRunning && currentIdleFrame, entry.runtime);
+    if (resolved?.source === "hook") return { ...entry, agentActivity: withMotion(resolved.activity) };
+    if (resolved?.source === "limit") return { ...entry, agentActivity: resolved.activity };
+    if (resolved?.source === "pane") return { ...entry, agentActivity: withMotion(resolved.activity, currentIdleFrame) };
 
     // No positive hook and no structural verdict. A stale/unknown hook, if one exists, is delivered
     // HONESTLY as-is (unknown/stale) — never upgraded to a quiet-seat verdict on arrival age alone.
@@ -1485,7 +1729,7 @@ export async function attachAgentActivity(
       now: sampledAt,
       captureObserver: deps.captureObserver,
       binding: deps.captureObserver ? deps.observationBinding?.(entry) : undefined,
-      agentApp: entry.agentApp?.app ?? null,
+      communityHarness: entry.communityHarness?.harness ?? null,
     })),
     };
   }));

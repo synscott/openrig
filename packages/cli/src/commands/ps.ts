@@ -1,3 +1,4 @@
+import { modelObservation, formatModelObservation, type ModelObservation } from "../lib/model-observation.js";
 import { Command } from "commander";
 import stringWidth from "string-width";
 import { resolveEffectiveHost } from "../host-selection.js";
@@ -10,6 +11,7 @@ import { loadHostRegistry, resolveHost, hostDisplayTarget, resolveRemoteBearer, 
 import { runCrossHostCommand, type RunCrossHostCommandOpts } from "../cross-host-executor.js";
 import { emitCrossHostError, emitCrossHostFailure } from "../cross-host-cli-helpers.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
+import { formatSeatActivity as formatActivity } from "../lib/seat-activity.js";
 import type { AggregatedPayload, PerHostStatus } from "../lib/hosts/fanout-contract.js";
 
 interface PsEntry {
@@ -42,6 +44,10 @@ interface PsEntry {
 }
 
 interface NodeEntry {
+  /** Served daemon attention, never re-derived here. Missing on an older daemon. */
+  needsAttention?: boolean;
+  arbitratedNeedsInput?: boolean | null;
+  needsInputEvidence?: { rung: string; observedAt: string } | null;
   rigId: string;
   rigName: string;
   logicalId: string;
@@ -55,6 +61,7 @@ interface NodeEntry {
   nodeKind: "agent" | "infrastructure";
   runtime: string | null;
   model: string | null;
+  modelObservation?: ModelObservation;
   sessionStatus: string | null;
   intentionallyStopped?: boolean;
   startupStatus: "pending" | "ready" | "attention_required" | "failed" | null;
@@ -76,9 +83,13 @@ interface NodeEntry {
     needsInput: { count: number; reason: string | null };
     decidedBy: string | null;
   } | null;
-  identityVerdict?: { reason?: string | null } | null;
-  /** A community agent app's seat: its label, maintainer and declared limits. */
-  agentApp?: { app: string; maintainer: string | null; limits: string[]; identity: string; needsInput: string; presetError?: string };
+  identityVerdict?: { verdict?: string; reason?: string | null; observedAt?: string | null } | null;
+  /** The registry's recorded session status, kept when the served sessionStatus is corrected. */
+  storedSessionStatus?: string | null;
+  /** A community harness's seat: its label, maintainer and declared limits. */
+  communityHarness?: { harness: string; maintainer: string | null; limits: string[]; identity: string; needsInput: string; presetError?: string };
+  /** Configured literal argv prefix wrapping local built-in Pi/Codex launches; omitted when absent. */
+  launchWrapper?: string[];
   /** Slice 15 — `has-work-to-do` primitive. Derived from queue_items;
    *  NEVER derived from terminalActive. */
   hasAssignedWork?: boolean;
@@ -90,6 +101,8 @@ interface NodeEntry {
   blockedWorkCount?: number;
   /** OPR.0.3.4.11 — held reason from node.held event. */
   heldReason?: string | null;
+  /** #2456: the required startup files this occupant's handover started it without. */
+  startedWithoutRequired?: string[];
   agentActivity?: {
     state: "running" | "needs_input" | "idle" | "unknown";
     reason: string;
@@ -205,8 +218,10 @@ const ALLOWED_NODE_FIELDS = new Set([
   "canonicalSessionName",
   "nodeKind",
   "runtime",
-  "agentApp",
+  "communityHarness",
+  "launchWrapper",
   "model",
+  "modelObservation",
   "sessionStatus",
   "intentionallyStopped",
   "startupStatus",
@@ -223,8 +238,14 @@ const ALLOWED_NODE_FIELDS = new Set([
   "inProgressWorkCount",
   "blockedWorkCount",
   "agentActivity",
+  "needsAttention",
+  "arbitratedNeedsInput",
+  "needsInputEvidence",
   "contextUsage",
   "heldReason",
+  "startedWithoutRequired",
+  "storedSessionStatus",
+  "identityVerdict",
 ]);
 
 interface PsCliOptions {
@@ -606,13 +627,6 @@ function selectFanOutFields(entries: Array<Record<string, unknown>>, fields: str
   });
 }
 
-function needsAttention(node: NodeEntry): boolean {
-  return node.lifecycleState === "attention_required"
-    || node.startupStatus === "attention_required"
-    || node.startupStatus === "failed"
-    || node.agentActivity?.state === "needs_input";
-}
-
 function hasCurrentUsageLimit(node: NodeEntry): boolean {
   const activity = node.agentActivity;
   return activity?.state === "unknown" && activity.reason === "usage_limit"
@@ -620,17 +634,28 @@ function hasCurrentUsageLimit(node: NodeEntry): boolean {
     && activity.stale === false && !activity.fallback;
 }
 
-/** One line per community agent app seat: what OpenRig knows about it, and what it doesn't. */
-export function formatAgentAppLine(seat: string, app: NonNullable<NodeEntry["agentApp"]>): string {
-  if (app.presetError) return `Community app (${seat}): ${app.app}: ${app.presetError}.`;
+/** One line per community harness seat: what OpenRig knows about it, and what it doesn't. */
+export function formatCommunityHarnessLine(seat: string, app: NonNullable<NodeEntry["communityHarness"]>): string {
+  if (app.presetError) return `Community harness (${seat}): ${app.harness}: ${app.presetError}.`;
   const limits = app.limits.length ? `; declared limits: ${app.limits.join("; ")}` : "";
-  return `Community app (${seat}): ${app.app}, maintained by ${app.maintainer}, not tested by OpenRig. Identity ${app.identity}; needs-input ${app.needsInput}${limits}.`;
+  return `Community harness (${seat}): ${app.harness}, maintained by ${app.maintainer}, not tested by OpenRig. Identity ${app.identity}; needs-input ${app.needsInput}${limits}.`;
 }
 
 function missingSessionGuidance(node: NodeEntry): string | null {
   return node.identityVerdict?.reason === "session_missing"
     ? "tmux session missing; restore or relaunch the seat"
     : null;
+}
+
+/** A recorded-running seat whose applicable identity check could not reach tmux: its liveness is
+ *  unconfirmed, not known dead. Codex's mismatch verdict keeps its own attention path. */
+function livenessUnconfirmed(node: NodeEntry): boolean {
+  return node.sessionStatus === "running" && !node.intentionallyStopped
+    && node.identityVerdict?.verdict === "tmux_unavailable";
+}
+
+function livenessLine(seat: string, node: NodeEntry): string {
+  return `Liveness (${seat}): recorded running, not confirmed: tmux was unavailable at the last observation (${node.identityVerdict?.observedAt ?? "time unknown"}).`;
 }
 
 // OPR.0.4.0.34 — the compact orch field set (PRD FR-4). Carries the
@@ -647,15 +672,54 @@ function missingSessionGuidance(node: NodeEntry): string | null {
 //
 // SCOPE, stated because the column invites a wider reading: this is the
 // SPEC-DECLARED model (nodes.model), NOT the model the seat is running. The
-// running model has no producer today — it is the ACTIVITY-umbrella rider.
+// last observed native model is reported separately, with its provenance and time.
+/** One line per seat, except that a runtime's seats with no model reader share one line (#1680). It keeps every
+ *  configured model with its count. Each seat's own configured model stays in `--full`'s MODEL(DECLARED) column and in
+ *  `--json`; the lines themselves collapse in every human view. */
+export function modelLines(nodes: NodeEntry[]): string[] {
+  const lines: string[] = [];
+  const unsupported = new Map<string, NodeEntry[]>();
+  const observed = new Map<NodeEntry, ModelObservation>();
+  for (const n of nodes) {
+    const observation = modelObservation(n.modelObservation, n.sessionStatus === "running");
+    observed.set(n, observation);
+    if (observation.status === "unknown" && observation.reason === "unsupported-runtime") {
+      const runtime = n.runtime ?? "unknown";
+      unsupported.set(runtime, [...(unsupported.get(runtime) ?? []), n]);
+    }
+  }
+  const summarized = new Set<string>();
+  for (const n of nodes) {
+    const runtime = n.runtime ?? "unknown";
+    const group = unsupported.get(runtime);
+    if (group && group.length > 1 && group.includes(n)) {
+      if (summarized.has(runtime)) continue;
+      summarized.add(runtime);
+      const configured = new Map<string, number>();
+      for (const seat of group) configured.set(formatDeclaredModel(seat.model), (configured.get(formatDeclaredModel(seat.model)) ?? 0) + 1);
+      lines.push(`Model (${group.length} ${runtime} seats): last observed UNKNOWN (unsupported-runtime: no model reader for ${runtime}); configured ${
+        [...configured].map(([model, count]) => count > 1 ? `${model} ×${count}` : model).join(", ")}`);
+      continue;
+    }
+    lines.push(`Model (${n.canonicalSessionName ?? n.logicalId}): configured ${formatDeclaredModel(n.model)}; last observed ${formatModelObservation(observed.get(n)!)}`);
+  }
+  return lines;
+}
+
 export function formatDeclaredModel(model: string | null | undefined): string {
   const m = (model ?? "").trim();
   return m.length > 0 ? m : "not-declared";
 }
 
+/** #2456: the attention reason for an occupant started without a required startup file. */
+function startedWithoutLine(files: string[]): string {
+  return `missing required ${files.map((file) => file.split("/").pop()).join(", ")}`;
+}
+
 export function compactNodeProjection(nodes: NodeEntry[]): Array<Record<string, unknown>> {
   return nodes.map((n) => {
-    const attention = needsAttention(n);
+    const keepDiagnostics = n.needsAttention !== false;
+    const observation = n.modelObservation == null ? null : modelObservation(n.modelObservation, n.sessionStatus === "running");
     const compact: Record<string, unknown> = {
       // identity (rigId/rigName + logicalId + session) — disambiguates under -A.
       rigId: n.rigId,
@@ -671,8 +735,16 @@ export function compactNodeProjection(nodes: NodeEntry[]): Array<Record<string, 
       // runtime is complete fleet-wide; model is a DECLARATION, absent on 13 of
       // 15 claude-code seats — see formatDeclaredModel for the render rule.
       runtime: n.runtime ?? null,
-      ...(n.agentApp ? { agentApp: n.agentApp } : {}),
+      ...(n.communityHarness ? { communityHarness: n.communityHarness } : {}),
+      ...(n.launchWrapper?.length ? { launchWrapper: n.launchWrapper } : {}),
       model: n.model ?? null,
+      // Compact tuple: [literal model, evidence source, native record time].
+      // Full JSON / --fields retain the complete labelled object and occupant generation.
+      modelObservation: !observation ? null : observation.status === "observed"
+        ? [observation.model, observation.source, observation.observedAt]
+        : { status: "unknown", reason: observation.reason },
+      // Provenance remains on --full / --fields; the compact read keeps the served flag.
+      ...(n.needsAttention === undefined ? {} : { needsAttention: n.needsAttention }),
       // lifecycle + session/startup state.
       sessionStatus: n.sessionStatus,
       startupStatus: n.startupStatus,
@@ -680,7 +752,7 @@ export function compactNodeProjection(nodes: NodeEntry[]): Array<Record<string, 
       oriented: n.oriented ?? "n-a",
       lifecycleState: n.lifecycleState,
       // Keep the current usage limit visible without classifying it as human attention.
-      agentActivity: attention || hasCurrentUsageLimit(n)
+      agentActivity: keepDiagnostics || hasCurrentUsageLimit(n)
         ? { state: n.agentActivity?.state ?? "unknown", reason: n.agentActivity?.reason }
         : { state: n.agentActivity?.state ?? "unknown" },
       // Work counts. Compact keeps the base pending-only key plus the active
@@ -698,9 +770,18 @@ export function compactNodeProjection(nodes: NodeEntry[]): Array<Record<string, 
       lastActivity: n.agentActivity?.sampledAt ?? n.startupCompletedAt ?? null,
     };
     if (n.intentionallyStopped !== undefined) compact.intentionallyStopped = n.intentionallyStopped;
+    // The served identity evidence (verdict, reason, observation time) and the registry's recorded
+    // status, without the raw evidence; recorded running is not a check that the process is alive.
+    if (n.storedSessionStatus !== undefined) compact.storedSessionStatus = n.storedSessionStatus;
+    if (n.identityVerdict) {
+      const { verdict, reason, observedAt } = n.identityVerdict;
+      // Only what was served: an absent time stays absent, never filled in.
+      compact.identityVerdict = { ...(verdict ? { verdict } : {}), ...(reason ? { reason } : {}), ...(observedAt ? { observedAt } : {}) };
+    }
     // held/attention reason (short) when present.
     if (n.heldReason) compact.heldReason = n.heldReason;
-    if (attention && n.latestError) {
+    if (n.startedWithoutRequired?.length) compact.startedWithoutRequired = n.startedWithoutRequired;
+    if (keepDiagnostics && n.latestError) {
       compact.latestError = n.latestError;
     }
     return compact;
@@ -853,18 +934,20 @@ contextUsage.percent, contextUsage.state (with --nodes). Other keys are rejected
 activeCount, hasWorkCount, attentionCount, status, lifecycleState, uptime,
 latestSnapshot.
 --fields accepts (node-level, with --nodes): rigId, rigName, logicalId, podId,
-podNamespace, hostSelfId, canonicalSessionName, nodeKind, runtime, agentApp, model, sessionStatus,
+podNamespace, hostSelfId, canonicalSessionName, nodeKind, runtime, communityHarness, launchWrapper, model, sessionStatus,
 intentionallyStopped, startupStatus, restoreOutcome, lifecycleState, tmuxAttachCommand,
 resumeCommand, latestError, terminalActive, hasAssignedWork,
 assignedWorkCount, pendingWorkCount, inProgressWorkCount, blockedWorkCount,
-agentActivity, contextUsage, heldReason.
+agentActivity, needsAttention, arbitratedNeedsInput, needsInputEvidence,
+contextUsage, heldReason, startedWithoutRequired, storedSessionStatus, identityVerdict.
 
 --host runs on a remote host declared in ~/.openrig/hosts.yaml (no current-rig
 default applied; the remote host's rigs are shown).
 
 Exit codes:
   0  Success
-  1  Daemon not running, or invalid --filter / --limit / --fields
+  1  Daemon not running, --rig names no rig (human output; --json keeps its empty result),
+     or invalid --filter / --limit / --fields
   2  Failed to fetch data from daemon`);
   const getDepsF = (): PsDeps => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
@@ -1006,6 +1089,18 @@ Exit codes:
       const rigScoped = opts.rig
         ? visible.filter((e) => (e.rigName ?? e.name) === opts.rig)
         : visible;
+
+      // A --rig that names no rig is a lookup that missed, not an empty fleet: say so (as rig chatroom,
+      // env and parked do) instead of "No rigs" or a zero summary. --json keeps its empty result.
+      if (!opts.json && opts.rig && rigScoped.length === 0) {
+        if (all.some((e) => (e.rigName ?? e.name) === opts.rig)) {
+          console.error(`Rig '${opts.rig}' is archived. Show it with: rig ps --rig ${opts.rig} --include-archived`);
+        } else {
+          console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+        }
+        process.exitCode = 1;
+        return;
+      }
 
       // Apply CLI-side filter (Amendment A: prefer CLI shaping).
       const filtered = parsedFilter ? applyRigFilter(rigScoped, parsedFilter) : rigScoped;
@@ -1180,6 +1275,29 @@ async function handleNodes(
   if (opts.rig) narrowed = narrowed.filter((n) => n.rigName === opts.rig);
   if (opts.session) narrowed = narrowed.filter((n) => n.canonicalSessionName === opts.session);
 
+  // A --rig that names no rig is a lookup that missed, not a rig without seats (or a zero summary).
+  // --json keeps its empty result.
+  if (!opts.json && opts.rig && effectiveRigs.length === 0) {
+    // The list above leaves archived rigs out unless asked; look once more so an archived rig's name gets
+    // the same --include-archived pointer as the rig view.
+    let archived = false;
+    if (!opts.includeArchived) {
+      const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", requestHeaders ? { headers: requestHeaders } : undefined);
+      // A failed lookup hasn't shown the rig is missing: report it as the first rig-list read does.
+      if (withArchived.status >= 400) {
+        console.error(`Failed to fetch rig list from daemon (HTTP ${withArchived.status}). Check daemon status with: rig status`);
+        process.exitCode = 2;
+        return;
+      }
+      archived = Array.isArray(withArchived.data) && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+    }
+    console.error(archived
+      ? `Rig '${opts.rig}' is archived. Show it with: rig ps --nodes --rig ${opts.rig} --include-archived`
+      : `Rig '${opts.rig}' not found. List rigs with: rig ps`);
+    process.exitCode = 1;
+    return;
+  }
+
   const filtered = parsedFilter ? applyNodeFilter(narrowed, parsedFilter) : narrowed;
 
   if (opts.summary) {
@@ -1250,12 +1368,12 @@ async function handleNodes(
   const humanTruncated = !opts.full && limit === null && filtered.length > HUMAN_NODE_BUDGET;
 
   if (useCompact) {
-    console.log(padCompactNodeRow("RIG", "SESSION", "LIFECYCLE", "ACTIVITY", "WORK", "REASON"));
+    console.log(padCompactNodeRow("RIG", "SESSION", "LIFECYCLE", "ACTIVITY", "WORK", "REASON", "ATTN"));
     for (const n of humanList as NodeEntry[]) {
-      const attn = needsAttention(n);
-      const reason = missingSessionGuidance(n) ?? (attn || hasCurrentUsageLimit(n)
-        ? (n.latestError ? truncate(n.latestError, 40) : n.agentActivity?.reason ?? "—")
-        : "—");
+      const reason = missingSessionGuidance(n) ?? (n.needsAttention !== false || hasCurrentUsageLimit(n)
+        ? (n.latestError ? truncate(n.latestError, 40) : n.startedWithoutRequired?.length ? truncate(startedWithoutLine(n.startedWithoutRequired), 40)
+          : n.agentActivity?.reason ?? "—")
+        : livenessUnconfirmed(n) ? "liveness unconfirmed" : "—");
       console.log(padCompactNodeRow(
         n.rigName,
         n.canonicalSessionName ?? "—",
@@ -1263,6 +1381,7 @@ async function handleNodes(
         formatActivity(n),
         formatHasWork(n.hasAssignedWork, n.assignedWorkCount ?? n.pendingWorkCount),
         reason,
+        n.needsAttention === undefined ? "?" : n.needsAttention ? "yes" : "no",
       ));
     }
   } else {
@@ -1289,10 +1408,13 @@ async function handleNodes(
         formatActivity(n),
         formatContextUsage(n.contextUsage),
         n.restoreOutcome,
-        missingSessionGuidance(n) ?? (n.latestError ? truncate(n.latestError, 30) : n.heldReason ? `held: ${truncate(n.heldReason, 25)}` : "—"),
+        missingSessionGuidance(n) ?? (n.latestError ? truncate(n.latestError, 30) : n.heldReason ? `held: ${truncate(n.heldReason, 25)}`
+          : n.startedWithoutRequired?.length ? truncate(startedWithoutLine(n.startedWithoutRequired), 30)
+          : livenessUnconfirmed(n) ? "liveness unconfirmed" : "—"),
       ));
     }
   }
+  for (const line of modelLines(humanList as NodeEntry[])) console.log(line);
   // Keep an actionable startup continuation outside the table's clipped cells.
   for (const n of humanList as NodeEntry[]) {
     if (n.startupStatus === "attention_required" && n.latestError?.includes("rig seat continue ")) {
@@ -1300,7 +1422,10 @@ async function handleNodes(
     }
   }
   for (const n of humanList as NodeEntry[]) {
-    if (n.agentApp) console.log(formatAgentAppLine(n.canonicalSessionName ?? n.logicalId, n.agentApp));
+    if (n.communityHarness) console.log(formatCommunityHarnessLine(n.canonicalSessionName ?? n.logicalId, n.communityHarness));
+  }
+  for (const n of humanList as NodeEntry[]) {
+    if (livenessUnconfirmed(n)) console.log(livenessLine(n.canonicalSessionName ?? n.logicalId, n));
   }
   if (humanTruncated) {
     const remaining = filtered.length - HUMAN_NODE_BUDGET;
@@ -1310,27 +1435,6 @@ async function handleNodes(
     const remaining = filtered.length - (limit ?? 0);
     console.log(`... and ${remaining} more node${remaining === 1 ? "" : "s"} (--limit ${limit}).`);
   }
-}
-
-function formatActivity(n: Pick<NodeEntry, "agentActivity" | "activityState" | "agentApp">): string {
-  // S19 — render from the served taxonomy state when present: needs-input as
-  // count(+reason), otherwise the bridge's display value. No local arbitration.
-  const tax = n.activityState;
-  if (tax) {
-    if (tax.needsInput.count > 0) return `needs-input x${tax.needsInput.count}`;
-    // A community agent app has no needs-input source in that state, so its zero isn't a clearance: a prompt the
-    // screen shows is kept.
-    if (n.agentApp && n.agentActivity?.state === "needs_input") return "needs-input (screen)";
-    return tax.display;
-  }
-  // Legacy fallback (a daemon without the S19 enrichment) — retires with the
-  // pre-taxonomy surfaces per the ladder-as-migration rule.
-  const activity = n.agentActivity;
-  if (!activity) return "unknown";
-  if (activity.state === "running") return "running";
-  if (activity.state === "needs_input") return "needs_input";
-  if (activity.state === "idle") return "idle";
-  return "unknown";
 }
 
 function truncate(s: string, max: number): string {
@@ -1364,6 +1468,9 @@ function padRigRow(cells: string[], widths: number[]): string {
   return cells.map((cell, i) => i < widths.length ? fitRigCell(cell, widths[i]!) : cell).join(RIG_COLUMN_SEPARATOR);
 }
 
+// A cell filled to its width, or cut to it, still ends before the next column begins.
+const NODE_COLUMN_SEPARATOR = " ";
+
 export function padNodeRow(rig: string, pod: string, member: string, session: string, runtime: string, model: string, status: string, startup: string, oriented: string, lifecycle: string, terminal: string, work: string, activity: string, ctx: string, restore: string, error: string): string {
   return [
     fitCell(rig, 30),
@@ -1380,22 +1487,24 @@ export function padNodeRow(rig: string, pod: string, member: string, session: st
     // Slice 15 — distinct TERMINAL + WORK columns.
     fitCell(terminal, 9),
     fitCell(work, 6),
-    fitCell(activity, 12),
+    // Wide enough for a needs-input count, as in the compact table.
+    fitCell(activity, 17),
     fitCell(ctx, 6),
     fitCell(restore, 10),
     error,
-  ].join("");
+  ].join(NODE_COLUMN_SEPARATOR);
 }
 
-export function padCompactNodeRow(rig: string, session: string, lifecycle: string, activity: string, work: string, reason: string): string {
+export function padCompactNodeRow(rig: string, session: string, lifecycle: string, activity: string, work: string, reason: string, attention = "?"): string {
   return [
     fitCell(rig, 22),
     fitCell(session, 38),
     fitCell(lifecycle, 11),
-    fitCell(activity, 14),
+    fitCell(activity, 17),
     fitCell(work, 6),
+    fitCell(attention, 4),
     reason,
-  ].join("");
+  ].join(NODE_COLUMN_SEPARATOR);
 }
 
 // Slice 15 — render the terminal-active primitive honestly.
@@ -1552,7 +1661,32 @@ async function runHttpPs(
     }
 
     const all = Array.isArray(res.data) ? res.data : [];
-    const filtered = parsedFilter ? applyRigFilter(all, parsedFilter) : all;
+    const rigScoped = opts.rig
+      ? all.filter((e) => (e.rigName ?? e.name) === opts.rig)
+      : all;
+
+    // The same not-found answer as the local rig view, for human output; --json keeps its empty result.
+    if (!opts.json && opts.rig && rigScoped.length === 0) {
+      let archived = false;
+      if (!opts.includeArchived) {
+        const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", { headers });
+        // A failed lookup hasn't shown the rig is missing: report it as the first remote read does.
+        const lookupStep = classifyHttpFailedStep(withArchived.status);
+        if (lookupStep !== "none") {
+          emitCrossHostError(host.id, lookupStep, `HTTP ${withArchived.status}`, opts.json);
+          process.exitCode = 1;
+          return;
+        }
+        archived = Array.isArray(withArchived.data) && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+      }
+      console.error(archived
+        ? `Rig '${opts.rig}' is archived on host ${host.id}. Show it with: rig ps --host ${host.id} --rig ${opts.rig} --include-archived`
+        : `Rig '${opts.rig}' not found on host ${host.id}. List rigs with: rig ps --host ${host.id}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const filtered = parsedFilter ? applyRigFilter(rigScoped, parsedFilter) : rigScoped;
 
     if (opts.summary) {
       const summary = summarizeRigs(filtered);

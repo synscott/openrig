@@ -5,11 +5,12 @@
 // partition rules live here, in one testable pure function, so no provider
 // re-implements them:
 //
-//   local live       → `tmux attach -t <session>` (tmux = the daemon-resolved
-//                      absolute path when the context carries one)
+//   local live       → bounded, identity-pinned tmux reattach command
+//                      (tmux = the daemon-resolved absolute executable)
 //   view-only / cross-rig (read-only)
-//                    → `tmux attach -r -t <session>`
-//   ssh host         → `ssh <dest> tmux attach [-r] -t <session>`
+//                    → the same reattach command with read-only `-r`
+//   ssh host         → `ssh -t <dest> <reattach command>` using remote tmux in inherit mode;
+//                      isolated views use remote `rig terminal attach` to resolve its server
 //   http host        → NO pane; honest-degrade { seat, host, reason }
 //   dead / no session → absent[] (named, never silently dropped)
 //
@@ -18,6 +19,7 @@
 // (ssh vs http vs unknown) is resolved through the operator's read-only hosts
 // registry via the injected `resolveHost`.
 
+import { tileAttachArgv } from "./tile-attach.js";
 import type { HostEntry } from "../hosts/hosts-registry-reader.js";
 import type {
   AbsentSeat,
@@ -69,11 +71,14 @@ export interface ComposeContext {
    */
   localTmux?: string;
   /**
-   * The daemon's tmux server flags (`-L <name>` or `-S <path>`), for LOCAL panes only. The daemon's
-   * sessions live on the server its inherited $TMUX names, which a new terminal doesn't reach by
-   * default. Absent or empty → no flags, unchanged. Never put into an ssh remote command.
+   * The daemon's effective tmux server flags (`-L <name>` or `-S <path>`), for LOCAL panes only.
+   * An inherited or dedicated socket may differ from the attaching terminal's server.
+   * Absent or empty → no flags, unchanged. Remote panes resolve their server on that host.
    */
   localTmuxServer?: readonly string[];
+  /** Effective mode of the viewing instance. Inherit keeps plain remote tmux;
+   *  isolated opts SSH tiles into remote instance-aware attachment. */
+  localTmuxServerMode?: "inherit" | "isolated";
 }
 
 /** POSIX single-quote a string so session names / targets are shell-inert in the composed command. */
@@ -166,12 +171,21 @@ export function composeView(
         });
         continue;
       }
-      const remoteCommand = `tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`;
+      // Inherit keeps remote tmux (no remote rig dependency), including main's
+      // identity-pinned replacement handling. Isolated views resolve the remote
+      // instance; local socket flags never cross SSH and lookup failure cannot fall back.
+      const isolated = ctx.localTmuxServerMode === "isolated";
+      const recoveryCommand = isolated
+        ? `env OPENRIG_HOST_SELECTED=local rig terminal attach${m.readOnly ? " --read-only" : ""} -- ${shellQuote(m.tmuxSession)}`
+        : `tmux attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`;
+      const remoteCommand = isolated ? recoveryCommand
+        : tileAttachArgv("tmux", [], m.tmuxSession, m.readOnly).map(shellQuote).join(" ");
       opened.push({
         seat: m.seat,
         ...(m.runtime ? { runtime: m.runtime } : {}),
         label: m.label,
-        paneCommand: `ssh ${shellQuote(dest)} ${shellQuote(remoteCommand)}`,
+        paneCommand: `ssh -t ${shellQuote(dest)} ${shellQuote(remoteCommand)}`,
+        recoveryCommand: `ssh -t ${shellQuote(dest)} ${shellQuote(recoveryCommand)}`,
         readOnly: m.readOnly,
       });
       continue;
@@ -194,14 +208,18 @@ export function composeView(
       });
       continue;
     }
+    const attachArgv = tileAttachArgv(ctx.localTmux ?? "tmux", ctx.localTmuxServer ?? [], m.tmuxSession, m.readOnly);
     opened.push({
       seat: m.seat,
       ...(m.runtime ? { runtime: m.runtime } : {}),
       label: m.label,
-      paneCommand: `${localTmux} attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
+      paneCommand: attachArgv.map(shellQuote).join(" "),
+      recoveryCommand: `${localTmux} attach ${attachFlag}-t ${shellQuote(m.tmuxSession)}`,
+      attachArgv,
       readOnly: m.readOnly,
     });
   }
 
-  return { id, opened, absent, degraded, pages: chunkPanes(opened, ctx.panesPerPage ?? PANES_PER_PAGE) };
+  return { id, opened, absent, degraded, pages: chunkPanes(opened, ctx.panesPerPage ?? PANES_PER_PAGE),
+    ...(ctx.localTmuxServer?.length ? { localTmuxServer: [...ctx.localTmuxServer] } : {}) };
 }

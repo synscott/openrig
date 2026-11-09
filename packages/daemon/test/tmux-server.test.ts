@@ -43,6 +43,7 @@ describe("the daemon's tmux server", () => {
   it("names a socket anywhere else, or another user's, with -S", () => {
     expect(tmuxServerArgs({ TMUX: "/srv/sockets/team,9,1" }, 501)).toEqual(["-S", "/srv/sockets/team"]);
     expect(tmuxServerArgs({ TMUX: "/srv/sockets/team ,9,1" }, 501)).toEqual(["-S", "/srv/sockets/team "]);
+    expect(tmuxServerArgs({ TMUX: "/srv/sockets/team,shared,9,1" }, 501)).toEqual(["-S", "/srv/sockets/team,shared"]);
     expect(tmuxServerArgs({ TMUX: "/tmp/tmux-501/person,123,0" }, 502)).toEqual(["-S", "/tmp/tmux-501/person"]);
   });
 
@@ -59,14 +60,14 @@ describe("the daemon's tmux server", () => {
     const remote: ViewMemberInput = { seat: "dev-build@starter", label: "builder", tmuxSession: "dev-build@starter", host: "box", readOnly: false, alive: true };
     const resolveHost = () => ({ id: "box", transport: "ssh" as const, target: "box.example" });
     const plain = composeView("v", [local, remote], { resolveHost });
-    expect(plain.opened.map((p) => p.paneCommand)).toEqual([
+    expect(plain.opened.map((p) => p.recoveryCommand)).toEqual([
       "tmux attach -t 'dev-review@starter'",
-      "ssh 'box.example' 'tmux attach -t '\"'\"'dev-build@starter'\"'\"''",
+      "ssh -t 'box.example' 'tmux attach -t '\"'\"'dev-build@starter'\"'\"''",
     ]);
     const onServer = composeView("v", [local, remote], { resolveHost, localTmux: "/usr/bin/tmux", localTmuxServer: ["-L", "person"] });
-    expect(onServer.opened.map((p) => p.paneCommand)).toEqual([
+    expect(onServer.opened.map((p) => p.recoveryCommand)).toEqual([
       "'/usr/bin/tmux' -L 'person' attach -t 'dev-review@starter'",
-      plain.opened[1]!.paneCommand,
+      plain.opened[1]!.recoveryCommand,
     ]);
   });
 });

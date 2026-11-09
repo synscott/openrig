@@ -1,3 +1,7 @@
+import { DeliveryGuardError } from "../domain/seat-delivery-guard.js";
+import type { Context } from "hono";
+import { expectedConversation, resolveExpectedConversation, type ExpectedConversation } from "../domain/expected-conversation.js";
+import { unknownModelObservation, type CurrentModelReader } from "../domain/model-divergence/current-model-reader.js";
 import { inventoryCaptureOptions, type ShadowCapture } from "../domain/shadow-capture.js";
 import { Hono } from "hono";
 import { observeInventoryHandler } from "../domain/request-phase-observer.js";
@@ -26,6 +30,7 @@ import type { SessionTransport } from "../domain/session-transport.js";
 import type { PreviewRateLimiter } from "../domain/preview/preview-rate-limiter.js";
 import type { ClaimService } from "../domain/claim-service.js";
 import type { PodRigInstantiator } from "../domain/rigspec-instantiator.js";
+import type { SnapshotCapture } from "../domain/snapshot-capture.js";
 import { convergeOp } from "../domain/topology-converge.js";
 import type { RestoreOrchestrator } from "../domain/restore-orchestrator.js";
 import { launchStatusIsRunning } from "../domain/restore-orchestrator.js";
@@ -46,7 +51,7 @@ const generationThreadIds = new CodexThreadIdResolver({ codexHome: process.env.C
 function terminalAuthGuard(): MiddlewareHandler {
   return async (c, next) => {
     const token = (c.get("terminalBearerToken" as never) as string | null | undefined) ?? null;
-    const mw = authBearerTokenMiddleware({ expectedToken: token });
+    const mw = authBearerTokenMiddleware({ expectedToken: token, diagnosticContext: "terminal" });
     return mw(c, next);
   };
 }
@@ -73,7 +78,7 @@ function getDeps(c: { get: (key: string) => unknown }) {
 
 function narrowLaunchErrorStatus(code: string | undefined): 404 | 409 | 500 {
   if (code === "rig_not_found" || code === "no_matching_nodes" || code === "snapshot_not_found" || code === "snapshot_wrong_rig" || code === "no_usable_snapshot") return 404;
-  if (code === "snapshot_unusable") return 409;
+  if (code === "snapshot_unusable" || code === "selection_changed") return 409;
   return 500;
 }
 
@@ -103,7 +108,8 @@ sessionsRoutes.get("/", (c) => {
 nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   const rigId = c.req.param("rigId")!;
   const deps = getDeps(c);
-  const rig = deps.rigRepo.getRig(rigId);
+  // Only existence is needed here; the inventory below builds the response.
+  const rig = deps.rigRepo.db.prepare("SELECT 1 FROM rigs WHERE id = ?").get(rigId);
   if (!rig) return c.json({ error: `Rig "${rigId}" not found. List rigs with: rig ps` }, 404);
 
   const refresh = c.req.query("refresh") === "true";
@@ -160,6 +166,7 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   const withTerminalAndWork = attachTerminalActivityAndWork(withActivity, {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   // Slice 13 fix 2 — HOST ATTRIBUTION AT THE SOURCE. A daemon only inventories its own seats, so
   // every row it serves lives on THIS host; stamping the boot-reconciled self-id here means a
@@ -168,7 +175,12 @@ nodesRoutes.get("/", observeInventoryHandler, async (c) => {
   // always present, so "not yet known" is a value, never an absence a consumer can misread.
   // selfHostId ONLY — never host.name (display-only; the DP4 conflation healthz already refuses).
   const hostSelfId = getSelfHostId();
-  return c.json(withTerminalAndWork.map((n) => ({ ...n, hostSelfId })));
+  const modelReader = c.get("currentModelReader" as never) as CurrentModelReader | undefined;
+  const observations = modelReader ? await modelReader.observeInventory(withTerminalAndWork) : null;
+  const nodes = withTerminalAndWork.map((n, i) => ({ ...n, hostSelfId,
+    modelObservation: observations?.[i] ?? unknownModelObservation("observer-unavailable"),
+  }));
+  return c.json(nodes);
 });
 
 // GET /api/rigs/:rigId/nodes/:logicalId — node detail
@@ -189,8 +201,12 @@ nodesRoutes.get("/:logicalId", async (c) => {
   const [detailWithTerminalAndWork] = attachTerminalActivityAndWork(detailWithActivity ? [detailWithActivity] : [detail], {
     db: deps.rigRepo.db,
     seatActivity: deps.seatActivityService,
+    agentActivity: deps.agentActivityStore,
   });
   Object.assign(detail, {
+    needsAttention: detailWithTerminalAndWork?.needsAttention,
+    arbitratedNeedsInput: detailWithTerminalAndWork?.arbitratedNeedsInput,
+    needsInputEvidence: detailWithTerminalAndWork?.needsInputEvidence,
     agentActivity: detailWithTerminalAndWork?.agentActivity,
     terminalActive: detailWithTerminalAndWork?.terminalActive,
     // ARCH RULING 3a947fb1: serve the raw lastActivityAt fact on node-detail too
@@ -272,7 +288,15 @@ nodesRoutes.post("/:logicalId/launch", async (c) => {
     return c.json(result, result.ok ? 201 : result.code === "failed" ? 500 : 409);
   }
 
-  if (node.podId) {
+  if (node.podId || body.snapshotId !== undefined) {
+    if (body.snapshotId === undefined) {
+      const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+      const firstStart = await instantiator?.launchFirstMaterializedNode(rigId, node.id);
+      if (firstStart) {
+        if (firstStart.ok) (c.get("snapshotCapture" as never) as SnapshotCapture | undefined)?.captureSnapshot(rigId, "auto-rehydrate");
+        return c.json(firstStart, firstStart.ok ? 201 : firstStart.code === "target_liveness_unknown" ? 503 : 409);
+      }
+    }
     const { restoreOrchestrator } = getDeps(c);
     if (!restoreOrchestrator) {
       return c.json({ ok: false, code: "internal_error", error: "Restore orchestrator not available" }, 500);
@@ -577,6 +601,35 @@ sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c
   return c.json(outcome, 200);
 });
 
+// Deliberately separate from /reconcile: old daemons must return 404, never adopt.
+sessionAdminRoutes.post("/:sessionName/repair-missing-pane", terminalAuthGuard(), async (c) => {
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return c.json({ error: "Supply a JSON object with optional rigId and logicalId." }, 400);
+  }
+  const input = body as Record<string, unknown>;
+  for (const key of ["rigId", "logicalId"]) {
+    if (input[key] !== undefined && (typeof input[key] !== "string" || !(input[key] as string).trim())) {
+      return c.json({ error: `${key} must be a non-empty string.` }, 400);
+    }
+  }
+  const rigId = input.rigId as string | undefined, logicalId = input.logicalId as string | undefined;
+  if (!!rigId !== !!logicalId) return c.json({ error: "rigId and logicalId must be provided together (or both omitted)." }, 400);
+  const claimService = c.get("claimService" as never) as ClaimService | undefined;
+  const instantiator = c.get("podInstantiator" as never) as PodRigInstantiator | undefined;
+  if (!claimService || !instantiator) return c.json({ error: "Missing-pane repair is unavailable on this daemon." }, 503);
+  const result = await convergeOp({ instantiator, claimService }, rigId ?? "", {
+    kind: "reconcile_session", sessionName: c.req.param("sessionName")!, rigId, logicalId, repairMissingPane: true,
+  }, ".");
+  if (result.kind !== "reconcile_session" || !result.supported) return c.json({ error: "Unexpected repair result." }, 500);
+  const outcome = result.outcome;
+  if (outcome.ok) return c.json(outcome, 200);
+  if (outcome.code === "tmux_unavailable") return c.json(outcome, 503);
+  if (outcome.code === "repair_timed_out") return c.json(outcome, 504);
+  if (outcome.code === "reconcile_error") return c.json(outcome, 500);
+  return c.json(outcome, 409);
+});
+
 // POST /api/sessions/:sessionName/clear-attention — OPR.0.3.4.10.
 sessionAdminRoutes.post("/:sessionName/clear-attention", terminalAuthGuard(), async (c) => {
   const sessionName = c.req.param("sessionName")!;
@@ -681,11 +734,17 @@ sessionAdminRoutes.post("/:sessionRef/unclaim", terminalAuthGuard(), async (c) =
 // impossible, never receive an empty success.
 // Round-2 (r2 HIGH-2): raw conversation bytes with no transcript redaction — a TERMINAL-CLASS
 // surface behind the same bearer gate as its neighbors (401/401/200; null-token loopback passes).
-sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), async (c) => {
+const generationRecord = async (c: Context) => {
   const sessionName = c.req.param("sessionName")!;
+  let expected: ExpectedConversation | undefined;
+  if (c.req.path.endsWith("/generation-record-expected")) {
+    try { expected = expectedConversation({ nodeId: c.req.query("expectedNodeId"), sessionName,
+      runtime: c.req.query("expectedRuntime"), nativeId: c.req.query("expectedNativeId") }); }
+    catch (error) { return c.json({ error: "invalid_expected_identity", message: (error as Error).message }, 400); }
+  }
   const store = c.get("contextUsageStore" as never) as ContextUsageStore | undefined;
   if (!store) {
-    return c.json({ error: "unsupported_runtime", message: "No context-usage store on this daemon; the seat's generation record cannot be resolved." }, 409);
+    return c.json({ error: expected ? "expected_identity_unavailable" : "unsupported_runtime", message: "No context-usage store on this daemon; the seat's generation record cannot be resolved." }, 409);
   }
   const { sessionRegistry: registry, tmuxAdapter } = getDeps(c);
   const context = registry?.findResumeContextByName(sessionName);
@@ -693,7 +752,12 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
   const runtime = context?.runtime ?? "claude-code";
   let transcriptPath: string | null;
   let sessionId: string | null;
-  if (runtime === "codex") {
+  let original: Awaited<ReturnType<typeof resolveExpectedConversation>> | undefined;
+  if (expected) {
+    try { original = await resolveExpectedConversation(expected, registry, tmuxAdapter, store);
+      sessionId = original.identity.nativeId; transcriptPath = original.path;
+    } catch (error) { return c.json({ error: error instanceof DeliveryGuardError ? error.code : "expected_identity_unavailable", message: (error as Error).message }, 409); }
+  } else if (runtime === "codex") {
     const binding = registry.getBindingForNode(context!.nodeId);
     const identity = new SeatIdentityStore(registry.db).getForNode(context!.nodeId);
     if (!occupant || !binding?.tmuxPane || binding.tmuxSession !== sessionName
@@ -704,18 +768,29 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
     }
     try {
       const pid = await tmuxAdapter?.getPanePid?.(binding.tmuxPane);
-      if (!pid || pid !== identity.evidence.observedPid) {
+      // A shell or launcher can be the pane root; legacy verdicts only recorded one PID.
+      const verifiedPanePid = identity.evidence.observedPanePid ?? identity.evidence.observedPid;
+      if (!pid || pid !== verifiedPanePid) {
         return c.json({ error: "record_identity_unverified", message: `The bound pane for '${sessionName}' no longer matches its verified occupant.` }, 409);
       }
+      let verifiedNativeThreadId: string | undefined;
       const live = await resolveLiveCodexThreadId(binding.tmuxPane, {
         getPanePid: async () => pid,
         listProcesses: () => generationCensus.list(),
-        readThreadIdByPid: (nativePid, startedAt) => startedAt
-          ? generationThreadIds.resolve(nativePid, startedAt) : undefined,
+        readThreadIdByPid: async (nativePid, startedAt) => {
+          const threadId = startedAt ? await generationThreadIds.resolve(nativePid, startedAt) : undefined;
+          if (nativePid === identity.evidence.observedPid) verifiedNativeThreadId = threadId;
+          return threadId;
+        },
       });
       if (!live.ok) return c.json({ error: "record_identity_unverified", message: live.reason }, 409);
       sessionId = live.id;
       transcriptPath = store.readCodexTranscriptPath(sessionId);
+      // Dual-PID verdicts must name the process whose thread was selected; legacy verdicts only identify the root. A different
+      // conversation under a surviving wrapper isn't a binding change, so it says what it is.
+      if (identity.evidence.observedPanePid != null && verifiedNativeThreadId !== sessionId) {
+        return c.json({ error: "record_identity_unverified", message: `The Codex conversation in the pane for '${sessionName}' isn't the one its verified process owned, so no generation record is served.` }, 409);
+      }
       if (registry.currentOccupantTenure(context!.nodeId)?.generationUuid !== occupant.generationUuid
         || registry.getBindingForNode(context!.nodeId)?.tmuxPane !== binding.tmuxPane
         || await tmuxAdapter.getPanePid?.(binding.tmuxPane) !== pid) {
@@ -741,39 +816,54 @@ sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), a
   // Cap the served suffix — the caller polls; a runaway record must not become a runaway response.
   const MAX_SUFFIX_BYTES = 8 * 1024 * 1024;
   try {
-    const fd = fs.openSync(transcriptPath, "r");
+    if (expected) { original = await resolveExpectedConversation(expected, registry, tmuxAdapter, store); transcriptPath = original.path; }
+    const fd = fs.openSync(original?.path ?? transcriptPath, "r");
     try {
       const stat = fs.fstatSync(fd);
       if (!stat.isFile()) throw new Error("record is not a regular file");
       const totalBytes = stat.size;
       // Identity and bytes come from the same open file. Appends preserve this identity;
       // replacing a rollout at the same path changes it, even if its native id is unchanged.
-      const generationId = JSON.stringify([occupant?.generationUuid ?? null, sessionId, transcriptPath, stat.dev, stat.ino, stat.birthtimeMs]);
-      if (runtime === "codex") {
-        let header = "";
-        for (let offset = 0; offset < Math.min(totalBytes, MAX_SUFFIX_BYTES) && !header.includes("\n");) {
+      const generationId = JSON.stringify([original?.generation ?? occupant?.generationUuid ?? null, sessionId, transcriptPath, stat.dev, stat.ino, stat.birthtimeMs]);
+      if (runtime === "codex" || expected) {
+        // Native records are append-only. Identify the opened file at its first identity-bearing line,
+        // rather than parsing megabytes of old conversation again on every suffix poll.
+        let pending = "", nativeId: string | undefined;
+        for (let offset = 0; offset < Math.min(totalBytes, MAX_SUFFIX_BYTES) && nativeId === undefined;) {
           const chunk = Buffer.alloc(Math.min(64 * 1024, totalBytes - offset, MAX_SUFFIX_BYTES - offset));
           const n = fs.readSync(fd, chunk, 0, chunk.length, offset);
           if (!n) break;
-          header += chunk.subarray(0, n).toString("utf8");
-          offset += n;
+          pending += chunk.subarray(0, n).toString("utf8"); offset += n;
+          for (let newline = pending.indexOf("\n"); newline >= 0; newline = pending.indexOf("\n")) {
+            const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+            let row;
+            try { row = JSON.parse(line); } catch { /* explicit no-answer below */ }
+            if (runtime === "codex") {
+              nativeId = row?.type === "session_meta" && typeof row.payload?.id === "string" ? row.payload.id : "";
+              break;
+            }
+            if (typeof row?.sessionId === "string") { nativeId = row.sessionId; break; }
+          }
         }
-        let meta;
-        try { meta = JSON.parse(header.slice(0, header.indexOf("\n"))); } catch { /* explicit no-answer below */ }
-        if (meta?.type !== "session_meta" || meta.payload?.id !== sessionId) {
-          return c.json({ error: "record_identity_mismatch", message: `The rollout header does not identify current thread '${sessionId}'.` }, 409);
+        if (nativeId !== sessionId) {
+          return c.json({ error: expected ? "expected_identity_mismatch" : "record_identity_mismatch",
+            message: "The opened record does not identify the selected native conversation." }, 409);
         }
       }
-      if (sinceRaw === undefined) return c.json({ generationId, sessionId, runtime, totalBytes });
+      original?.assertCurrent();
+      const receipt = expected ? { checkedIdentity: expected, identityContract: 1 as const } : {};
+      if (sinceRaw === undefined) return c.json({ generationId, sessionId, runtime, totalBytes, ...receipt });
       if (since > totalBytes) return c.json({ error: "record_truncated", message: "Generation record shrank below the requested byte boundary." }, 409);
       const length = Math.min(totalBytes - since, MAX_SUFFIX_BYTES);
       const buf = Buffer.alloc(length);
       const read = fs.readSync(fd, buf, 0, length, since);
-      return c.json({ generationId, sessionId, runtime, totalBytes, suffix: buf.subarray(0, read).toString("utf8"), truncated: totalBytes - since > read });
+      return c.json({ generationId, sessionId, runtime, totalBytes, ...receipt, suffix: buf.subarray(0, read).toString("utf8"), truncated: totalBytes - since > read });
     } finally {
       fs.closeSync(fd);
     }
   } catch (err) {
-    return c.json({ error: "record_unreadable", message: `Generation record for '${sessionName}' is unreadable: ${(err as Error).message}` }, 409);
+    return c.json({ error: expected ? err instanceof DeliveryGuardError ? err.code : "expected_identity_unavailable" : "record_unreadable", message: `Generation record for '${sessionName}' is unreadable: ${(err as Error).message}` }, 409);
   }
-});
+};
+sessionAdminRoutes.get("/:sessionName/generation-record", terminalAuthGuard(), generationRecord);
+sessionAdminRoutes.get("/:sessionName/generation-record-expected", terminalAuthGuard(), generationRecord);

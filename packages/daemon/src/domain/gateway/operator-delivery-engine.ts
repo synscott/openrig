@@ -6,11 +6,17 @@
 // dispatcher and the REAL tick.
 
 import type { QueueItem, QueueRepository } from "../queue-repository.js";
+import { RELAY_OWNER_NOTIFICATION_ACCEPTED_PREFIX } from "../queue-transition-log.js";
 import { DispatchBuffer } from "./dispatch-buffer.js";
+import { lastMeaningfulTransition } from "../queue-waiting.js";
 import type { DispatchResult } from "./dispatcher.js";
-import type { LoadResult } from "./human-registry.js";
+import type { HumanFragment, LoadResult } from "./human-registry.js";
 import { loadHumanRegistry } from "./human-registry.js";
+import { resolveDefaultPerson } from "./participants.js";
 import { loadConfig } from "./slack/config.js";
+import { resolveSecret } from "./slack/secrets.js";
+import { resolveHumanDeliveryReadiness } from "./human-readiness.js";
+import { quietHoldFor } from "./human-quiet-windows.js";
 import { OUTBOUND_OP } from "./slack/outbound-driver.js";
 import {
   decideDelivery,
@@ -19,6 +25,8 @@ import {
 } from "./delivery-rules-engine.js";
 
 export interface OperatorDeliveryEngine {
+  /** Read durable pre-marker custody without dispatching or rechecking readiness. */
+  hasAcceptedEscalation?: (row: QueueItem) => boolean;
   dispatchEscalation: (
     row: QueueItem,
     reason: string,
@@ -59,17 +67,54 @@ export function makeOperatorDeliveryEngine(deps: {
   queueRepo: QueueRepository;
   dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => DispatchResult;
   registry?: { loadHumanRegistry: () => LoadResult };
+  gatewayState?: () => string;
+  readiness?: (human: HumanFragment) => Promise<{ ready: boolean; reason: string }>;
 }): OperatorDeliveryEngine {
+  const notificationKeyFor = (row: QueueItem): string => {
+    const owner = deps.queueRepo.transitionLog.latestOwnerNotificationForQitem(row.qitemId);
+    if (owner) return `${row.qitemId}:${owner.transitionId}`;
+    const legacy = `${row.qitemId}:operator-rung`;
+    // Aggregates have one episode; keep any current legacy custody across an upgrade too.
+    if (row.tags?.includes("wake-prompt-refusal") || resolvedFor(row, legacy)
+      || new DispatchBuffer(deps.home).pending().some(d => d.decisionId === `operator:${legacy}`)) return legacy;
+    const episode = lastMeaningfulTransition(deps.queueRepo.db, row.qitemId)?.id ?? 0;
+    return `${legacy}:${episode}`;
+  };
+  const resolvedFor = (row: QueueItem, key: string): string | null => {
+    const transitions = deps.queueRepo.listTransitions(row.qitemId);
+    // Prompt aggregates keep one episode across claims. Ordinary fixed-key rows can progress into another.
+    const after = transitions.length && key === `${row.qitemId}:operator-rung` && !row.tags?.includes("wake-prompt-refusal")
+      ? lastMeaningfulTransition(deps.queueRepo.db, row.qitemId)?.id ?? 0 : 0;
+    let resolved: string | null = null;
+    for (const t of transitions) {
+      if (t.transitionId <= after) continue;
+      const note = t.transitionNote ?? "";
+      // Match the ladder: a receipt before the latest dispatch cannot resolve that dispatch.
+      if (note.startsWith("escalation-rung: operator dispatched-to-engine")) resolved = null;
+      if (note.split(/\s+/).includes(`notification_key=${key}`)) {
+        if (note.startsWith("slack-owner-notification-posted ")) resolved = "posted";
+        if (note.startsWith(`${RELAY_OWNER_NOTIFICATION_ACCEPTED_PREFIX} `)) resolved = "accepted";
+        if (note.startsWith("delivery-termination:")) resolved = "terminated";
+      }
+    }
+    return resolved;
+  };
   return {
+    hasAcceptedEscalation: row => {
+      const key = notificationKeyFor(row);
+      return resolvedFor(row, key) !== null || new DispatchBuffer(deps.home).pending()
+        .some(d => d.decisionId === `operator:${key}`);
+    },
     async dispatchEscalation(row: QueueItem, _reason: string) {
       // The episode identity the receipt must carry (Slice 14's ledger accepts
-      // only the current qitemId:transitionId key; a baton row with no owner
-      // transition gets the stable synthetic operator-rung episode).
-      const owner = deps.queueRepo.transitionLog.latestOwnerNotificationForQitem(row.qitemId);
-      const notificationKey = owner ? `${row.qitemId}:${owner.transitionId}` : `${row.qitemId}:operator-rung`;
+      // the current qitemId:transitionId key; an ordinary row without an owner
+      // transition uses its meaningful-progress episode in the synthetic key).
+      const notificationKey = notificationKeyFor(row);
 
       const decisionId = `operator:${notificationKey}`;
       const accepted = () => new DispatchBuffer(deps.home).pending().some(d => d.decisionId === decisionId);
+      const resolved = resolvedFor(row, notificationKey);
+      if (resolved) return { decision: resolved, resolved: true, dispatched: true, notificationKey, decisionId };
       // An accepted decision belongs to the gateway even if registry access or
       // routing changes before the ladder records its dispatch marker.
       if (accepted()) return { decision: "accepted-pending", resolved: false, dispatched: true, notificationKey, decisionId };
@@ -80,11 +125,27 @@ export function makeOperatorDeliveryEngine(deps: {
         return { decision: "unavailable:human-registry", resolved: false, dispatched: false };
       }
       if (!reg.ok) return { decision: "unavailable:human-registry", resolved: false, dispatched: false };
-      const human = reg.entities[0];
+      // The escalation goes to the default person, never simply the first file: with several people and none chosen,
+      // it's undeliverable and says so.
+      const human = resolveDefaultPerson(reg.entities, deps.home).person;
       if (!human) {
-        return { decision: "undeliverable:no-registered-human", resolved: false, dispatched: false };
+        return { decision: reg.entities.length ? "undeliverable:no-default-person" : "undeliverable:no-registered-human", resolved: false, dispatched: false };
       }
       const cfg = loadConfig(deps.home);
+      // A local carrier remains visible; no new gateway decision belongs to a channel that cannot post.
+      // Already-accepted decisions returned above retain gateway custody, even if readiness later changes.
+      try {
+        const readiness = await (deps.readiness?.(human) ?? resolveHumanDeliveryReadiness({
+          human,
+          config: cfg,
+          gatewayState: deps.gatewayState?.() ?? "unavailable",
+          botToken: resolveSecret("SLACK_BOT_TOKEN", { envFile: cfg.secretsEnvFile ?? undefined }),
+          home: deps.home,
+        }, { entities: reg.entities }));
+        if (!readiness.ready) return { decision: `unavailable:human-delivery:${readiness.reason}`, resolved: false, dispatched: false };
+      } catch {
+        return { decision: "unavailable:human-delivery:readiness-unavailable", resolved: false, dispatched: false };
+      }
       const decision = decideDelivery({
         level: "ALERT",
         escalation: true,
@@ -97,12 +158,17 @@ export function makeOperatorDeliveryEngine(deps: {
           minimumLevelThatPosts: cfg.minimumLevelThatPosts,
           minimumLevelThatInterrupts: cfg.minimumLevelThatInterrupts,
         },
+        // An escalation is never held, so quiet can't change this rung's decision: a failed quiet read is ignored here
+        // rather than blocking the escalation.
+        quiet: (() => { try { return quietHoldFor(deps.queueRepo.db, human.entityId, new Date()); } catch { return null; } })(),
       });
 
       const payload = {
         qitemId: row.qitemId,
         notificationKey,
-        summary: row.summary ?? `wake-ladder escalation: ${row.qitemId}`,
+        // The person sees which seat the work is waiting on. The sender stays the row's own, so a reply in the thread
+        // still goes where the row's posts go.
+        summary: `Waiting on ${row.destinationSession}: ${row.summary ?? `wake-ladder escalation: ${row.qitemId}`}`,
         body: row.body ?? null,
         destinationSession: human.address,
         sourceSession: row.sourceSession ?? null,

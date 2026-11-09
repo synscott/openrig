@@ -1,3 +1,4 @@
+import { makeKernelHookReviewReader } from "./domain/kernel-hook-review.js";
 import { serve, type ServerType } from "@hono/node-server";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,6 +7,7 @@ import { closeHttpServer, createDaemonShutdown, DAEMON_SHUTDOWN_RECEIPT, trackHt
 import { readOpenRigEnv, OPENRIG_HOME } from "./openrig-compat.js";
 import { makeOperatorDeliveryEngine } from "./domain/gateway/operator-delivery-engine.js";
 import { resolveDaemonDbPath } from "./daemon-db-path.js";
+import { createGuestActivityApp } from "./server.js";
 import { createDaemon } from "./startup.js";
 import { removeParentSessionEnv } from "./domain/parent-session-env.js";
 import { resolveBindPlan } from "./domain/bind-plan.js";
@@ -32,6 +34,7 @@ import {
 import type { SlowOperationInstrumentation } from "./domain/slow-op-recorder.js";
 import type { ProviderService } from "./domain/provider/provider-service.js";
 import { SettingsStore } from "./domain/user-settings/settings-store.js";
+import { startSeatPollers } from "./domain/seat-activity-service.js";
 import {
   ensureOpenRigInstance,
   formatInstanceInitializationConflicts,
@@ -114,7 +117,8 @@ export function startPeriodicSnapshotScheduler(deps: {
 
 /** OPR.0.4.6.FS-1 W2 — start the queue-retention maintenance sweep (arch D3): a
  *  boot sweep + a daily tick that archives aged terminal `queue_transitions`
- *  (never-delete) and prunes `watchdog_history`, both in bounded batches with
+ *  (never-delete) and prunes `watchdog_history`, `usage_samples`, stream items and
+ *  the history-only event types of `events`, all in bounded batches with
  *  event-loop yields. Reads the `retention.*` settings (baked defaults via
  *  RETENTION_DEFAULTS). Fire-and-forget with error logging — a sweep failure must
  *  never crash the daemon. Returns the daily interval handle (cleared on
@@ -138,7 +142,10 @@ export function startQueueRetentionScheduler(deps: {
       watchdogRetentionDays: num("retention.watchdog_days", RETENTION_DEFAULTS.watchdogRetentionDays),
       watchdogKeepPerJob: num("retention.watchdog_keep_per_job", RETENTION_DEFAULTS.watchdogKeepPerJob),
       usageSamplesRetentionDays: num("retention.usage_samples_days", RETENTION_DEFAULTS.usageSamplesRetentionDays),
+      streamRetentionDays: num("retention.stream_days", RETENTION_DEFAULTS.streamRetentionDays),
+      streamMaxItems: num("retention.stream_max_items", RETENTION_DEFAULTS.streamMaxItems),
       batchSize: num("retention.batch_size", RETENTION_DEFAULTS.batchSize),
+      eventsRetentionDays: num("retention.events_days", RETENTION_DEFAULTS.eventsRetentionDays),
     }).catch((err: unknown) => {
       console.error(`[queue-retention] sweep error: ${err instanceof Error ? err.message : String(err)}`);
     });
@@ -166,12 +173,26 @@ export function startStuckSweepScheduler(deps: {
   const status = createStuckSweepStatus();
   deps.stuckSweepStatus = status; // healthz reads this snapshot
   const db = deps.rigRepo.db;
+  // A pass yields the event loop, so a tick could start a second pass over the first one (a pass longer than the
+  // interval): one pass at a time, and a tick that finds one still running is skipped.
+  let runningSince: string | null = null;
+  let skipped = 0;
   const runOnce = (): void => {
+    if (runningSince) {
+      // Never silent: a pass that hangs (an awaited send that never settles) shows up here on every tick.
+      skipped++;
+      status.pass({ runningSince, skippedTicks: skipped });
+      console.error(`[stuck-sweep] tick skipped: the pass started at ${runningSince} is still running (${skipped} tick(s) skipped)`);
+      return;
+    }
+    runningSince = new Date().toISOString();
+    skipped = 0;
+    status.pass({ runningSince, skippedTicks: 0 });
     // runStuckSweep never throws (failure is recorded loudly on the status surface);
     // the catch is the never-crash-the-daemon belt for the promise chain itself.
     void runStuckSweep({ db, queueRepo, status }).catch((err: unknown) => {
       console.error(`[stuck-sweep] scheduler error: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    }).finally(() => { runningSince = null; status.pass({ runningSince: null, skippedTicks: skipped }); });
   };
   runOnce(); // boot sweep (fire-and-forget)
   return setInterval(runOnce, resolveStuckSweepIntervalSeconds() * 1000);
@@ -191,7 +212,8 @@ export function startWakeLadderScheduler(deps: {
   usageLimitJitterSeconds?: number;
   seatActivityService?: Pick<import("./domain/seat-activity-service.js").SeatActivityService, "getSeatState">;
   agentActivityStore?: Pick<import("./domain/agent-activity-store.js").AgentActivityStore, "getLatestForNode">;
-  gatewaySubsystem?: { dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => import("./domain/gateway/dispatcher.js").DispatchResult };
+  tmuxAdapter?: Pick<import("./adapters/tmux.js").TmuxAdapter, "listPanes" | "readAllPaneProcesses" | "capturePaneScreen" | "getPanePid">;
+  gatewaySubsystem?: { status?: () => { state?: unknown }; dispatch: (op: string, entityBindingRef: string, payload: unknown, opts?: { decisionId?: string }) => import("./domain/gateway/dispatcher.js").DispatchResult };
 }): WakeLadderScheduler | null {
   const queueRepo = deps.queueRepo;
   if (!queueRepo) return null;
@@ -206,6 +228,7 @@ export function startWakeLadderScheduler(deps: {
     ? makeOperatorDeliveryEngine({
         home: OPENRIG_HOME,
         queueRepo,
+        gatewayState: () => String(deps.gatewaySubsystem?.status?.().state ?? "unavailable"),
         dispatch: (op, ref, payload, opts) => deps.gatewaySubsystem!.dispatch(op, ref, payload, opts),
       })
     : undefined;
@@ -215,10 +238,14 @@ export function startWakeLadderScheduler(deps: {
       queueRepo,
       status,
       ...(deliveryEngine ? { deliveryEngine } : {}),
+      ...(deps.tmuxAdapter ? { readHookReviews: makeKernelHookReviewReader({ db, tmux: deps.tmuxAdapter }) } : {}),
       readPromptState: makePromptStateReader({
         db,
         getSeatState: (nodeId) => deps.seatActivityService?.getSeatState(nodeId),
-        getLatestHook: (sessionName) => deps.agentActivityStore?.getLatestForNode({ sessionName }),
+        getLatestHook: (sessionName, runtime) => deps.agentActivityStore?.getLatestForNode({
+          sessionName,
+          order: runtime === "claude-code" ? "source" : "arrival",
+        }),
       }),
       ...(deps.providerService
         ? { getProviderReadModel: () => deps.providerService!.getReadModel() }
@@ -251,6 +278,9 @@ export interface StartServerOptions {
 
 export async function startServer(port?: number, options: StartServerOptions = {}) {
   const p = port ?? parseInt(readOpenRigEnv("OPENRIG_PORT", "RIGGED_PORT") ?? "7433", 10);
+  const guestPort = process.env.OPENRIG_GUEST_ACTIVITY_PORT ? Number(process.env.OPENRIG_GUEST_ACTIVITY_PORT) : undefined;
+  if (guestPort !== undefined && (!Number.isInteger(guestPort) || guestPort < 1 || guestPort > 65535 || guestPort === p))
+    throw new Error("OPENRIG_GUEST_ACTIVITY_PORT must be a distinct valid listener port");
   // D15 — anchor the default db under OPENRIG_HOME, never a bare CWD-relative
   // filename (which could open the shared fleet db). Explicit OPENRIG_DB wins.
   const dbPath = resolveDaemonDbPath(readOpenRigEnv("OPENRIG_DB", "RIGGED_DB"), OPENRIG_HOME);
@@ -276,8 +306,8 @@ export async function startServer(port?: number, options: StartServerOptions = {
   // The overloaded routing env (OPENRIG_HOST/RIGGED_HOST) is observed for the
   // provenance line below and NEVER selects the bind branch: a managed environment's
   // injected endpoint is byte-indistinguishable from opt-in, and the parent daemon
-  // silently lost its Tailscale listener to exactly that (operator baton
-  // qitem-20260827070400). The auth-bearer-tailscale-trust ruling rides the new
+  // silently lost its Tailscale listener to exactly that (operator baton).
+  // The auth-bearer-tailscale-trust ruling rides the new
   // surface unchanged.
   const bindPlan = resolveBindPlan({
     bindHostEnv: process.env.OPENRIG_BIND_HOST,
@@ -313,8 +343,9 @@ export async function startServer(port?: number, options: StartServerOptions = {
 
   // The fresh-DB Codex probe runs inside createDaemon, before the shutdown handlers below exist.
   const disarmStartupSignals = endProbeGroupsOnStartupSignal();
-  const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket } = await createDaemon({
+  const { app, contextMonitor, deps, eventLoopMonitor, injectWebSocket, wakeRecovery } = await createDaemon({
     dbPath,
+    guestActivityPort: guestPort,
     bearerToken,
     terminalBearerToken,
     // S20 — the effective bind plan rides the health surface so adoption gates verify
@@ -361,6 +392,9 @@ export async function startServer(port?: number, options: StartServerOptions = {
         await close?.();
       }],
       ["context-monitor", () => contextMonitor.stop()],
+      // First, while transport still works: let the delivery in flight finish; the rest wait for the next start.
+      ["wake-recovery", () => wakeRecovery.stop()],
+      ["terminal-following", () => deps.terminalService?.stop()],
       ["timers", () => {
         deps.resumeMetadataRefresher?.stop();
         if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -371,6 +405,7 @@ export async function startServer(port?: number, options: StartServerOptions = {
       ["proof-source-watch", () => deps.proofSourceWatch?.close()],
       ["health-diagnosis", () => deps.healthDiagnosis?.stop()],
       ["watchdog", () => deps.watchdogScheduler?.stop()],
+      ["stream-intake", () => deps.streamIntakeCoordinator?.stop()],
       ["draft-delivery", () => deps.sessionTransport?.guardedDelivery?.stop()],
       ["seat-activity", () => deps.seatActivityService?.stop()],
       ["seat-structural-activity", () => deps.seatStructuralActivityService?.stop()],
@@ -423,6 +458,12 @@ export async function startServer(port?: number, options: StartServerOptions = {
       requestShutdown("startup cancellation");
       throw new Error("daemon startup cancelled");
     }
+    if (guestPort !== undefined) {
+      const guest = createGuestActivityApp(deps);
+      const guestServer = serve({ fetch: (request, env) => startupReady ? guest.fetch(request, env) : new Response("OpenRig daemon startup incomplete", { status: 503 }), port: guestPort, hostname: process.env.OPENRIG_GUEST_ACTIVITY_HOST ?? "127.0.0.1" });
+      trackHttpServerResponses(guestServer);
+      servers.push(guestServer);
+    }
     for (const host of bindHosts) {
       const srv = serve({ fetch: (request, env) => startupReady
         ? app.fetch(request, env)
@@ -432,6 +473,7 @@ export async function startServer(port?: number, options: StartServerOptions = {
         if (!monitorsStarted) {
           monitorsStarted = true;
           contextMonitor.start();
+          wakeRecovery.start();
           // PL-004 Phase C: start watchdog scheduler. Joins the supervision
           // tree post-bind so the HTTP surface is ready before the first
           // tick (matches contextMonitor pattern).
@@ -445,9 +487,9 @@ export async function startServer(port?: number, options: StartServerOptions = {
           // Polls every running tmux-bound seat's window_activity timestamp so
           // PsProjectionService + node-inventory enrichment serve
           // fresh data on each request.
-          deps.seatActivityService?.start(deps.rigRepo.db);
+          startSeatPollers({ activity: deps.seatActivityService, structural: deps.seatStructuralActivityService }, deps.rigRepo.db);
           // 5b82324b — the structural pane-activity cache, on the same 1Hz cadence.
-          deps.seatStructuralActivityService?.start(deps.rigRepo.db);
+          deps.streamIntakeCoordinator?.start();
           // OPR.0.4.3.19 — start the liveness identity reconciler (5s default).
           // Persists the per-seat pane PID/command verdict so node-inventory
           // gates the running/active projection on verified process identity.
@@ -496,7 +538,7 @@ export async function startServer(port?: number, options: StartServerOptions = {
     startupComplete = true;
     startupReady = true;
     // Preserve the existing single-server return; signals drain all owned binds.
-    return servers[0]!;
+    return servers[guestPort !== undefined ? 1 : 0]!;
   } catch (error) {
     startupFailed = true;
     requestShutdown("startup failure");

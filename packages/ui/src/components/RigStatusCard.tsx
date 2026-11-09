@@ -15,37 +15,44 @@ import { Button } from "./ui/button.js";
 import { cn } from "../lib/utils.js";
 import type { RigAggStatus } from "../hooks/useRigStatus.js";
 
+// The kernel card also names a skipped boot: its agent count cannot establish
+// the readiness verdict that the boot tracker did not observe.
+export type RigStatusCardStatus = RigAggStatus | "untracked";
+
 // Shared status vocabulary — also consumed by the compact topology
 // RigStatusControl (OPR.0.4.7.1) so both surfaces render one verdict language.
-export const statusToPip: Record<RigAggStatus, StatusPipStatus> = {
+export const statusToPip: Record<RigStatusCardStatus, StatusPipStatus> = {
   up: "running",
   partial: "warning",
   down: "stopped",
   blocked: "error",
   unknown: "info",
+  untracked: "info",
 };
 
-export const statusBadgeTone: Record<RigAggStatus, string> = {
+export const statusBadgeTone: Record<RigStatusCardStatus, string> = {
   up: "border-success text-success",
   partial: "border-warning text-warning",
   down: "border-stone-400 text-stone-500",
   blocked: "border-tertiary text-tertiary",
   unknown: "border-stone-300 text-stone-400",
+  untracked: "border-stone-300 text-stone-500",
 };
 
-export const statusHelp: Record<RigAggStatus, string> = {
+export const statusHelp: Record<RigStatusCardStatus, string> = {
   up: "All managed seats are running.",
   partial: "Some seats running, some stopped / detached / attention-required.",
   down: "No seats running — recoverable from snapshot.",
   blocked: "Restore cannot proceed without operator action (missing token / auth / spec).",
   unknown: "Daemon/API cannot confidently compute the state.",
+  untracked: "Kernel boot was skipped; readiness is not tracked.",
 };
 
 export interface RigStatusCardProps {
   rigId: string;
   rigName: string;
   isKernel?: boolean;
-  status: RigAggStatus;
+  status: RigStatusCardStatus;
   seatsRunning: number;
   seatsTotal: number;
   recoverable: boolean;
@@ -81,7 +88,7 @@ export function RigStatusCard({
     <div
       data-testid={testId ?? `rig-status-card-${rigId}`}
       data-status={status}
-      className="bg-white border border-stone-900 hard-shadow relative"
+      className="bg-surface-lowest border border-stone-900 dark:border-outline hard-shadow relative"
     >
       {/* Dark header stripe — vellum grammar (matches RigCard). */}
       <div className="bg-stone-900 text-white px-4 py-1.5 font-mono text-[10px] flex justify-between items-center">
@@ -91,7 +98,7 @@ export function RigStatusCard({
 
       <div className="p-4 space-y-3">
         {/* Name + aggregate status badge (the badge tone CONSUMES the verdict). */}
-        <div className="flex justify-between items-end border-b border-stone-100 pb-2">
+        <div className="flex justify-between items-end border-b border-stone-100 dark:border-outline-variant pb-2">
           <span className="font-headline font-bold text-lg tracking-tight uppercase">{rigName}</span>
           <span
             data-testid={`rig-status-badge-${rigId}`}
@@ -101,7 +108,7 @@ export function RigStatusCard({
             )}
           >
             <StatusPip status={pip} />
-            {status}
+            {status === "untracked" ? "boot not tracked" : status}
           </span>
         </div>
 
@@ -139,7 +146,7 @@ export function RigStatusCard({
         {/* Provenance — the composed source signals (composed, not inferred). */}
         <p
           data-testid={`rig-status-src-${rigId}`}
-          className="font-mono text-[8px] leading-snug text-stone-400 border-t border-stone-100 pt-2"
+          className="font-mono text-[8px] leading-snug text-stone-400 border-t border-stone-100 dark:border-outline-variant pt-2"
         >
           src: {src.join(" · ")}
         </p>

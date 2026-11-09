@@ -4,6 +4,7 @@ import type Database from "better-sqlite3";
 import { Hono } from "hono";
 import { OPENRIG_HOME } from "../openrig-compat.js";
 import { RestoreCheckService, type RestoreCheckDeps, type NodeInventoryEntry, type StartupContextProbeResult } from "../domain/restore-check-service.js";
+import { createDesiredClaudeActivityHooksReader } from "../domain/desired-claude-activity-hooks.js";
 import { deriveRelayEvents } from "../domain/claude-activity-hooks.js";
 import { getNodeInventory } from "../domain/node-inventory.js";
 import { resolveLegacyTopologyRigsRoot } from "../domain/user-settings/settings-store.js";
@@ -168,6 +169,9 @@ export function createRestoreCheckService(
         };
       }
     },
+    getDesiredClaudeActivityHooks: createDesiredClaudeActivityHooksReader(rigRepo.db, {
+      exists: existsSync, readFile: (path) => readFileSync(path, "utf8"),
+    }),
     getClaudeActivityHookEvents: () => deriveRelayEvents(
       { exists: existsSync, readFile: (path) => readFileSync(path, "utf-8") },
       resolve(import.meta.dirname, "../../assets/plugins/openrig-core/hooks/claude.json"),

@@ -30,6 +30,8 @@ export interface RenderInstance {
   hopCount?: number;
   /** OPR.0.4.6.FAC1: the instance's bound rig (API-carried; null/absent = unbound, renders nothing). */
   boundRig?: string | null;
+  /** #2730: what the run is for, as its `--root-objective` gave it; null for an instance from before it was kept. */
+  rootObjective?: string | null;
   /**
    * WF-1 FR-2's API-carried classification (present since the
    * completion fixback at 384e60f1). RAIL 1 (arch ruling): the CLI
@@ -108,7 +110,7 @@ export interface RenderTrailRow {
 
 /** One command-shaped owner action, including the typed acceptance contract when present. */
 export function renderProjectAction(instanceId: string, packet: RenderFrontierPacket): string {
-  const base = `rig workflow project --instance ${instanceId} --current-packet ${packet.packetId} --exit <handoff|waiting|done|failed> --actor-session ${packet.ownerSession ?? "<owner>"}${packet.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
+  const base = `rig workflow project --instance ${instanceId} --current-packet ${packet.packetId} --exit <handoff|waiting|done|failed>${packet.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
   if (!packet.acceptance) return base;
   const verdict = packet.acceptance.verdicts.length === 1
     ? packet.acceptance.verdicts[0]!
@@ -181,6 +183,7 @@ export function renderTraceTree(
   const lines: string[] = [];
   const name = instance.workflowName ? `${instance.workflowName}${instance.workflowVersion ? ` v${instance.workflowVersion}` : ""}` : "";
   lines.push(`${statusGlyph(instance.status)} ${instance.instanceId}  ${name}  status=${instance.status}${instance.hopCount !== undefined ? `  hops=${instance.hopCount}` : ""}${instance.boundRig ? `  rig=${instance.boundRig}` : ""}`);
+  if (instance.rootObjective) lines.push(`  objective: ${instance.rootObjective}`);
   if (instance.createdAt) {
     lines.push(`  created ${instance.createdAt}${instance.createdBySession ? ` by ${instance.createdBySession}` : ""}  age ${humanAge(instance.createdAt, nowIso)}`);
   }
@@ -220,7 +223,7 @@ export function renderTraceTree(
   for (const failure of (instance.failureOccurrences ?? []).filter((item) => item.status === "unresolved")) {
     lines.push(`  ▲ failure ${failure.occurrenceId}  step=${failure.stepId}${failure.failureReason ? `  reason=${failure.failureReason}` : ""}`);
     lines.push(failure.targetedAction === "resume"
-      ? `      action: rig workflow resume ${instance.instanceId} --occurrence ${failure.occurrenceId} --actor-session <you>`
+      ? `      action: rig workflow resume ${instance.instanceId} --occurrence ${failure.occurrenceId}`
       : "      action: none — terminal history");
   }
   for (const unknown of instance.unknowns ?? []) lines.push(`  ? ${unknown}`);
@@ -254,6 +257,8 @@ function isStuck(instance: RenderInstance): boolean {
 export interface AttentionRow {
   instanceId: string;
   workflowName: string;
+  /** #2730: what the run is for; null when the instance doesn't record it. */
+  rootObjective: string | null;
   /** All classes for this instance — exactly-once row, combined. */
   classes: string[];
   reasons: string[];
@@ -320,6 +325,7 @@ export function composeAttentionRollup(instances: RenderInstance[]): AttentionRo
     attention.push({
       instanceId: inst.instanceId,
       workflowName: inst.workflowName ?? "",
+      rootObjective: inst.rootObjective ?? null,
       classes,
       reasons,
       affordance,
@@ -345,6 +351,7 @@ export function renderStatus(rollup: AttentionRollup): string[] {
     lines.push(
       `${fitCell("▲", 2)}${fitCell(row.instanceId, 30)}${fitCell(row.workflowName, 20)}${fitCell(row.classes.join("+"), 16)}${row.reasons.join("; ")}`,
     );
+    if (row.rootObjective) lines.push(`  ${fitCell("", 2)}  objective: ${row.rootObjective}`);
     lines.push(`  ${fitCell("", 2)}└ ${row.affordance}`);
   }
   return lines;
@@ -374,6 +381,7 @@ export function renderInstanceShow(
   const lines: string[] = [];
   lines.push(`${statusGlyph(instance.status)} ${instance.instanceId}  status=${instance.status}`);
   if (instance.workflowName) lines.push(`  workflow: ${instance.workflowName}${instance.workflowVersion ? ` v${instance.workflowVersion}` : ""}`);
+  if (instance.rootObjective) lines.push(`  objective: ${instance.rootObjective}`);
   // OPR.0.4.6.FAC1: the bound rig renders when present (unbound rows unchanged).
   if (instance.boundRig) lines.push(`  rig:      ${instance.boundRig}`);
   if (instance.createdAt) lines.push(`  created:  ${instance.createdAt}${instance.createdBySession ? ` by ${instance.createdBySession}` : ""}  (age ${humanAge(instance.createdAt, nowIso)})`);
@@ -384,7 +392,7 @@ export function renderInstanceShow(
       const action = packet.targetedAction === "project"
         ? renderProjectAction(instance.instanceId, packet)
         : packet.targetedAction === "route"
-          ? `rig workflow route ${instance.instanceId} --packet ${packet.packetId} --to <seat> --actor-session <you>`
+          ? `rig workflow route ${instance.instanceId} --packet ${packet.packetId} --to <seat>`
           : "disabled — inspect named unknowns";
       lines.push(`      action: ${action}`);
     }
@@ -406,7 +414,7 @@ export function renderInstanceShow(
     for (const failure of unresolved) {
       lines.push(`    ${failure.occurrenceId}  step=${failure.stepId}${failure.failureReason ? `  reason=${failure.failureReason}` : ""}`);
       lines.push(failure.targetedAction === "resume"
-        ? `      action: rig workflow resume ${instance.instanceId} --occurrence ${failure.occurrenceId} --actor-session <you>`
+        ? `      action: rig workflow resume ${instance.instanceId} --occurrence ${failure.occurrenceId}`
         : "      action: none — terminal history");
     }
   }

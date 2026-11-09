@@ -24,7 +24,8 @@ import type {
 } from "../domain/runtime-adapter.js";
 import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
-import { mergeManagedBlock } from "../domain/managed-blocks.js";
+import { isPerSeatRoleGuidance, perSeatRoleSkipWarning } from "../domain/managed-blocks.js";
+import { writeManagedGuidanceBlock, type ManagedBlockRecords } from "../domain/managed-block-records.js";
 import {
   stubSeatSidecarPath, buildStubRunnerCommand, parseStubRunnerState,
   type StubRunnerState,
@@ -56,6 +57,9 @@ export interface StubRuntimeAdapterDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Launch-attempt id minting (tests inject; defaults to randomUUID). */
   newLaunchId?: () => string;
+  /** #2456: with it, every guidance block this adapter writes is checked against the record and recorded; absent, the
+   *  plain merge, as before. */
+  managedBlockRecords?: ManagedBlockRecords;
 }
 
 /** In-memory launch record: the readiness fallback for the hermetic path (no
@@ -74,8 +78,10 @@ export class StubRuntimeAdapter implements RuntimeAdapter {
   private sleep: (ms: number) => Promise<void>;
   private newLaunchId: () => string;
   private readonly launchRecords = new Map<string, StubLaunchRecord>();
+  private managedBlockRecords: ManagedBlockRecords | undefined;
 
   constructor(deps: StubRuntimeAdapterDeps) {
+    this.managedBlockRecords = deps.managedBlockRecords;
     this.tmux = deps.tmux;
     this.fsOps = deps.fsOps;
     this.runtime = deps.runtime ?? "stub";
@@ -121,7 +127,7 @@ export class StubRuntimeAdapter implements RuntimeAdapter {
       try {
         if (!this.fsOps) throw new Error("no fsOps configured — cannot read startup file content");
         const content = this.fsOps.readFile(file.absolutePath);
-        const hint = file.deliveryHint === "auto" ? resolveConcreteHint(file.path, content) : file.deliveryHint;
+        const hint = file.deliveryHint === "auto" ? resolveConcreteHint(file.path, content, file.orientation) : file.deliveryHint;
 
         switch (hint) {
           case "guidance_merge": {
@@ -290,7 +296,7 @@ export class StubRuntimeAdapter implements RuntimeAdapter {
     if (!this.fsOps) return false;
     if (entry.category === "guidance" && entry.mergeStrategy === "managed_block") {
       const targetPath = nodePath.join(binding.cwd, "AGENTS.md");
-      return this.mergeGuidance(targetPath, entry.effectiveId, this.fsOps.readFile(entry.absolutePath), warnings);
+      return this.mergeGuidance(targetPath, entry.effectiveId, this.fsOps.readFile(entry.absolutePath), warnings, entry.absolutePath);
     }
     if (entry.category === "skill") {
       const targetDir = nodePath.join(binding.cwd, ".openrig", "stub", "skills", entry.effectiveId);
@@ -320,15 +326,19 @@ export class StubRuntimeAdapter implements RuntimeAdapter {
     return false;
   }
 
-  private mergeGuidance(targetPath: string, blockId: string, content: string, warnings: string[]): boolean {
+  private mergeGuidance(targetPath: string, blockId: string, content: string, warnings: string[], sourcePath?: string): boolean {
     if (!this.fsOps) return false;
     // Per-seat rig-role content collides across pod-mates when merged into a shared
     // cwd file; it is delivered via send_text instead (mirrors the other adapters).
-    if (blockId === "rig-role") return false;
-    mergeManagedBlock(this.fsOps, targetPath, blockId, content, {
-      warnings,
+    if (isPerSeatRoleGuidance(blockId, sourcePath)) {
+      const warning = perSeatRoleSkipWarning(blockId, targetPath);
+      if (warning) warnings.push(warning);
+      return false;
+    }
+    // #2456: a block a person edited since OpenRig wrote it is kept and named, not counted as merged.
+    return writeManagedGuidanceBlock(this.fsOps, targetPath, blockId, content, {
+      records: this.managedBlockRecords, sourcePath, warnings,
       replaceBlockIds: blockId === "openrig-start.md" ? ["using-openrig.md"] : [],
     });
-    return true;
   }
 }

@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
+import { noServerTerminal } from "./helpers/no-server-terminal.js";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { RigTeardownOrchestrator } from "../src/domain/rig-teardown.js";
-import type { TmuxAdapter } from "../src/adapters/tmux.js";
+import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { SnapshotCapture } from "../src/domain/snapshot-capture.js";
 import { SnapshotRepository } from "../src/domain/snapshot-repository.js";
 import { CheckpointStore } from "../src/domain/checkpoint-store.js";
@@ -14,7 +15,18 @@ import { ResumeMetadataRefresher } from "../src/domain/resume-metadata-refresher
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { checkRunningNameGuard, makeRunningSessionCounter, confirmStoppedGenerations } from "../src/domain/running-name-guard.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { managedBlockText, mergeManagedBlock } from "../src/domain/managed-blocks.js";
+import { SEAT_SKILLS_BOOTSTRAP_LINE } from "../src/domain/seat-skill-storage.js";
+import { getNodeInventory } from "../src/domain/node-inventory.js";
+import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
+import { replaceFile } from "../src/adapters/replace-file.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
+import { claudeActivityRelayPath } from "../src/domain/claude-activity-hooks.js";
 
 
 function mockTmux(killResult?: { ok: boolean; code?: string; message?: string }): TmuxAdapter {
@@ -59,6 +71,55 @@ describe("RigTeardownOrchestrator", () => {
   afterEach(() => {
     db.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === "win32")("community contract: stop and down remove only their panes, leaving a sibling session untouched", async () => {
+    // Stay inside CI's IPC allowlist, with a short path for macOS sockaddr_un.
+    const socketDir = fs.mkdtempSync(path.join(os.tmpdir(), "h1-"));
+    const socket = "community";
+    const env = { ...process.env, TMUX_TMPDIR: socketDir };
+    delete env.TMUX;
+    const exec = promisify(execFile);
+    const tmux = async (...args: string[]) => (await exec("tmux", ["-L", socket, "-f", "/dev/null", ...args], { env, timeout: 3000 })).stdout;
+    const adapter = new TmuxAdapter(async () => { throw new Error("unexpected shell execution"); }, undefined,
+      async argv => tmux(...argv.slice(1)));
+    try {
+      const targetRig = rigRepo.createRig("community-target");
+      const siblingRig = rigRepo.createRig("community-sibling");
+      const seed = async (rigId: string, name: string) => {
+        const node = rigRepo.addNode(rigId, "dev.worker", { runtime: "synth", cwd: tmpDir });
+        const session = sessionRegistry.registerSession(node.id, name);
+        sessionRegistry.recordCommunityHarnessSelection(session.id, "synth");
+        sessionRegistry.updateStatus(session.id, "running");
+        sessionRegistry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: name });
+        await tmux("new-session", "-d", "-s", name, "sleep 60");
+        return { node, session };
+      };
+      const target = await seed(targetRig.id, "worker@community-target");
+      const sibling = await seed(siblingRig.id, "worker@community-sibling");
+      const siblingBefore = db.prepare("SELECT * FROM sessions WHERE id=?").get(sibling.session.id);
+      const lifecycle = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: adapter });
+      expect(await lifecycle.stopSeat({ seatRef: "worker@community-target", reason: "contract stop test" })).toMatchObject({ ok: true });
+      expect(await adapter.hasSession("worker@community-target")).toBe(false);
+      expect(await adapter.hasSession("worker@community-sibling")).toBe(true);
+      // A later normal down of the target rig must have the same ownership boundary.
+      await tmux("new-session", "-d", "-s", "worker@community-target", "sleep 60");
+      sessionRegistry.updateStatus(target.session.id, "running");
+      sessionRegistry.updateBinding(target.node.id, { attachmentType: "tmux", tmuxSession: "worker@community-target" });
+      const teardown = new RigTeardownOrchestrator({ db, rigRepo, sessionRegistry, eventBus,
+        tmuxAdapter: adapter, snapshotCapture: mockSnapshotCapture(db) });
+      expect(await teardown.teardown(targetRig.id, { snapshot: false })).toMatchObject({ errors: [], sessionsKilled: 1,
+        paneOnly: ["worker@community-target"] });
+      expect(await adapter.hasSession("worker@community-target")).toBe(false);
+      expect(await adapter.hasSession("worker@community-sibling")).toBe(true);
+      expect(db.prepare("SELECT * FROM sessions WHERE id=?").get(sibling.session.id)).toEqual(siblingBefore);
+    } finally {
+      try { await tmux("kill-server"); }
+      catch (error) {
+        if (!/no server running|No such file or directory/.test(String((error as { stderr?: string }).stderr))) throw error;
+      }
+      fs.rmSync(socketDir, { recursive: true, force: true });
+    }
   });
 
   function seedRig(): { rigId: string; nodeId: string; sessionId: string } {
@@ -195,6 +256,55 @@ describe("RigTeardownOrchestrator", () => {
       .toEqual({ status: "exited", intentionally_stopped: 1 });
   });
 
+  // A failed start rolls its blank provisional session back to `superseded`. That row is the seat's newest, so
+  // `rig start --last` reads it; restore skips it and keeps reading the seat's own older session.
+  function seedRolledBackStart(): { rigId: string; nodeId: string; historyId: string; rollbackId: string } {
+    const { rigId, nodeId, sessionId: historyId } = seedRig();
+    sessionRegistry.updateStatus(historyId, "exited");
+    sessionRegistry.updateResumeToken(historyId, "claude_id", "native-history");
+    db.prepare("UPDATE sessions SET created_at = '2000-01-01' WHERE id = ?").run(historyId);
+    const rollback = sessionRegistry.registerSession(nodeId, "r01-dev");
+    sessionRegistry.updateStatus(rollback.id, "superseded");
+    return { rigId, nodeId, historyId, rollbackId: rollback.id };
+  }
+  const sessionRow = (id: string) => db.prepare("SELECT status, intentionally_stopped, resume_token FROM sessions WHERE id = ?").get(id);
+
+  it("records explicit down of a failed start's rolled-back session and keeps it superseded", async () => {
+    const { rigId, historyId, rollbackId } = seedRolledBackStart();
+    const tmux = mockTmux();
+    tmux.probeSession = vi.fn(async () => ({ state: "absent" }));
+    expect(await buildTeardown(tmux).teardown(rigId)).toMatchObject({ alreadyStopped: true, sessionsKilled: 0 });
+    expect(sessionRow(rollbackId)).toEqual({ status: "superseded", intentionally_stopped: 1, resume_token: null });
+    // The seat's own history is untouched, so a later restore still resumes it.
+    expect(sessionRow(historyId)).toEqual({ status: "exited", intentionally_stopped: 0, resume_token: "native-history" });
+    // What `rig start --last` reads for the seat: the newest session, now recorded as stopped on purpose.
+    expect(getNodeInventory(db, rigId)[0]).toMatchObject({ sessionStatus: "superseded", intentionallyStopped: true });
+    expect(tmux.killSession).not.toHaveBeenCalled();
+  });
+
+  it("leaves a rolled-back session unmarked while its tmux session is present or its binding changes", async () => {
+    for (const kind of ["present", "binding"] as const) {
+      const { rigId, nodeId, rollbackId } = seedRolledBackStart();
+      const tmux = mockTmux();
+      tmux.probeSession = vi.fn(async () => {
+        if (kind === "binding") sessionRegistry.updateBinding(nodeId, { tmuxSession: "new-owner", tmuxPane: "%new" });
+        return { state: kind === "present" ? "present" : "absent" };
+      });
+      await buildTeardown(tmux).teardown(rigId);
+      expect(sessionRow(rollbackId)).toEqual({ status: "superseded", intentionally_stopped: 0, resume_token: null });
+      expect(tmux.killSession).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not record a stop for a rolled-back session without an explicit down", async () => {
+    const { rigId, rollbackId } = seedRolledBackStart();
+    const tmux = mockTmux();
+    tmux.probeSession = vi.fn(async () => ({ state: "absent" }));
+    const { Reconciler } = await import("../src/domain/reconciler.js");
+    await new Reconciler({ db, sessionRegistry, eventBus, tmuxAdapter: tmux }).reconcile(rigId);
+    expect(sessionRow(rollbackId)).toEqual({ status: "superseded", intentionally_stopped: 0, resume_token: null });
+  });
+
   it("records down after reconciliation leaves a detached session's original binding", async () => {
     const { rigId, nodeId, sessionId } = seedRig();
     sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev", tmuxPane: "%1" });
@@ -207,6 +317,77 @@ describe("RigTeardownOrchestrator", () => {
     expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE id = ?").get(sessionId))
       .toEqual({ status: "exited", intentionally_stopped: 1 });
     expect(sessionRegistry.getBindingForNode(nodeId)).toBeNull();
+    expect(tmux.killSession).not.toHaveBeenCalled();
+  });
+
+  it("explicit down of a non-kernel rig starts only an empty server before recording absence", async () => {
+    const { rigId, nodeId, sessionId } = seedRig();
+    sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev", tmuxPane: "%1" });
+    sessionRegistry.markDetached(sessionId);
+    const terminal = noServerTerminal();
+    const tmux = mockTmux();
+    tmux.probeSession = terminal.probeSession;
+    tmux.startServer = terminal.startServer;
+    expect(await buildTeardown(tmux).teardown(rigId)).toMatchObject({ alreadyStopped: true, sessionsKilled: 0, errors: [] });
+    expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE id = ?").get(sessionId))
+      .toEqual({ status: "exited", intentionally_stopped: 1 });
+    expect(sessionRegistry.getBindingForNode(nodeId)).toBeNull();
+    expect(terminal.startServer).toHaveBeenCalledTimes(1);
+    expect(terminal.serverRunning()).toBe(true);
+    expect(tmux.createSession).not.toHaveBeenCalled();
+    expect(tmux.killSession).not.toHaveBeenCalled();
+  });
+
+  it.each(["failed-start", "throw-start", "second-permission", "second-unreadable", "second-present", "initial-unreadable", "initial-permission", "mixed-permission"])("no-server stop bookkeeping preserves state on %s", async fault => {
+    const { rigId, nodeId, sessionId } = seedRig();
+    sessionRegistry.markDetached(sessionId);
+    sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev", tmuxPane: "%1" });
+    const before = sessionRegistry.getBindingForNode(nodeId);
+    const tmux = mockTmux();
+    let calls = 0;
+    tmux.probeSession = vi.fn(async () => {
+      calls++;
+      if (fault === "initial-permission" || (calls === 2 && fault === "second-permission")) throw new Error("permission denied");
+      if (fault === "initial-unreadable" || (calls === 2 && fault === "second-unreadable")) return { state: "transport_unavailable", cause: "fixture unreadable" };
+      if (fault === "mixed-permission") return { state: "transport_unavailable", cause: "no server running: permission denied" };
+      if (calls === 1) return { state: "transport_unavailable", cause: "no server running on /tmp/tmux-1000/default" };
+      return { state: "present" };
+    });
+    tmux.startServer = vi.fn(async () => {
+      if (fault === "throw-start") throw new Error("fixture start unreadable");
+      return fault === "failed-start" ? { ok: false, code: "tmux_unavailable" } : { ok: true };
+    });
+    await buildTeardown(tmux).teardown(rigId);
+    expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE id = ?").get(sessionId)).toEqual({ status: "detached", intentionally_stopped: 0 });
+    expect(sessionRegistry.getBindingForNode(nodeId)).toEqual(before);
+    expect(tmux.startServer).toHaveBeenCalledTimes(fault.startsWith("initial-") || fault === "mixed-permission" ? 0 : 1);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(tmux.createSession).not.toHaveBeenCalled();
+  });
+
+  it.each([["probe", "binding"], ["probe", "latest"], ["start", "binding"], ["start", "latest"], ["reprobe", "binding"], ["reprobe", "latest"]] as const)("rechecks the %s await against a changed %s before recording a no-server stop", async (phase, kind) => {
+    const { rigId, nodeId, sessionId } = seedRig();
+    sessionRegistry.markDetached(sessionId);
+    db.prepare("UPDATE sessions SET created_at = '2000-01-01' WHERE id = ?").run(sessionId);
+    sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev", tmuxPane: "%1" });
+    const tmux = mockTmux();
+    const change = () => {
+      if (kind === "binding") sessionRegistry.updateBinding(nodeId, { tmuxSession: "new-owner", tmuxPane: "%new" });
+      else { const newer = sessionRegistry.registerSession(nodeId, "r01-new-owner"); sessionRegistry.updateStatus(newer.id, "running"); }
+    };
+    let calls = 0;
+    tmux.probeSession = vi.fn(async () => {
+      calls++;
+      if ((phase === "probe" && calls === 1) || (phase === "reprobe" && calls === 2)) change();
+      return calls === 1 ? { state: "transport_unavailable", cause: "no server running on /tmp/tmux-1000/default" } : { state: "absent" };
+    });
+    tmux.startServer = vi.fn(async () => { if (phase === "start") change(); return { ok: true }; });
+    await buildTeardown(tmux).teardown(rigId);
+    expect(db.prepare("SELECT status, intentionally_stopped FROM sessions WHERE id = ?").get(sessionId)).toEqual({ status: "detached", intentionally_stopped: 0 });
+    if (kind === "binding") expect(sessionRegistry.getBindingForNode(nodeId)).toMatchObject({ tmuxSession: "new-owner", tmuxPane: "%new" });
+    else expect(sessionRegistry.getSessionsForRig(rigId).find(session => session.sessionName === "r01-new-owner")?.status).toBe("running");
+    expect(tmux.startServer).toHaveBeenCalledTimes(phase === "probe" ? 0 : 1);
+    expect(tmux.probeSession).toHaveBeenCalledTimes(phase === "reprobe" ? 2 : 1);
     expect(tmux.killSession).not.toHaveBeenCalled();
   });
 
@@ -417,7 +598,7 @@ describe("RigTeardownOrchestrator", () => {
   });
 
   it.each([
-    ["claude-code", "CLAUDE.md"], ["claude-code", "CLAUDE.local.md"], ["codex", "AGENTS.md"],
+    ["claude-code", "CLAUDE.md"], ["claude-code", "CLAUDE.local.md"], ["codex", "AGENTS.md"], ["pi", "AGENTS.md"], ["omp", "AGENTS.md"],
   ])("preserves %s guidance when a sibling sharing %s cannot stop", async (runtime, fileName) => {
     const { rigId, nodeId, sessionId } = seedRigWithNode({ runtime, cwd: tmpDir });
     if (fileName === "CLAUDE.local.md") rigRepo.setRigClaudeManagedBlockFile(rigId, fileName);
@@ -447,6 +628,96 @@ describe("RigTeardownOrchestrator", () => {
     expect(fs.readFileSync(guidance, "utf-8")).toBe("Operator notes\n");
   });
 
+  // The seat-skills line's block goes at down only while it still holds the line; a person's edit is kept and named.
+  it.each([
+    ["claude-code", "CLAUDE.md"], ["codex", "AGENTS.md"],
+  ] as const)("keeps a person's edit to the seat-skills line in a %s seat's %s and reports it; an unedited line goes", async (runtime, fileName) => {
+    const writer = { exists: (p: string) => fs.existsSync(p), readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c) };
+    const asset = fs.readFileSync(path.join(import.meta.dirname, "../assets/guidance/openrig-seat-skills.md"), "utf-8");
+    const personal = "# Personal instructions\nPreserve these exact bytes.\n";
+    // An appended word and an indented line (four spaces make it a Markdown code block) are both a person's edits.
+    const edits = { none: (line: string) => line, appended: (line: string) => `${line} PERSON LINE EDIT`, indented: (line: string) => `    ${line}` };
+    for (const [kind, edit] of Object.entries(edits)) {
+      const cwd = fs.mkdtempSync(path.join(tmpDir, `${runtime}-`));
+      const guidance = path.join(cwd, fileName);
+      fs.writeFileSync(guidance, personal);
+      mergeManagedBlock(writer, guidance, "CULTURE.md", "culture text");
+      mergeManagedBlock(writer, guidance, "openrig-seat-skills.md", asset);
+      fs.writeFileSync(guidance, fs.readFileSync(guidance, "utf-8").replace(SEAT_SKILLS_BOOTSTRAP_LINE, edit(SEAT_SKILLS_BOOTSTRAP_LINE)));
+      const before = fs.readFileSync(guidance, "utf-8");
+      const rig = rigRepo.createRig(`line-${runtime}-${kind}`);
+      const node = rigRepo.addNode(rig.id, "dev", { runtime, cwd });
+      sessionRegistry.updateStatus(sessionRegistry.registerSession(node.id, `dev@line-${runtime}-${kind}`).id, "running");
+
+      const result = await buildTeardown().teardown(rig.id);
+
+      const after = fs.readFileSync(guidance, "utf-8");
+      if (kind === "none") {
+        expect(after, kind).toBe(personal);
+        expect(result.keptGuidance, kind).toBeUndefined();
+      } else {
+        // Only the culture block and its separator go: every byte around the kept edit stays.
+        expect(after, kind).toBe(before.replace(`\n\n${managedBlockText("CULTURE.md", "culture text")}`, ""));
+        expect(after, kind).toContain(`<!-- BEGIN OpenRig MANAGED BLOCK: openrig-seat-skills.md -->\n${edit(SEAT_SKILLS_BOOTSTRAP_LINE)}\n`);
+        expect(result.keptGuidance, kind).toEqual([`${guidance}: openrig-seat-skills.md`]);
+      }
+    }
+  });
+
+  // Down takes out exactly what the writer added: a person's file is byte for byte what it was before the line went in,
+  // whatever it ended with, after one start or several, beside the rig's other blocks; a file the line created is gone.
+  it.each([
+    ["claude-code", "CLAUDE.md"], ["codex", "AGENTS.md"],
+  ] as const)("returns a %s seat's %s to its original bytes after the seat-skills line was on", async (runtime, fileName) => {
+    const writer = { exists: (p: string) => fs.existsSync(p), readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c) };
+    const asset = fs.readFileSync(path.join(import.meta.dirname, "../assets/guidance/openrig-seat-skills.md"), "utf-8");
+    const shapes = { "no trailing newline": "# Notes\nkeep these", "one trailing newline": "# Notes\nkeep these\n", "two trailing newlines": "# Notes\nkeep these\n\n", "an empty file": "", "a new file": null };
+    for (const [shape, original] of Object.entries(shapes)) {
+      for (const starts of [1, 2]) {
+        const label = `${shape}, ${starts} start(s)`;
+        const cwd = fs.mkdtempSync(path.join(tmpDir, `${runtime}-`));
+        const guidance = path.join(cwd, fileName);
+        if (original !== null) fs.writeFileSync(guidance, original);
+        // Each start merges the rig's culture and then the seat-skills line, as a start with the line on writes them.
+        for (let i = 0; i < starts; i++) {
+          mergeManagedBlock(writer, guidance, "CULTURE.md", "culture text");
+          mergeManagedBlock(writer, guidance, "openrig-seat-skills.md", asset);
+        }
+        expect(fs.readFileSync(guidance, "utf-8"), label).toContain(SEAT_SKILLS_BOOTSTRAP_LINE);
+        const rig = rigRepo.createRig(`bytes-${runtime}-${Object.keys(shapes).indexOf(shape)}-${starts}`);
+        const node = rigRepo.addNode(rig.id, "dev", { runtime, cwd });
+        sessionRegistry.updateStatus(sessionRegistry.registerSession(node.id, `dev@${rig.name}`).id, "running");
+
+        await buildTeardown().teardown(rig.id);
+
+        if (original === null) expect(fs.existsSync(guidance), label).toBe(false);
+        else expect(fs.readFileSync(guidance, "utf-8"), label).toBe(original);
+      }
+    }
+  });
+
+  // What down can't tell apart: blank lines a person adds right after OpenRig's last block look like the writer's, so they
+  // go with it; text a person adds there is kept, with its own newlines.
+  it("removes blank lines a person added right after the seat-skills block, and keeps text they added there", async () => {
+    const writer = { exists: (p: string) => fs.existsSync(p), readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c) };
+    const asset = fs.readFileSync(path.join(import.meta.dirname, "../assets/guidance/openrig-seat-skills.md"), "utf-8");
+    const original = "# Notes\nkeep these\n";
+    for (const [added, expected] of [["\n\n\n", original], ["\nperson tail\n", `${original}\nperson tail\n`]] as const) {
+      const cwd = fs.mkdtempSync(path.join(tmpDir, "claude-code-"));
+      const guidance = path.join(cwd, "CLAUDE.md");
+      fs.writeFileSync(guidance, original);
+      mergeManagedBlock(writer, guidance, "openrig-seat-skills.md", asset);
+      fs.appendFileSync(guidance, added);
+      const rig = rigRepo.createRig(`after-block-${expected.length}`);
+      const node = rigRepo.addNode(rig.id, "dev", { runtime: "claude-code", cwd });
+      sessionRegistry.updateStatus(sessionRegistry.registerSession(node.id, `dev@${rig.name}`).id, "running");
+
+      await buildTeardown().teardown(rig.id);
+
+      expect(fs.readFileSync(guidance, "utf-8"), JSON.stringify(added)).toBe(expected);
+    }
+  });
+
   it.each(["kill_failed", "transport_unavailable"] as const)("keeps guidance when termination is unconfirmed: %s", async failure => {
     const { rigId, sessionId } = seedRigWithNode({ runtime: "codex", cwd: tmpDir });
     const guidance = path.join(tmpDir, "AGENTS.md");
@@ -473,6 +744,204 @@ describe("RigTeardownOrchestrator", () => {
     expect(fs.readFileSync(guidance, "utf-8")).toBe(content);
   });
 
+  // #875: Pi and omp seats write their blocks to AGENTS.md too, so a Codex rig stopping must not strip a file they still use.
+  it.each(["pi", "omp"])("keeps a shared AGENTS.md that another rig's live %s seat still uses when a Codex rig stops", async (runtime) => {
+    const { rigId } = seedRigWithNode({ runtime: "codex", cwd: tmpDir });
+    const other = rigRepo.createRig("other-rig");
+    const otherNode = rigRepo.addNode(other.id, "dev", { runtime, cwd: tmpDir });
+    sessionRegistry.updateStatus(sessionRegistry.registerSession(otherNode.id, "dev@other-rig").id, "running");
+    const guidance = path.join(tmpDir, "AGENTS.md");
+    const content = "<!-- BEGIN OpenRig MANAGED BLOCK: role -->\nshared guidance\n<!-- END OpenRig MANAGED BLOCK: role -->\n";
+    fs.writeFileSync(guidance, content);
+    await buildTeardown().teardown(rigId);
+    expect(fs.readFileSync(guidance, "utf-8")).toBe(content);
+  });
+
+  // #875: once no seat in a cwd still uses them, down takes back the collector, its status line and the activity relay hooks
+  // OpenRig added there, and leaves everything else as the person had it.
+  describe("OpenRig's Claude collector, status line and activity hooks in a seat's cwd", () => {
+    const COLLECTOR = "// shipped collector\n";
+
+    /** A Claude seat's cwd after a real collector install, with the person's own settings text if given. */
+    function claudeCwd(ownSettings?: string) {
+      const cwd = fs.mkdtempSync(path.join(tmpDir, "claude-cwd-"));
+      const state = path.join(tmpDir, "openrig-home");
+      const asset = path.join(tmpDir, "collector-asset.cjs");
+      fs.writeFileSync(asset, COLLECTOR);
+      const settings = path.join(cwd, ".claude", "settings.local.json");
+      if (ownSettings !== undefined) {
+        fs.mkdirSync(path.dirname(settings), { recursive: true });
+        fs.writeFileSync(settings, ownSettings);
+      }
+      const fsOps = {
+        readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"),
+        exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
+        copyFile: replaceFile, homedir: os.homedir(),
+      };
+      new ClaudeCodeAdapter({ tmux: {} as TmuxAdapter, fsOps, stateDir: state, collectorAssetPath: asset })
+        .ensureContextCollector({ cwd, tmuxSession: "dev@claude-rig" });
+      const relay = `${shellQuote(process.execPath)} ${shellQuote(claudeActivityRelayPath(state))}`;
+      return { cwd, asset, settings, collector: path.join(cwd, ".openrig", "context-collector.cjs"), relay };
+    }
+
+    /** Add hook groups the way the adapter writes them. */
+    function addHooks(settings: string, hooks: Record<string, unknown[]>): void {
+      const current = JSON.parse(fs.readFileSync(settings, "utf-8")) as Record<string, unknown>;
+      current["hooks"] = { ...(current["hooks"] as Record<string, unknown> | undefined), ...hooks };
+      fs.writeFileSync(settings, JSON.stringify(current, null, 2));
+    }
+
+    function claudeRig(name: string, cwd: string): string {
+      const rig = rigRepo.createRig(name);
+      const node = rigRepo.addNode(rig.id, "dev", { runtime: "claude-code", cwd });
+      sessionRegistry.updateStatus(sessionRegistry.registerSession(node.id, `dev@${name}`).id, "running");
+      return rig.id;
+    }
+
+    function teardownWith(asset: string, tmux?: TmuxAdapter) {
+      return new RigTeardownOrchestrator({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux ?? mockTmux(),
+        snapshotCapture: mockSnapshotCapture(db), eventBus, claudeCollectorAssetPath: asset });
+    }
+
+    it("gives a non-git cwd back the person's own settings bytes, and removes the collector and its emptied folder", async () => {
+      const own = JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] }, env: { TEAM: "1" } }, null, 2);
+      const s = claudeCwd(own);
+      addHooks(s.settings, { Stop: [{ hooks: [{ type: "command", command: s.relay }] }],
+        PreToolUse: [{ hooks: [{ type: "command", command: s.relay, timeout: 5 }] }] });
+      expect(fs.readFileSync(s.settings, "utf-8")).not.toBe(own);
+      expect(fs.existsSync(path.join(s.cwd, ".git"))).toBe(false);
+
+      const result = await teardownWith(s.asset).teardown(claudeRig("claude-rig", s.cwd));
+
+      expect(fs.readFileSync(s.settings, "utf-8")).toBe(own);
+      expect(fs.existsSync(s.collector)).toBe(false);
+      expect(fs.existsSync(path.join(s.cwd, ".openrig"))).toBe(false);
+      expect(result.keptFiles).toBeUndefined();
+      expect(result.errors).toEqual([]);
+    });
+
+    it("keeps settings.local.json as {} when OpenRig's entries were all it held, since nothing says who created it", async () => {
+      const s = claudeCwd();
+      addHooks(s.settings, { Stop: [{ hooks: [{ type: "command", command: s.relay }] }] });
+
+      await teardownWith(s.asset).teardown(claudeRig("claude-rig", s.cwd));
+
+      expect(fs.readFileSync(s.settings, "utf-8")).toBe("{}");
+      expect(fs.existsSync(path.join(s.cwd, ".claude"))).toBe(true);
+      expect(fs.existsSync(path.join(s.cwd, ".openrig"))).toBe(false);
+    });
+
+    it("takes only OpenRig's hooks out of a mixed group, keeping the person's hooks, the group's other fields and their status line fields", async () => {
+      const person = { type: "command", command: "echo person" };
+      const s = claudeCwd(JSON.stringify({ permissions: { deny: ["Read(.env)"] }, statusLine: { padding: 2 } }, null, 2));
+      addHooks(s.settings, {
+        PreToolUse: [{ matcher: "Bash", hooks: [person, { type: "command", command: s.relay }] }],
+        Stop: [{ hooks: [{ type: "command", command: s.relay }] }],
+        Notification: [{ matcher: "", hooks: [person] }],
+      });
+
+      await teardownWith(s.asset).teardown(claudeRig("claude-rig", s.cwd));
+
+      expect(JSON.parse(fs.readFileSync(s.settings, "utf-8"))).toEqual({
+        permissions: { deny: ["Read(.env)"] },
+        statusLine: { padding: 2 },
+        hooks: { PreToolUse: [{ matcher: "Bash", hooks: [person] }], Notification: [{ matcher: "", hooks: [person] }] },
+      });
+    });
+
+    it("keeps and names a collector whose bytes aren't the shipped collector's, and still takes its status line out", async () => {
+      const s = claudeCwd();
+      fs.appendFileSync(s.collector, "// a person's edit\n");
+
+      const result = await teardownWith(s.asset).teardown(claudeRig("claude-rig", s.cwd));
+
+      expect(fs.readFileSync(s.collector, "utf-8")).toBe(`${COLLECTOR}// a person's edit\n`);
+      expect(result.keptFiles).toEqual([`${s.collector}: not the shipped collector's bytes, so it was kept`]);
+      expect(JSON.parse(fs.readFileSync(s.settings, "utf-8"))).toEqual({});
+      expect(result.errors).toEqual([]);
+    });
+
+    it.each(["{ \"permissions\": ", "[]"])("leaves settings it can't read as a settings object (%s) byte for byte, and names them", async (text) => {
+      const s = claudeCwd(text);
+
+      const result = await teardownWith(s.asset).teardown(claudeRig("claude-rig", s.cwd));
+
+      expect(fs.readFileSync(s.settings, "utf-8")).toBe(text);
+      expect(result.keptFiles).toEqual([`${s.settings}: not a JSON settings object, so it was left as it is`]);
+      expect(fs.existsSync(s.collector)).toBe(false);
+      expect(result.errors).toEqual([]);
+    });
+
+    it.each(["another rig's seat", "a sibling whose stop failed"] as const)("keeps everything while %s still uses the cwd", async (consumer) => {
+      const own = JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] } }, null, 2);
+      const s = claudeCwd(own);
+      addHooks(s.settings, { Stop: [{ hooks: [{ type: "command", command: s.relay }] }] });
+      const before = fs.readFileSync(s.settings, "utf-8");
+      const rigId = claudeRig("claude-rig", s.cwd);
+      const tmux = mockTmux();
+      if (consumer === "another rig's seat") claudeRig("other-rig", s.cwd);
+      else {
+        const sibling = rigRepo.addNode(rigId, "survivor", { runtime: "claude-code", cwd: s.cwd });
+        sessionRegistry.updateStatus(sessionRegistry.registerSession(sibling.id, "survivor@claude-rig").id, "running");
+        tmux.killSession = vi.fn(async target => target === "survivor@claude-rig"
+          ? { ok: false, code: "kill_failed", message: "tmux error" } : { ok: true });
+      }
+
+      await teardownWith(s.asset, tmux).teardown(rigId);
+
+      expect(fs.readFileSync(s.settings, "utf-8")).toBe(before);
+      expect(fs.readFileSync(s.collector, "utf-8")).toBe(COLLECTOR);
+
+      if (consumer === "a sibling whose stop failed") {
+        // Once that seat stops too, the next down takes OpenRig's additions back.
+        tmux.killSession = vi.fn(async () => ({ ok: true }));
+        await teardownWith(s.asset, tmux).teardown(rigId);
+        expect(fs.readFileSync(s.settings, "utf-8")).toBe(own);
+        expect(fs.existsSync(s.collector)).toBe(false);
+      }
+    });
+
+    // A link below the cwd shares a file between two directories: the stopping seat's cwd A and a live seat's cwd B. Whichever
+    // way the link points, the shared target stays and is named; A's own, unshared targets still go.
+    it.each(["B's .claude and .openrig link to A's", "A's .claude and .openrig link to B's", "settings.local.json is hardlinked"] as const)(
+      "keeps a Claude target a seat in another directory still uses when %s", async (shape) => {
+        const own = JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] } }, null, 2);
+        const real = claudeCwd(own);
+        addHooks(real.settings, { Stop: [{ hooks: [{ type: "command", command: real.relay }] }] });
+        const other = fs.mkdtempSync(path.join(tmpDir, "claude-other-"));
+        let a = real.cwd, b = other;
+        if (shape === "A's .claude and .openrig link to B's") { a = other; b = real.cwd; }
+        if (shape === "settings.local.json is hardlinked") {
+          fs.mkdirSync(path.join(other, ".claude"));
+          fs.linkSync(real.settings, path.join(other, ".claude", "settings.local.json"));
+        } else {
+          fs.symlinkSync(path.join(real.cwd, ".claude"), path.join(other, ".claude"));
+          fs.symlinkSync(path.join(real.cwd, ".openrig"), path.join(other, ".openrig"));
+        }
+        const before = fs.readFileSync(real.settings, "utf-8");
+        const rigId = claudeRig("claude-rig", a);
+        claudeRig("other-rig", b);
+
+        const result = await teardownWith(real.asset).teardown(rigId);
+
+        expect(fs.readFileSync(real.settings, "utf-8")).toBe(before);
+        const aSettings = path.join(a, ".claude", "settings.local.json");
+        const aCollector = path.join(a, ".openrig", "context-collector.cjs");
+        if (shape === "settings.local.json is hardlinked") {
+          // A's collector isn't shared, so it still goes.
+          expect(fs.existsSync(real.collector)).toBe(false);
+          expect(result.keptFiles).toEqual([`${aSettings}: another seat's directory still uses it through a link, so it was kept`]);
+        } else {
+          expect(fs.readFileSync(real.collector, "utf-8")).toBe(COLLECTOR);
+          expect(result.keptFiles).toEqual([
+            `${aSettings}: another seat's directory still uses it through a link, so it was kept`,
+            `${aCollector}: another seat's directory still uses it through a link, so it was kept`,
+          ]);
+        }
+        expect(result.errors).toEqual([]);
+      });
+  });
+
   // T12: Kill failure + --delete -> blocked
   it("kill failure blocks --delete", async () => {
     const { rigId, nodeId } = seedRig();
@@ -487,6 +956,43 @@ describe("RigTeardownOrchestrator", () => {
     // Node should NOT be marked exited
     const sessions = sessionRegistry.getSessionsForRig(rigId);
     expect(sessions.some((s) => s.status === "running")).toBe(true);
+  });
+
+  it.each([false, true])("leaves a seat joined with rig attach as an external CLI claimed and running, and still stops the tmux seat (delete=%s)", async (del) => {
+    const { rigId, nodeId } = seedRig();
+    sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev" });
+    const desktop = rigRepo.addNode(rigId, "desktop", { runtime: "claude-code" });
+    sessionRegistry.updateBinding(desktop.id, { attachmentType: "external_cli", externalSessionName: "desktop@test-rig" });
+    const claimed = sessionRegistry.registerClaimedSession(desktop.id, "desktop@test-rig");
+    const tmux = mockTmux();
+    tmux.probeSession = vi.fn(async (name: string) => ({ state: name === "r01-dev" ? "present" : "absent" }));
+
+    const result = await buildTeardown(tmux).teardown(rigId, { delete: del });
+
+    if (!del) {
+      // The claim is untouched: not recorded as stopped, and its binding kept, while the tmux seat beside it is stopped.
+      expect(db.prepare("SELECT status, intentionally_stopped AS stopped FROM sessions WHERE id = ?").get(claimed.id)).toEqual({ status: "running", stopped: 0 });
+      expect(sessionRegistry.getBindingForNode(desktop.id)).toMatchObject({ attachmentType: "external_cli" });
+      expect(sessionRegistry.getBindingForNode(nodeId)).toBeNull();
+    }
+    expect(tmux.probeSession).not.toHaveBeenCalledWith("desktop@test-rig");
+    expect(tmux.killSession).not.toHaveBeenCalledWith("desktop@test-rig");
+    expect(result).toMatchObject({ sessionsKilled: 1, errors: [], deleted: del, leftRunning: ["desktop@test-rig"] });
+  });
+
+  it("names the community-harness seats whose pane it stopped, since the harness's own processes may outlive it", async () => {
+    const { rigId } = seedRigWithNode({ runtime: "claude-code", cwd: "/tmp" });
+    const hermes = rigRepo.addNode(rigId, "hermes", { runtime: "synth-harness" });
+    const launched = sessionRegistry.registerSession(hermes.id, "hermes@test-rig");
+    sessionRegistry.updateStatus(launched.id, "running");
+    sessionRegistry.recordCommunityHarnessSelection(launched.id, "synth-harness");
+    // A free-text runtime with a preset's name, never launched for that preset, isn't one.
+    const namesake = rigRepo.addNode(rigId, "namesake", { runtime: "synth-harness" });
+    sessionRegistry.updateStatus(sessionRegistry.registerSession(namesake.id, "namesake@test-rig").id, "running");
+
+    const result = await buildTeardown().teardown(rigId);
+
+    expect(result).toMatchObject({ sessionsKilled: 3, errors: [], paneOnly: ["hermes@test-rig"] });
   });
 
   // T13: Stale session (tmux gone) -> benign
@@ -554,11 +1060,49 @@ describe("RigTeardownOrchestrator", () => {
     expect(rigRepo.getRig(rigId)).not.toBeNull();
   });
 
-  it("retains the binding when the tmux server is unreachable", async () => {
+  it.each(["/tmp/tmux-501/default", "/team/tmux/tmux-501/default"])("stops a rig after its own server reports absence on %s", async (socket) => {
+    const { rigId, nodeId, sessionId } = seedRig();
+    sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev" });
+    const terminal = noServerTerminal(`Command failed: tmux has-session -t =r01-dev\nno server running on ${socket}`);
+    const tmux = mockTmux();
+    tmux.probeSession = terminal.probeSession;
+
+    const result = await buildTeardown(tmux).teardown(rigId);
+
+    expect(result.errors).toEqual([]);
+    expect(result.sessionsKilled).toBe(0);
+    expect(tmux.killSession).not.toHaveBeenCalled();
+    expect(sessionRegistry.getBindingForNode(nodeId)).toBeNull();
+    expect(sessionRegistry.getSessionsForRig(rigId).find((session) => session.id === sessionId))
+      .toMatchObject({ status: "exited" });
+    expect(db.prepare("SELECT intentionally_stopped FROM sessions WHERE id = ?").get(sessionId))
+      .toEqual({ intentionally_stopped: 1 });
+    expect(checkRunningNameGuard({ findRigsByName: (name) => rigRepo.findRigsByName(name),
+      countRunningSessions: makeRunningSessionCounter(db) }, "test-rig")).toEqual({ ok: true });
+    expect(terminal.commands).toEqual(["tmux has-session -t '=r01-dev'"]);
+    expect((await confirmStoppedGenerations(db, [rigId], tmux.probeSession.bind(tmux))).ok).toBe(true);
+    rigRepo.archiveRig(rigId);
+    expect(db.prepare("SELECT archived_at FROM rigs WHERE id = ?").get(rigId))
+      .toEqual({ archived_at: expect.any(String) });
+  });
+
+  it.each([
+    "error connecting to /other-caller/tmux-501/default (No such file or directory)",
+    // Synthetic Connection refused shape: real tmux 3.6a prints "no server running on ..." for a stale socket.
+    "error connecting to /tmp/tmux-501/default (Connection refused)",
+    "error connecting to /tmp/no server running/tmux-501/default (Connection refused)",
+    "error connecting to /tmp/no server running/tmux-501/default (No such file or directory)",
+    "error connecting to /tmp/\nno server running on x/tmux-501/default (Permission denied)",
+    "error connecting to /tmp/no session/tmux-501/default (No such file or directory)",
+    "permission denied: no server running on /tmp/tmux-501/default",
+  ])("retains the binding when the server probe is uncertain: %s", async (cause) => {
     const { rigId, nodeId, sessionId } = seedRig();
     sessionRegistry.updateBinding(nodeId, { tmuxSession: "r01-dev" });
     const tmux = mockTmux();
-    tmux.probeSession = vi.fn(async () => ({ state: "transport_unavailable", cause: "no server running on /tmp/tmux-501/default" }));
+    const adapter = new TmuxAdapter(async () => { throw new Error("unexpected legacy exec"); }, undefined, async () => {
+      throw Object.assign(new Error(`Command failed: /fixture/tmux has-session -t =r01-dev\n${cause}`), { execStderr: cause });
+    });
+    tmux.probeSession = vi.fn((name) => adapter.probeSession(name));
 
     const result = await buildTeardown(tmux).teardown(rigId, { delete: true });
 
@@ -567,6 +1111,8 @@ describe("RigTeardownOrchestrator", () => {
     expect(rigRepo.getRig(rigId)).not.toBeNull();
     expect(sessionRegistry.getBindingForNode(nodeId)?.tmuxSession).toBe("r01-dev");
     expect(sessionRegistry.getSessionsForRig(rigId).find((session) => session.id === sessionId)?.status).toBe("running");
+    sessionRegistry.updateStatus(sessionId, "detached");
+    expect((await confirmStoppedGenerations(db, [rigId], tmux.probeSession.bind(tmux))).ok).toBe(false);
   });
 
   it("retains the binding if the tmux server vanishes between probe and kill", async () => {

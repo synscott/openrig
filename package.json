@@ -1,6 +1,6 @@
 {
   "name": "openrig",
-  "version": "0.6.11",
+  "version": "0.7.1",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -19,6 +19,7 @@
     "typecheck:prep": "npm run build -w packages/daemon",
     "lint": "npm run typecheck:prep && tsc --noEmit --project packages/daemon/tsconfig.json && tsc --noEmit --project packages/ui/tsconfig.json && tsc --noEmit --project packages/cli/tsconfig.json && tsc --noEmit --project packages/tui/tsconfig.json",
     "build:package": "node scripts/run-package-build.mjs",
+    "pack:release": "node scripts/pack-release.mjs",
     "test:tui-package": "node scripts/test-tui-package.mjs",
     "mirror-skills": "node scripts/mirror-skills.mjs",
     "mirror-skills:check": "node scripts/mirror-skills.mjs --check",
@@ -28,6 +29,7 @@
     "gate": "node scripts/gate-lane.mjs"
   },
   "engines": {
-    "node": "^22 || ^24"
+    "node": "^22 || ^24",
+    "npm": ">=10"
   }
 }

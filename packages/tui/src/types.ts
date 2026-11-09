@@ -4,12 +4,21 @@
 // it introduces no new data model.
 
 export interface AgentRow {
+  /** Served attention and its needs-input provenance. Null is unavailable, never clear. */
+  needsAttention?: boolean | null;
+  arbitratedNeedsInput?: boolean | null;
+  needsInputEvidence?: { rung: string; observedAt: string } | null;
   /** Stable daemon node identity used by canonical seat-scoped records. */
   nodeId?: string;
   name: string;
   runtime: string;
   /** effective served model; separate from runtime, null when not served */
   model?: string | null;
+  /** Configured launch effort: the seat's explicit choice, else the authored value.
+   *  null = no configured level (runtime default); never an observed guess. */
+  effort?: string | null;
+  /** Provenance for `effort`; `runtime_default` = no configured level is known. */
+  effortSource?: "seat_choice" | "authored" | "runtime_default" | null;
   spec: string;
   profile?: string | null;
   specVersion?: string | null;
@@ -33,6 +42,7 @@ export interface AgentRow {
     needsInput: { count: number; reason: string | null } | null;
     decidedBy: string | null;
     signalReason: string | null;
+    signalState?: string | null;
     signalSource: string | null;
     eventAt: string | null;
   };
@@ -75,12 +85,17 @@ export interface RigNode {
   graph?: import("./topology/graph-types.js").RigGraph;
   /** served rig lifecycleState verbatim (summary read); non-"running" states surface */
   lifecycleState?: string;
+  /** A rig on another registered host, read through this daemon: its name and state only, not its seats. */
+  remoteHost?: string;
 }
 
 export interface HostNode {
   /** Stable transport key (`local` for this daemon); separate from display identity. */
   id?: string;
+  /** Stable host identity used by navigation and command targets. */
   name: string;
+  /** Operator-configured name for presentation, never a routing key. */
+  displayName?: string;
   reachable: boolean;
   rigs: RigNode[];
 }
@@ -354,8 +369,42 @@ export interface HealthSnapshot {
 
 export interface ProjectSelection { id: string; root: string }
 export interface ProjectEntry extends ProjectSelection { name: string; sourcePath: string | null; missionsRoot: string; error?: string }
+/** The served `rig seat effort` report, narrowed to the fields this renderer reads.
+ *  `ok: false` is a refusal (code/message), never a fabricated value. */
+export interface SeatEffortRead {
+  ok: boolean;
+  code?: string;
+  message?: string;
+  runtime?: string;
+  /** The last `rig seat set-effort` for this seat; null = never set. `value: null` = cleared. */
+  requested?: { value?: string | null; at?: string; reason?: string; operator?: string | null } | null;
+  saved?: { effective?: string | null; source?: string | null; authored?: string | null; choice?: string | null };
+  emitted?: {
+    state?: "observed" | "unknown";
+    value?: string | null;
+    pid?: number;
+    startedAt?: string | null;
+    matchesSaved?: boolean;
+    detail?: string;
+  };
+  observed?: {
+    state?: "observed" | "not_verified";
+    value?: string | null;
+    source?: string;
+    outcome?: string;
+    detail?: string;
+    at?: string;
+    matchesEmitted?: boolean;
+  };
+  summary?: string;
+}
+
 export interface FleetSnapshot {
   attentionRead?: import("@openrig/daemon/attention").AttentionRead | null;
+  /** Present only while an agent detail page is open; fetched from the existing
+   *  seat-effort route. A null report = the read did not answer; never a claim that
+   *  no effort exists. */
+  seatEffort?: { seatRef: string; report: SeatEffortRead | null } | null;
   projects?: { catalogPath: string; projects: ProjectEntry[] } | null;
   projectRead?: ProjectSelection | null;
   projectSources?: Record<string, string>;
@@ -423,9 +472,8 @@ export interface FleetSnapshot {
    * the render keeps only unclaimed (claimedAt null) and caps for display. */
   pending: QueueRead[];
   /** PULSE JUST FINISHED source (increment 3) — the shipped
-   * state=done,handed-off read (a bounded recent WINDOW; no fleet-wide
-   * finish-time-ordered transitions endpoint exists — the served order is
-   * ts_created, so the render re-sorts by tsUpdated DESC for newest-finished-first). */
+   * state=done,handed-off read with sort=updated (a bounded recent WINDOW of the
+   * most recently finished; the render sorts by tsUpdated DESC for newest-finished-first). */
   recentlyFinished: QueueRead[];
   /** When THIS snapshot finished hydrating (TUI render-time fact, not a daemon
    * read) — the PULSE footer "updated Ns ago" freshness. Absent before the first
@@ -476,6 +524,8 @@ export type Action =
   | { type: "attention-category"; category: "action" | "update" }
   | { type: "attention-open"; id: string }
   | { type: "attention-source"; path: string }
+  /** Whose Feed queue to show: a person, "all" or "default". A view, never who acts. */
+  | { type: "attention-view"; view: string }
   | { type: "file-open"; target: import("./reading.js").FileTarget }
   | { type: "external-open"; url: string }
   /** Leave the TUI briefly and print `value` as one unbroken line for exact copying; Enter returns. */
@@ -530,6 +580,11 @@ export type Action =
   | { type: "act"; act: "launch-spec" }
   | { type: "act"; act: "open-terminal"; view: string; expectedPlan?: string }
   | { type: "act"; act: "run"; rigId: string; agent: string }
+  /** Answer a request on its own row, as the person the Feed served: Steering's Approve, or a choice
+   * (questionId + optionId) or their own words (decision) through mission control's answer. */
+  | { type: "act"; act: "answer"; qitemId: string; verb: "approve" | "answer" | "resolve"; actorSession: string; questionId?: string; optionId?: string; decision?: string }
+  /** Answer the open request in your own words (the `reply` command); main resolves it to the served answer act. */
+  | { type: "attention-reply"; text: string }
   | { type: "notice"; message: string };
 
 /** FR-12: the section set is ONE in-code registry — adding a section is a
@@ -547,6 +602,8 @@ export interface ViewState {
   terminalView?: string | null;
   terminalPage?: number;
   attentionOpen?: string | null;
+  /** Whose Feed queue is shown: a person, or "all"; null is the default person's (or everyone's when there is none). */
+  attentionView?: string | null;
   attentionCategory?: "action" | "update" | null;
   file?: import("./reading.js").FileTarget | null;
   externalUrl?: string | null;
@@ -634,6 +691,8 @@ export interface LoadState {
   /** Known change or lost authority contact; quiet elapsed time alone never sets this. */
   stale?: boolean;
   connection?: "connected" | "dropped" | "reconnecting" | "unavailable";
+  /** this TUI's build differs from the daemon's; background refresh has stopped */
+  skew?: string;
   /** a hydrate refresh is running right now */
   inFlight: boolean;
   /** at least one refresh has completed (success or failure) */

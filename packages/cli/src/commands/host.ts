@@ -1,12 +1,19 @@
 // OPR.0.4.4.13 — the host-registry verbs (add / list / doctor — arch
-// R13-2a: no edit/remove/tunnel/bootstrap verbs; hand-editing hosts.yaml
-// remains the path for exotica; the bootstrap ships as script + runbook).
-// OPR.0.4.6.MH1 FR-1 extends the family with `select` — the persisted
-// host-selection pointer (kubectl current-context shape). The pointer
-// lives in the config twins as `host.selected`; this verb is a THIN
-// CLIENT of the daemon config write (one write path for CLI+UI
+// R13-2a originally: no edit/remove/tunnel/bootstrap verbs; hand-editing
+// hosts.yaml remains the path for exotica; the bootstrap ships as script +
+// runbook). OPR.0.4.6.MH1 FR-1 extends the family with `select` — the
+// persisted host-selection pointer (kubectl current-context shape). The
+// pointer lives in the config twins as `host.selected`; this verb is a
+// THIN CLIENT of the daemon config write (one write path for CLI+UI
 // convergence, arch ruling); reads resolve from the local ConfigStore
 // (env > file > default — zero new daemon lookups on read paths).
+// Issue #2128 (maintainer-approved boundary) extends the family again with
+// `edit` and `remove`: the SAME parity-pinned writer contract as add — id
+// and transport stay fixed on an edit, unknown fields fail loud, empty
+// string clears an optional field, and remove deletes only the registry
+// entry (no credential files, no learned identity, no selection change).
+// When the selected host is edited or removed, the selection outcome is
+// shown plainly — never a silent switch.
 //
 // Secret hygiene (FR-1): every render carries bearer POINTERS (env var /
 // file NAMES) only — no code path in this file resolves a bearer value
@@ -17,12 +24,14 @@ import { existsSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { hostname as osHostname, userInfo } from "node:os";
 import { connect } from "node:net";
+import { execFile } from "node:child_process";
 import { getOpenRigHome } from "../openrig-compat.js";
-import { addHostEntry, defaultHostRegistryPath, loadHostRegistry, validateHostRegistry, hostDisplayTarget, resolveHost, resolveRemoteBearer, bearerAuthHeaders, type HostEntry, type HttpHostEntry } from "../host-registry.js";
+import { addHostEntry, updateHostEntry, removeHostEntry, defaultHostRegistryPath, loadHostRegistry, validateHostRegistry, hostDisplayTarget, resolveHost, resolveRemoteBearer, bearerAuthHeaders, type HostEntry, type HttpHostEntry, type SshHostEntry } from "../host-registry.js";
 import { runCrossHostCommand, type CrossHostResult } from "../cross-host-executor.js";
 import { recordHostObservation, loadHostBindings, describeBindingConflict, defaultHostBindingsPath, type HostObservationOutcome } from "../host-bindings.js";
 import { DaemonClient } from "../client.js";
 import { readOwnHostName, readSelectedHost } from "../host-selection.js";
+import { parseFeedHostSubscriptionKey } from "../config-store.js";
 
 // ---------------------------------------------------------------------------
 // rig host pair — the approval wait is BOUNDED.
@@ -70,7 +79,47 @@ export interface DoctorDeps {
   /** Slice 14 Source-1: record an observed `/healthz` selfHostId for a registry alias in the learned
    *  sidecar (TOFU + loud-conflict). Optional so existing fixtures keep compiling AND unit runs never
    *  write the real sidecar — absent means learning is skipped, which is the fail-open contract. */
-  learnHostBinding?: (alias: string, observedHostId: string) => HostObservationOutcome;
+  learnHostBinding?: (alias: string, observedHostId: string, observedUrl: string) => HostObservationOutcome;
+  /** The registry entry a reply addressed `@<hostId>` resolves to, by the lookup `rig send` makes.
+   *  Optional like the learner: absent means doctor makes no claim about where replies go. */
+  replyRoute?: (hostId: string) => HostEntry | null;
+  /** The self-id learned for a registry alias, if any. */
+  learnedHostId?: (alias: string) => string | null;
+}
+
+/** Where `rig send` takes a target ending `@<hostId>`: registry id, then a declared hostId, then the
+ *  first hosts.yaml entry with that learned binding (cross-host-target.ts). Null when none matches. */
+export function replyRouteFromDisk(hostId: string): HostEntry | null {
+  const loaded = loadHostRegistry();
+  if (!loaded.ok) return null;
+  const resolved = resolveHost(loaded.registry, hostId, loadHostBindings().bindings);
+  return resolved.ok ? resolved.host : null;
+}
+
+const REPLY_ROUTE_ORDER = "rig send resolves it by registry id, then a declared hostId, then the first hosts.yaml entry that learned it";
+
+/** A reachable entry whose self-id another entry answers for. Unknown, not fail: doctor can't tell
+ *  from here whether that other entry still reaches the machine. */
+function replyRouteElsewhereRow(host: HostEntry, hostId: string, winner: HostEntry): CheckRow {
+  return {
+    step: "reply-route",
+    status: "unknown",
+    detail: `replies addressed @${hostId} go to '${winner.id}', not '${host.id}' (${REPLY_ROUTE_ORDER})`,
+    fix: `run rig host doctor ${winner.id}; if it no longer reaches this machine, delete its entry from ${defaultHostRegistryPath()} (and its line in ${defaultHostBindingsPath()}, if any)`,
+  };
+}
+
+/** An unreachable entry that replies still resolve to: the failure a stale entry causes, named on
+ *  the entry itself. Null when the entry has no self-id or another entry answers for it. */
+function replyRouteThroughDeadEntryRow(host: HostEntry, deps: DoctorDeps): CheckRow | null {
+  const hostId = host.hostId ?? deps.learnedHostId?.(host.id) ?? null;
+  if (!hostId || deps.replyRoute?.(hostId)?.id !== host.id) return null;
+  return {
+    step: "reply-route",
+    status: "fail",
+    detail: `replies addressed @${hostId} resolve to '${host.id}', so they fail while it is unreachable`,
+    fix: `if another entry reaches this machine, delete '${host.id}' from ${defaultHostRegistryPath()} (and its line in ${defaultHostBindingsPath()}, if any), then run rig host doctor on that entry; otherwise restore this entry's connectivity`,
+  };
 }
 
 function nestedBoolean(obj: unknown, path: readonly string[]): boolean | undefined {
@@ -113,19 +162,41 @@ function defaultDoctorDeps(): DoctorDeps {
         sock.on("timeout", () => { sock.destroy(); resolve("closed"); });
         sock.on("error", () => { sock.destroy(); resolve("closed"); });
       }),
-    learnHostBinding: (alias, observedHostId) => recordHostObservation({ alias, observedHostId }),
+    learnHostBinding: (alias, observedHostId, observedUrl) => recordHostObservation({ alias, observedHostId, observedUrl }),
+    replyRoute: replyRouteFromDisk,
+    learnedHostId: (alias) => loadHostBindings().bindings[alias]?.hostId ?? null,
   };
+}
+
+/** Where ssh would connect for this host, from `ssh -G`, which reads ssh config without connecting.
+ *  Null when ssh can't resolve the target or a ProxyJump/ProxyCommand sits in between, since no
+ *  direct dial stands for that transport. */
+export function resolveSshEndpoint(host: SshHostEntry, timeoutMs = 1500): Promise<{ hostname: string; port: number } | null> {
+  const args = [...(host.user ? ["-l", host.user] : []), "-G", host.target];
+  return new Promise((resolve) => {
+    execFile("ssh", args, { timeout: timeoutMs }, (error, stdout) => {
+      if (error) return resolve(null);
+      const conf = new Map(stdout.split("\n").map((line) => {
+        const i = line.indexOf(" ");
+        return [line.slice(0, i).toLowerCase(), line.slice(i + 1).trim()] as const;
+      }));
+      const proxied = ["proxyjump", "proxycommand"].some((k) => (conf.get(k) ?? "none") !== "none");
+      const hostname = conf.get("hostname");
+      const port = Number(conf.get("port"));
+      resolve(hostname && Number.isInteger(port) && !proxied ? { hostname, port } : null);
+    });
+  });
 }
 
 /** FR-1 doctor legs — each failing step maps to a DISTINCT actionable error:
  *  "SSH works but daemon is down" ≠ "daemon works but registry is wrong" ≠
  *  "remote rig binary missing/old". */
 /** OPR.0.4.6.MH1 FR-3 — the coarse ls status word: a BOUNDED tcp dial
- *  against the host's transport endpoint (ssh: target:22; http: the
- *  URL's host:port). Coarse by design (the kubectl STATUS / docker
- *  context ls precedent): reachable | unreachable | unknown — never a
- *  hang (hard timeout), never a guess (dial failure = unreachable,
- *  probe error/unparseable endpoint = unknown). */
+ *  against the host's transport endpoint (ssh: the host and port ssh itself
+ *  resolves, see resolveSshEndpoint; http: the URL's host:port). Coarse by
+ *  design (the kubectl STATUS / docker context ls precedent): reachable |
+ *  unreachable | unknown — never a hang (hard timeout), never a guess (dial
+ *  failure = unreachable, probe error/unparseable endpoint = unknown). */
 export async function probeHostStatus(
   host: HostEntry,
   tcpProbe: DoctorDeps["tcpProbe"],
@@ -135,8 +206,9 @@ export async function probeHostStatus(
     let target: string;
     let port: number;
     if (host.transport === "ssh") {
-      target = host.target;
-      port = 22;
+      const endpoint = await resolveSshEndpoint(host, timeoutMs);
+      if (!endpoint) return "unknown";
+      ({ hostname: target, port } = endpoint);
     } else {
       const u = new URL(host.url);
       target = u.hostname.replace(/^\[|\]$/g, "");
@@ -163,6 +235,8 @@ export async function doctorLegs(host: HostEntry, deps: DoctorDeps): Promise<Che
           ? "SSH auth/permission gate — check the key, agent, and remote authorized_keys"
           : "verify the ssh target/alias, tailnet connectivity, and that sshd is running",
       });
+      const routeRow = reach.failedStep === "ssh-unreachable" ? replyRouteThroughDeadEntryRow(host, deps) : null;
+      if (routeRow) rows.push(routeRow);
       return rows; // later legs are meaningless without the shell
     }
     rows.push({ step: "transport-reachability", status: "pass", detail: `ssh to ${host.target} ok` });
@@ -254,21 +328,29 @@ export async function doctorLegs(host: HostEntry, deps: DoctorDeps): Promise<Che
       try {
         const parsed = JSON.parse(health.body) as { selfHostId?: unknown };
         if (typeof parsed.selfHostId === "string" && parsed.selfHostId.length > 0) {
-          const obs = deps.learnHostBinding(host.id, parsed.selfHostId);
-          rows.push(obs.outcome === "conflict"
-            ? {
-                step: "host-identity-binding",
-                status: "fail",
-                detail: describeBindingConflict(host.id, obs.binding),
-                fix: `if the re-key is legitimate, delete the '${host.id}' entry in ${defaultHostBindingsPath()} and re-run doctor to re-learn`,
-              }
-            : {
-                step: "host-identity-binding",
-                status: "pass",
-                detail: obs.outcome === "bound"
-                  ? `learned host identity '${obs.binding.hostId}' (first contact) — reply hints ending @${obs.binding.hostId} now resolve to '${host.id}'`
-                  : `host identity '${obs.binding.hostId}' confirmed`,
-              });
+          const obs = deps.learnHostBinding(host.id, parsed.selfHostId, (host as HttpHostEntry).url);
+          if (obs.outcome === "conflict") {
+            rows.push({
+              step: "host-identity-binding",
+              status: "fail",
+              detail: describeBindingConflict(host.id, obs.binding),
+              fix: `if the re-key is legitimate, delete the '${host.id}' entry in ${defaultHostBindingsPath()} and re-run doctor to re-learn`,
+            });
+          } else {
+            // Ask the route rig send takes rather than assume it: an entry listed earlier in
+            // hosts.yaml with the same identity keeps the replies, even when it no longer answers.
+            const id = obs.binding.hostId;
+            const winner = deps.replyRoute?.(id) ?? null;
+            const routedHere = winner?.id === host.id;
+            rows.push({
+              step: "host-identity-binding",
+              status: "pass",
+              detail: obs.outcome === "bound"
+                ? `learned host identity '${id}' (first contact)${routedHere ? ` — reply hints ending @${id} now resolve to '${host.id}'` : ""}`
+                : `host identity '${id}' confirmed`,
+            });
+            if (winner && !routedHere) rows.push(replyRouteElsewhereRow(host, id, winner));
+          }
         }
       } catch {
         // body not JSON — an older or non-daemon endpoint; learning is skipped, nothing breaks.
@@ -276,6 +358,8 @@ export async function doctorLegs(host: HostEntry, deps: DoctorDeps): Promise<Che
     }
   } catch (err) {
     rows.push({ step: "transport-reachability", status: "fail", detail: `daemon unreachable at ${(host as HttpHostEntry).url}: ${(err as Error).message}`, fix: "check tailnet connectivity and that the remote daemon is running (rig daemon start on the host)" });
+    const routeRow = replyRouteThroughDeadEntryRow(host, deps);
+    if (routeRow) rows.push(routeRow);
     return rows;
   }
   rows.push({
@@ -481,8 +565,24 @@ function authPointer(h: HostEntry): string {
   return h.bearer_env ? `env:${h.bearer_env}` : h.bearer_file ? `file:${h.bearer_file}` : "—";
 }
 
+function printHostNextSteps(host: HostEntry): void {
+  console.log(`Verify it: rig host doctor ${host.id}`);
+  if (host.transport !== "http") {
+    console.log("Remote FEED requires an HTTP host entry. Pair its daemon URL with: rig host pair <url>");
+    return;
+  }
+  const key = `feed.subscriptions.${host.id}.enabled`;
+  if (!parseFeedHostSubscriptionKey(key)) {
+    console.log(`For remote FEED, register this host with a different id: '${host.id}' is reserved by feed settings.`);
+    return;
+  }
+  console.log("Remote FEED is off by default. To include this host's attention items, run locally:");
+  console.log(`  rig config set ${key} true`);
+}
+
 export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
   const cmd = new Command("host").description("Manage the multi-host registry (~/.openrig/hosts.yaml)");
+  const rewritesRegistry = "\nIt rewrites ~/.openrig/hosts.yaml from the fields it knows, so comments, formatting, unknown entry keys and other top-level keys aren't kept.";
 
   cmd
     .command("add")
@@ -496,6 +596,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
     .option("--bearer-file <path>", "File PATH holding the bearer token — http transport (optional pointer, never a value; at most one bearer flag)")
     .option("--notes <text>", "Free-form operator note")
     .option("--json", "JSON output")
+    .addHelpText("after", rewritesRegistry)
     .action((opts: { id: string; transport: string; target?: string; user?: string; url?: string; bearerEnv?: string; bearerFile?: string; notes?: string; json?: boolean }) => {
       const rawEntry: Record<string, unknown> = { id: opts.id, transport: opts.transport };
       if (opts.target !== undefined) rawEntry["target"] = opts.target;
@@ -516,7 +617,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         return;
       }
       console.log(`Added host '${res.entry.id}' (${res.entry.transport}) to ${res.path}`);
-      console.log(`Verify it: rig host doctor ${res.entry.id}`);
+      printHostNextSteps(res.entry);
     });
 
   cmd
@@ -618,11 +719,73 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
     });
 
   cmd
+    .command("edit")
+    .description("Edit a host entry (id and transport stay fixed; an empty string clears an optional field)")
+    .argument("<id>", "A registered host id")
+    .option("--target <target>", "SSH target — ssh transport")
+    .option("--user <user>", "SSH user — ssh transport (empty string clears the value)")
+    .option("--url <url>", "Remote daemon base URL — http transport")
+    .option("--notes <text>", "Free-form operator note (empty string clears the value)")
+    .option("--json", "JSON output")
+    .addHelpText("after", rewritesRegistry)
+    .action((id: string, opts: { target?: string; user?: string; url?: string; notes?: string; json?: boolean }) => {
+      const changes: Record<string, unknown> = {};
+      if (opts.target !== undefined) changes["target"] = opts.target;
+      if (opts.user !== undefined) changes["user"] = opts.user;
+      if (opts.url !== undefined) changes["url"] = opts.url;
+      if (opts.notes !== undefined) changes["notes"] = opts.notes;
+
+      const res = updateHostEntry(id.trim(), changes);
+      if (!res.ok) {
+        console.error(res.error);
+        process.exitCode = 1;
+        return;
+      }
+      const wasSelected = readSelectedHost() === res.entry.id;
+      if (opts.json) {
+        console.log(JSON.stringify({ ok: true, path: res.path, entry: res.entry, wasSelected }));
+        return;
+      }
+      console.log(`Updated host '${res.entry.id}' (${res.entry.transport}) at ${res.path}`);
+      for (const key of Object.keys(changes) as string[]) {
+        const rec = (e: HostEntry) => e as unknown as Record<string, unknown>;
+        const before = rec(res.previous)[key];
+        const after = rec(res.entry)[key];
+        if (before !== after) {
+          console.log(`  ${key}: ${before === undefined ? "(unset)" : String(before)} → ${after === undefined ? "(cleared)" : String(after)}`);
+        }
+      }
+      if (wasSelected) console.log(`note: '${res.entry.id}' is the selected host — it was edited in place and the selection still points at it.`);
+    });
+
+  cmd
+    .command("remove")
+    .description("Remove a host entry (deletes only the registry entry — credential files, the learned identity and the selection stay as they are)")
+    .argument("<id>", "A registered host id")
+    .option("--json", "JSON output")
+    .addHelpText("after", rewritesRegistry)
+    .action((id: string, opts: { json?: boolean }) => {
+      const res = removeHostEntry(id.trim());
+      if (!res.ok) {
+        console.error(res.error);
+        process.exitCode = 1;
+        return;
+      }
+      const wasSelected = readSelectedHost() === res.entry.id;
+      if (opts.json) {
+        console.log(JSON.stringify({ ok: true, path: res.path, entry: res.entry, wasSelected }));
+        return;
+      }
+      console.log(`Removed host '${res.entry.id}' (${res.entry.transport}) from ${res.path}`);
+      if (wasSelected) console.log(`note: '${res.entry.id}' was the selected host — the selection still points at '${res.entry.id}' and was NOT changed. Pick another: rig host select <id>`);
+    });
+
+  cmd
     .command("pair")
     .description("Pair with a remote host from one pasted address — one approval on the target, done (FR-6)")
-    .argument("<url>", "The target daemon's address (http[s]://host:port, or host:port)")
+    .argument("<url>", "The target daemon's address (http[s]://host:port, or host:port); that daemon must run with OPENRIG_AUTH_BEARER_TOKEN set")
     .option("--id <id>", "Registry id for the new host (default: derived from the hostname)")
-    .option("--timeout <seconds>", "How long to wait for the target-side approval", "600")
+    .option("--timeout <seconds>", "How long to wait for the target-side approval; the request stays open that long on the target (a target older than this CLI keeps it 10 minutes)", "600")
     .option("--human <address>", "Registered @external approval recipient on the target (required when several exist)")
     .option("--json", "JSON output")
     .action(async (rawUrl: string, opts: { id?: string; timeout?: string; json?: boolean; human?: string }) => {
@@ -694,11 +857,17 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         try { return JSON.parse(s) as Record<string, unknown>; } catch { return {}; }
       };
 
+      // The wait is BOUNDED: a non-finite or overflowing --timeout is clamped to
+      // MAX_PAIR_TIMEOUT_MS, so a target that stops answering can never spin the
+      // retry loop forever. Values that work today keep their wait. The target
+      // keeps the request open as long as this side waits, and its approval says so.
+      const timeoutMs = resolvePairTimeoutMs(opts.timeout);
       let issued: { pairId?: string; code?: string; approvalQitemId?: string; error?: string; message?: string };
       try {
         const res = await httpPost(`${targetBase}/api/hosts/pair-request`, {
           requester: `${userInfo().username}@${osHostname()}`,
           ...(opts.human ? { human: opts.human } : {}),
+          timeoutMs,
         });
         issued = parseJson(res.body) as typeof issued;
         if (res.status !== 200 || !issued.pairId || !issued.code) {
@@ -718,25 +887,25 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         console.log(`On the target: rig queue update ${issued.approvalQitemId ?? "<qitem-id>"} --state done --closure-reason no-follow-on`);
       }
 
-      // The wait is BOUNDED: a non-finite or overflowing --timeout is clamped to
-      // MAX_PAIR_TIMEOUT_MS, so a target that stops answering can never spin the
-      // retry loop forever. Values that work today keep their wait. A note names
-      // the bound actually used so a clamped value is not silently absorbed.
-      const timeoutMs = resolvePairTimeoutMs(opts.timeout);
+      // A note names the bound actually used so a clamped value is not silently absorbed.
       if (!opts.json && timeoutMs === MAX_PAIR_TIMEOUT_MS) {
         console.log(`Waiting up to ~${(MAX_PAIR_TIMEOUT_MS / 86_400_000).toFixed(1)} days for approval on the target (--timeout capped at the maximum).`);
       }
+      // Poll at once, then every 2 s, never sleeping past the deadline: the target keeps the request open only as long
+      // as this side waits, so a short --timeout still sees an approval that's already there.
       const deadline = Date.now() + timeoutMs;
       let outcome: { status?: string; token?: string } = {};
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
+      for (;;) {
         try {
           const res = await deps.httpGet(`${targetBase}/api/hosts/pair-request/${issued.pairId}`);
           outcome = parseJson(res.body) as typeof outcome;
+          if (outcome.status && outcome.status !== "pending") break;
         } catch {
-          continue; // transient poll failure: keep waiting until the deadline
+          // transient poll failure: keep waiting until the deadline
         }
-        if (outcome.status && outcome.status !== "pending") break;
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise((r) => setTimeout(r, Math.min(2000, remaining)));
       }
 
       if (outcome.status !== "approved" || !outcome.token) {
@@ -786,7 +955,7 @@ export function hostCommand(doctorDepsOverride?: DoctorDeps): Command {
         return;
       }
       console.log(`Paired. Host '${id}' registered (${targetBase}, bearer_file ${tokenPath}).`);
-      console.log(`Verify it: rig host doctor ${id}`);
+      printHostNextSteps(added.entry);
     });
 
   cmd

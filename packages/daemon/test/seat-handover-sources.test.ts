@@ -6,12 +6,16 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { DiscoveryRepository } from "../src/domain/discovery-repository.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { SeatHandoverService } from "../src/domain/seat-handover-service.js";
+import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
 import { SEAT_HANDOVER_SOURCE_CAPABILITIES } from "../src/domain/seat-handover-planner.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import { observeCodexSandbox } from "../src/domain/permission-drift.js";
 import { buildRebuildPrimingChain } from "../src/domain/rebuild-priming-chain.js";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
+import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -134,6 +138,31 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
   function nodeRow(nodeId: string) {
     return db.prepare("SELECT continuity_outcome, handover_result FROM nodes WHERE id = ?").get(nodeId) as Record<string, string | null>;
   }
+
+  it("rebuild handover uses the cwd selected through set-cwd for the same seat", async () => {
+    const { node, rig, sessionId } = seedSeat();
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "openrig-handover-cwd-")));
+    const cwd = join(root, "isolated seat");
+    db.prepare(`INSERT INTO node_startup_context
+      (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime)
+      VALUES (?, '[]', '[]', '[]', 'codex')`).run(node.id);
+    const lifecycle = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux(),
+      runtimeAdapters: { codex: { ...codexAdapter(),
+        project: async () => ({ projected: [], skipped: [], failed: [] }),
+        deliverStartup: async () => ({ delivered: 0, failed: [] }),
+      } } });
+    try {
+      expect(await lifecycle.setCwd({ seatRef: "dev-impl@seat-rig", cwd, reason: "isolate workspace" })).toMatchObject({ ok: true });
+      expect(launchHarness).not.toHaveBeenCalled();
+      expect(await service.handover({ seatRef: "dev-impl@seat-rig", source: "rebuild", reason: "carry durable context" })).toMatchObject({ ok: true });
+      expect(respawnPane).toHaveBeenCalledWith("%9", expect.any(String), expect.objectContaining({ cwd }));
+      expect(launchHarness).toHaveBeenCalledWith(expect.objectContaining({ nodeId: node.id, cwd }), expect.any(Object));
+      expect(rigRepo.getRig(rig.id)!.nodes.map(n => n.id)).toEqual([node.id]);
+      expect(sessionRegistry.getSessionsForRig(rig.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: sessionId, status: "superseded" }),
+      ]));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 
   // ── Mini-req 1: FORK EXECUTES ────────────────────────────────────────────
 
@@ -295,7 +324,7 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
       expect(row.executes).toBe(true);
     }
     for (const source of ["fresh", "rebuild", "fork:dev-impl@seat-rig"]) {
-      seedSeat();
+      seedSeat({ resumeToken: "native-abc" });
       const planned = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source, dryRun: true });
       expect(planned.ok).toBe(true);
       if (!planned.ok || !("plan" in planned)) throw new Error("expected plan");
@@ -421,6 +450,34 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
     expect(sessionRegistry.getBindingForNode(node.id)?.tmuxSession).toBe("dev-impl@seat-rig");
     expect(seatPaneRows()).toEqual([expect.objectContaining({ status: "claimed", claimed_node_id: node.id })]);
     expect(respawnPane).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["fresh", "fork:dev-impl@seat-rig", "rebuild"])("%s: the successor is told once of messages held for its seat, and the result names them (#2431)", async (source) => {
+    const { node } = seedSeat(source.startsWith("fork") ? { resumeToken: "native-abc" } : undefined);
+    db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql); // as the guard suites add the held-message store
+    new OutboxHandler(db).retain({ outboxId: "held-1", senderSession: "orch-lead@seat-rig", destinationSession: "dev-impl@seat-rig", body: "Real work for you" },
+      { nodeId: node.id, session: "dev-impl@seat-rig", occupant: null, pane: null });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source });
+
+    const notice = "1 held message was kept for this seat and not delivered: read it with rig seat held-messages dev-impl@seat-rig.";
+    expect(result).toMatchObject({ ok: true, result: { mutated: true, warnings: [notice] } });
+    expect(sendText.mock.calls.filter(([, text]) => text === notice)).toEqual([["dev-impl@seat-rig", notice]]);
+    expect(sendKeys).toHaveBeenLastCalledWith("dev-impl@seat-rig", ["Enter"]);
+  });
+
+  it("discovered: a live session OpenRig didn't launch gets no typed notice, and the result still names the held messages (#2431)", async () => {
+    const { node } = seedSeat();
+    db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql);
+    new OutboxHandler(db).retain({ outboxId: "held-1", senderSession: "orch-lead@seat-rig", destinationSession: "dev-impl@seat-rig", body: "Real work for you" },
+      { nodeId: node.id, session: "dev-impl@seat-rig", occupant: null, pane: null });
+    const discovered = discoveryRepo.upsertDiscoveredSession({ tmuxSession: "successor-session", tmuxPane: "%1", tmuxWindow: "0", runtimeHint: "codex", confidence: "high", cwd: "/project" });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: `discovered:${discovered.id}` });
+
+    expect(result).toMatchObject({ ok: true, result: { mutated: true, warnings: [expect.stringContaining("1 held message was kept for this seat and not delivered")] } });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
   });
 
   it("a seat-pane discovery row claimed by another node still refuses the handover (#237 holds)", async () => {

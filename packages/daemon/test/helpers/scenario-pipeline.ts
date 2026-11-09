@@ -14,7 +14,7 @@
  * suite, not the pure unit tests.
  */
 
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, cpSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
@@ -85,10 +85,15 @@ export function extractStubScripts(env: Record<string, unknown> | undefined): Re
 
 /**
  * A queue-baton precondition (fixture level). The scenario asserts observables;
- * `env.queue` establishes a claimed baton via the SHIPPED `rig queue create|claim`
- * writes BEFORE the steps run — there is no queue action verb, so the baton lives
+ * `env.queue` establishes queue state via the SHIPPED `rig queue ...` writes
+ * BEFORE the steps run — there is no queue action verb, so the fixture lives
  * outside the scenario grammar (per the locked verb set), visibly documented in
  * the scenario file. Queue state is daemon-side, independent of any seat process.
+ *
+ * One entry = one qitem. Applied in this fixed order after `up`:
+ * create → block (`state: "blocked"`) → resolve → claim → unclaim → handoff.
+ * Companions are enforced at extract: unclaim needs claim, resolve needs
+ * state: "blocked", and handoff is exclusive with every other transition.
  */
 export interface QueuePrecondition {
   id: string;
@@ -98,6 +103,17 @@ export interface QueuePrecondition {
   body?: string;
   /** Claim the created qitem so it lands in-progress + owned by `destination`. */
   claim?: boolean;
+  state?: "blocked";
+  blockedOn?: string;
+  tags?: string[];
+  /** Release the claim after it (`rig queue unclaim <id>` as `destination`: in-progress → pending). Requires `claim`. */
+  unclaim?: boolean;
+  /** Unpark decision for `rig queue resolve <id> --decision <text>` as `destination` (blocked → in-progress). Requires `state: "blocked"`. */
+  resolve?: string;
+  /** Destination seat for `rig queue handoff <id> --to <session>` as `destination` (source → handed-off + successor row). Exclusive with claim/unclaim/resolve/blocked. */
+  handoff?: string;
+  /** `--summary` for the handoff's successor row (a handoff never inherits the source's). */
+  handoffSummary?: string;
 }
 
 /** Extract + shape-check the `env.queue` preconditions (loud on a malformed entry). */
@@ -114,6 +130,15 @@ export function extractQueuePreconditions(env: Record<string, unknown> | undefin
         throw new ScenarioPreconditionError(`env.queue[${i}].${key} is required (non-empty string)`);
       }
     }
+    if (e.state !== undefined && e.state !== "blocked") throw new ScenarioPreconditionError("queue state fixture supports blocked only (use claim for in-progress)");
+    if (e.state === "blocked" && (e.claim === true || typeof e.blocked_on !== "string" || !e.blocked_on)) throw new ScenarioPreconditionError("blocked fixture needs blocked_on and cannot also claim");
+    if (e.tags !== undefined && (!Array.isArray(e.tags) || !e.tags.every(t => typeof t === "string" && t))) throw new ScenarioPreconditionError("queue tags fixture must be nonempty strings");
+    if (e.unclaim !== undefined && e.unclaim !== true) throw new ScenarioPreconditionError(`env.queue[${i}].unclaim supports true only`);
+    if (e.unclaim === true && e.claim !== true) throw new ScenarioPreconditionError(`env.queue[${i}].unclaim needs claim: true — only a claimed in-progress row can be unclaimed`);
+    if (e.resolve !== undefined && (typeof e.resolve !== "string" || !e.resolve.trim())) throw new ScenarioPreconditionError(`env.queue[${i}].resolve must be the non-empty decision text passed to \`rig queue resolve --decision\``);
+    if (e.resolve !== undefined && e.state !== "blocked") throw new ScenarioPreconditionError(`env.queue[${i}].resolve needs state: "blocked" — resolve unparks a blocked row to in-progress`);
+    if (e.handoff !== undefined && (typeof e.handoff !== "string" || !e.handoff.trim())) throw new ScenarioPreconditionError(`env.queue[${i}].handoff must be the non-empty destination session passed to \`rig queue handoff --to\``);
+    if (e.handoff !== undefined && (e.claim === true || e.unclaim === true || e.resolve !== undefined || e.state !== undefined)) throw new ScenarioPreconditionError(`env.queue[${i}].handoff is exclusive with claim/unclaim/resolve/blocked — it runs on the plain created row as its owner`);
     return {
       id: e.id as string,
       source: e.source as string,
@@ -121,6 +146,12 @@ export function extractQueuePreconditions(env: Record<string, unknown> | undefin
       summary: typeof e.summary === "string" ? e.summary : undefined,
       body: typeof e.body === "string" ? e.body : undefined,
       claim: e.claim === true,
+      ...(e.state === "blocked" ? { state: "blocked" as const, blockedOn: typeof e.blocked_on === "string" ? e.blocked_on : undefined } : {}),
+      ...(Array.isArray(e.tags) && e.tags.every(t => typeof t === "string") ? { tags: e.tags as string[] } : {}),
+      ...(e.unclaim === true ? { unclaim: true } : {}),
+      ...(e.resolve !== undefined ? { resolve: e.resolve } : {}),
+      ...(e.handoff !== undefined ? { handoff: e.handoff } : {}),
+      ...(typeof e.handoff_summary === "string" && e.handoff_summary ? { handoffSummary: e.handoff_summary } : {}),
     };
   });
 }
@@ -155,11 +186,29 @@ export async function applyQueuePreconditions(
   for (const p of preconditions) {
     const create = await runRig(
       ["queue", "create", "--id", p.id, "--destination", p.destination,
+        ...(p.tags?.length ? ["--tags", p.tags.join(",")] : []),
         "--summary", p.summary ?? p.id, "--body", p.body ?? `51-02 precondition baton ${p.id}`, "--json"],
       { ...ctx.readEnv, OPENRIG_SESSION_NAME: p.source }, ctx.rigBin,
     );
     if (create.code !== 0) {
       throw new ScenarioPreconditionError(`queue create ${p.id} (exit ${create.code}): ${create.stderr || create.stdout}`);
+    }
+    if (p.state === "blocked") {
+      if (!p.blockedOn) throw new ScenarioPreconditionError("blocked queue fixture requires blocked_on");
+      const block = await runRig(["queue", "update", p.id, "--state", "blocked", "--blocked-on", p.blockedOn,
+        "--note", "Scenario parked typed baton", "--json"], { ...ctx.readEnv, OPENRIG_SESSION_NAME: p.destination }, ctx.rigBin);
+      if (block.code !== 0) throw new ScenarioPreconditionError(`queue block ${p.id}: ${block.stderr || block.stdout}`);
+    }
+    if (p.resolve !== undefined) {
+      // Fixture setup, not a delivery assertion: --no-notify keeps the precondition
+      // to the unpark write (blocked → in-progress); the owner nudge is not this row's check.
+      const resolve = await runRig(
+        ["queue", "resolve", p.id, "--decision", p.resolve, "--no-notify", "--json"],
+        { ...ctx.readEnv, OPENRIG_SESSION_NAME: p.destination }, ctx.rigBin,
+      );
+      if (resolve.code !== 0) {
+        throw new ScenarioPreconditionError(`queue resolve ${p.id} (exit ${resolve.code}): ${resolve.stderr || resolve.stdout}`);
+      }
     }
     if (p.claim) {
       const claim = await runRig(
@@ -168,6 +217,28 @@ export async function applyQueuePreconditions(
       );
       if (claim.code !== 0) {
         throw new ScenarioPreconditionError(`queue claim ${p.id} (exit ${claim.code}): ${claim.stderr || claim.stdout}`);
+      }
+    }
+    if (p.unclaim) {
+      const unclaim = await runRig(
+        ["queue", "unclaim", p.id, "--json"],
+        { ...ctx.readEnv, OPENRIG_SESSION_NAME: p.destination }, ctx.rigBin,
+      );
+      if (unclaim.code !== 0) {
+        throw new ScenarioPreconditionError(`queue unclaim ${p.id} (exit ${unclaim.code}): ${unclaim.stderr || unclaim.stdout}`);
+      }
+    }
+    if (p.handoff !== undefined) {
+      // The row's own owner hands off: the route derives the handing-off seat from
+      // the transport header, and `destination` is the created row's destination.
+      const handoff = await runRig(
+        ["queue", "handoff", p.id, "--to", p.handoff,
+          ...(p.handoffSummary ? ["--summary", p.handoffSummary] : []),
+          "--json"],
+        { ...ctx.readEnv, OPENRIG_SESSION_NAME: p.destination }, ctx.rigBin,
+      );
+      if (handoff.code !== 0) {
+        throw new ScenarioPreconditionError(`queue handoff ${p.id} (exit ${handoff.code}): ${handoff.stderr || handoff.stdout}`);
       }
     }
   }
@@ -205,6 +276,19 @@ export function loadScenarioFile(path: string, opts: LoadScenarioOptions = {}): 
   const result = validateScenario(doc, { topologyKind: opts.topologyKind });
   if (!result.ok) return { ok: false, errors: result.errors };
 
+  // Queue preconditions are fixture content too: refuse an invalid env.queue at
+  // the SAME load boundary as any other content problem, so the pure loader
+  // never reports ok:true for a fixture the runner would reject. runScenarioFile
+  // re-extracts below, fail-closed, before any spawn.
+  try {
+    extractQueuePreconditions(result.scenario.env);
+  } catch (err) {
+    if (err instanceof ScenarioPreconditionError) {
+      return { ok: false, errors: [{ code: "QUEUE_PRECONDITION_INVALID", message: err.message, path: "env.queue" }] };
+    }
+    throw err;
+  }
+
   const topologyPath = resolve(dirname(path), result.scenario.topology);
   return { ok: true, loaded: { scenario: result.scenario, topologyPath } };
 }
@@ -216,7 +300,7 @@ export interface RunScenarioFileOptions {
   /** Base environment for the hermetic scaffold (HOME/PATH/TERM). */
   baseEnv?: Record<string, string | undefined>;
   /** Overrides forwarded to buildRealDeps, including an explicit test fault controller. */
-  deps?: Partial<Pick<RealDepsOptions, "now" | "sleep" | "appendRecord" | "defaults" | "normalizer" | "seedRegression">>;
+  deps?: Partial<Pick<RealDepsOptions, "now" | "sleep" | "appendRecord" | "defaults" | "normalizer" | "seedRegression" | "refocusEnv" | "onHookContext">>;
   /**
    * 51-04 opt-in: how the scenario-local daemon is stood up. ABSENT => host-mode,
    * byte-identical to pre-51-04 (`defaultHostDaemon` = spawnScenarioDaemon with rigBin).
@@ -326,6 +410,23 @@ export async function runScenarioFile(
     ...(opts.baseEnv ? { baseEnv: opts.baseEnv } : {}),
     ...(opts.injectClockNow !== undefined ? { injectClockNow: opts.injectClockNow } : {}),
   });
+  if (loaded.loaded.scenario.env?.work_fixture !== undefined && (typeof loaded.loaded.scenario.env.work_fixture !== "string"
+    || !loaded.loaded.scenario.env.work_fixture || loaded.loaded.scenario.env.work_fixture.startsWith("/")
+    || loaded.loaded.scenario.env.work_fixture.split(/[\\/]/).includes(".."))) {
+    scaffold.cleanup();
+    throw new ScenarioPreconditionError("work_fixture must be a nonempty relative fixture directory without traversal");
+  }
+  if (typeof loaded.loaded.scenario.env?.work_fixture === "string") {
+    const workspace = join(scaffold.openrigHome, "workspace");
+    cpSync(resolve(dirname(path), loaded.loaded.scenario.env.work_fixture), workspace, { recursive: true });
+    scaffold.env.OPENRIG_WORKSPACE_ROOT = workspace;
+    // Forward to the actual selected CLI; no canned queue answers.
+    const bin = join(scaffold.root, "hook-bin"); mkdirSync(bin);
+    writeFileSync(join(bin, "rig"), `#!/usr/bin/env node
+const r=require("node:child_process").spawnSync(${JSON.stringify(process.execPath)},[${JSON.stringify(opts.rigBin)},...process.argv.slice(2)],{env:process.env,stdio:"inherit"});process.exit(r.status??1);
+`, { mode: 0o755 });
+    scaffold.env.PATH = `${bin}:${scaffold.env.PATH}`;
+  }
   // Seats launch with cwd under the scaffold so their managed writes (AGENTS.md,
   // the stub sidecar) stay in scratch and never pollute the launch cwd.
   const seatCwd = join(scaffold.root, "seat-cwd");

@@ -100,6 +100,41 @@ describe("archive-only bundle behaviour", () => {
     expect(view).not.toHaveProperty("team");
   });
 
+  it("shows a Claude member's own agent, prompt file and plugin folder before install; a source it doesn't hold is unknown (OPR.0.7.0.9)", () => {
+    const files = fixture();
+    files.set("rig.yaml", files.get("rig.yaml")!.replace("    profile: default\n", "    profile: default\n    agent_file: claude/reviewer.md\n"
+      + "    append_system_prompt_file: claude/house.md\n    plugin_dirs: [claude/plugins/review, claude/plugins/absent, 'claude/plugins/my review/.']\n"));
+    files.set("claude/reviewer.md", "---\nname: code-reviewer\n---\nReview.\n");
+    files.set("claude/house.md", "House rules.\n");
+    files.set("claude/plugins/review/skills/check/SKILL.md", "---\nname: check\n---\nCheck.\n");
+    files.set("claude/plugins/review/hooks/hooks.json", '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"node review-stop.mjs"}]}]}}');
+    files.set("claude/plugins/my review/notes.md", "Notes.\n");
+    const view = inspect(files);
+    if (view.state !== "generated") throw new Error(view.reason);
+    expect(view.toldFiles).toEqual(expect.arrayContaining([
+      expect.objectContaining({ seat: "build.worker", kind: "launch_agent", pathOrRef: "claude/reviewer.md", resolution: "archive" }),
+      expect.objectContaining({ seat: "build.worker", kind: "launch_system_prompt", pathOrRef: "claude/house.md", resolution: "archive" }),
+      expect.objectContaining({ seat: "build.worker", kind: "launch_plugin_dir", pathOrRef: "claude/plugins/review", resolution: "archive" }),
+    ]));
+    expect(view.writes.filter((w) => w.destinationBase === "openrig_seat_storage").map((w) => w.path))
+      .toEqual(["plugin/agents/code-reviewer.md", "additions/system-prompt.md", "additions/plugins/review", "additions/plugins/absent", "additions/plugins/my_review"]);
+    expect(view.alsoRuns).toEqual(expect.arrayContaining([expect.objectContaining({ seat: "build.worker", kind: "hook_command", pathOrRef: "node review-stop.mjs" })]));
+    expect(view.unknownBeforeLaunch).toEqual(expect.arrayContaining([expect.objectContaining({ subject: "claude/plugins/absent", seat: "build.worker" })]));
+  });
+
+  it("names a Claude member's plugin channels as needs before install, and writes nothing for them (#2044)", () => {
+    const files = fixture();
+    files.set("rig.yaml", files.get("rig.yaml")!.replace("    profile: default\n", "    profile: default\n"
+      + "    plugin_channels: [plugin:example-channel@example, plugin:second@example]\n"));
+    const view = inspect(files);
+    if (view.state !== "generated") throw new Error(view.reason);
+    expect(view.needs.filter((need) => need.kind === "claude_plugin_channel")).toEqual(["plugin:example-channel@example", "plugin:second@example"].map((entry, i) => ({
+      seat: "build.worker", kind: "claude_plugin_channel", status: "not_checked",
+      name: `Claude plugin channel ${entry} (--channels): its plugin installed, and the channel admitted by Claude's channel policy`,
+      sourceRefs: [{ path: "rig.yaml", field: `pods.build.members.worker.plugin_channels[${i}]` }] })));
+    expect(view.writes.filter((w) => w.destinationBase === "openrig_seat_storage")).toEqual([]);
+  });
+
   it("never reads host paths and keeps missing selected files explicit", () => {
     const files = fixture();
     files.set("agents/worker/agent.yaml", files.get("agents/worker/agent.yaml")!.replace("path: brief.md", "path: /private/host-context.md"));

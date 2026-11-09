@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { wrapSendBody } from "../src/commands/send.js";
+import { resolveQueueHostDestination } from "../src/commands/queue.js";
 
 describe("wrapSendBody — pre-release CLI/daemon Item 2 (email-style envelope)", () => {
   it("renders From / To / body / reply hint with both session names", () => {
@@ -10,12 +11,58 @@ describe("wrapSendBody — pre-release CLI/daemon Item 2 (email-style envelope)"
     expect(out).toContain('↩ Reply: rig send driver-3@my-rig "..."');
   });
 
+  it.each(["human@kernel", "human@host", "human-alice@kernel", "human-alice@host"])(
+    "gives %s a queue update reply with the existing human-route fields",
+    (sender) => {
+      const body = "Please check this.\nKeep the actor unchanged.";
+      const out = wrapSendBody(sender, "driver@rig", body, { replyToQitem: "qitem-original" });
+      expect(out).toContain(`From: ${sender}\nTo: driver@rig\n`);
+      expect(out.split("\n---\n")[1]).toBe(body);
+      expect(out.split("\n").at(-1)).toBe(`↩ Reply if needed: rig queue create --destination ${sender} --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify`);
+      expect(out).not.toContain(`rig send ${sender}`);
+      expect(out).not.toContain("--reply-to"); // Slack-thread guidance belongs to registered external addresses.
+    },
+  );
+
+  it.each(["human@kernel@host-origin", "human-reviewer@host@host-origin", "alex@external@host-origin"])(
+    "a forwarded person %s gets a queue hint retaining the origin host",
+    (sender) => {
+      const body = "Original body\nkept verbatim.";
+      expect(resolveQueueHostDestination(sender)).toEqual({ ok: true, destination: sender.slice(0, sender.lastIndexOf("@")), hostId: "host-origin" });
+      const out = wrapSendBody(sender, "driver@receiver", body);
+      expect(out).toContain("From: " + sender + "\nTo: driver@receiver\n");
+      expect(out.split("\n---\n")[1]).toBe(body);
+      expect(out.split("\n").at(-1)).toBe("↩ Reply if needed: rig queue create --destination " + sender + ' --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify');
+    },
+  );
+
+  it("keeps host-qualified look-alike seats and malformed human triples on the ordinary hint", () => {
+    for (const sender of ["humanity@kernel@host-origin", "human@real-rig@host-origin", "dev-human@host@host-origin",
+      "human@kernel@", "human@kernel@host-origin@extra"]) {
+      expect(wrapSendBody(sender, "driver@receiver", "hi").split("\n").at(-1))
+        .toBe("↩ Reply: rig send " + sender + ' "..."');
+    }
+  });
+
+  it("keeps similarly named real seats on the ordinary reply route", () => {
+    for (const sender of ["human@my-rig", "humanity@kernel", "dev-human@host", "dev-human@rig@origin-host"]) {
+      expect(wrapSendBody(sender, "driver@rig", "hi").split("\n").at(-1))
+        .toBe(`↩ Reply: rig send ${sender} "..."`);
+    }
+  });
+
   it("routes an external sender's reply through the durable human queue", () => {
     const out = wrapSendBody("decision-maker@external", "driver@rig", "Decision received.");
     expect(out).toContain("From: decision-maker@external");
     expect(out).toContain('↩ Reply if needed: rig queue create --destination decision-maker@external --summary "<one line>" --body "..." --verify');
     expect(out).not.toContain("rig send decision-maker@external");
     expect(wrapSendBody("driver@external-tools", "guard@rig", "Status.")).toContain('↩ Reply: rig send driver@external-tools "..."');
+  });
+
+  it("a person's message that names its row tells the agent how to answer in that Slack thread", () => {
+    const out = wrapSendBody("alex@external", "driver@rig", "Queue handoff: qitem-1 - check your queue.", { replyToQitem: "qitem-1" });
+    expect(out.split("\n").at(-1)).toBe('↩ Reply if needed: rig queue create --destination alex@external --human-intent update --reply-to qitem-1 --summary "<one line>" --body "..." --verify');
+    expect(wrapSendBody("lead@rig", "driver@rig", "hi", { replyToQitem: "qitem-1" }).split("\n").at(-1)).toBe('↩ Reply: rig send lead@rig "..."');
   });
 
   it("preserves the original body verbatim between the dash separators", () => {

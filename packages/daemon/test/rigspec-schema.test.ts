@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { RigSpecSchema, LegacyRigSpecSchema } from "../src/domain/rigspec-schema.js";
+import { RigSpecCodec } from "../src/domain/rigspec-codec.js";
 
 const VALID_RIG = {
   version: "0.2",
@@ -37,6 +38,26 @@ const VALID_RIG = {
 };
 
 describe("RigSpec schema (pod-aware)", () => {
+  it.each(["model", "label"])("rejects non-string member %s values in canonical validation", field => {
+    for (const value of [null, 7, {}, [], true]) {
+      const rig = structuredClone(VALID_RIG);
+      (rig.pods[0]!.members[0] as Record<string, unknown>)[field] = value;
+      const result = RigSpecSchema.validate(rig);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain(`pods[0].members[0].${field}: must be a string`);
+    }
+  });
+
+  it.each(["model", "label"])("keeps optional and string member %s values unchanged", field => {
+    for (const value of [undefined, "", "selected-value"]) {
+      const rig = structuredClone(VALID_RIG);
+      const member = rig.pods[0]!.members[0] as Record<string, unknown>;
+      if (value === undefined) delete member[field]; else member[field] = value;
+      expect(RigSpecSchema.validate(rig).valid).toBe(true);
+      expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]![field as "model" | "label"]).toBe(value);
+    }
+  });
+
   // T1: valid rig with embedded pods passes validation
   it("valid rig with embedded pods passes validation", () => {
     const result = RigSpecSchema.validate(VALID_RIG);
@@ -122,6 +143,44 @@ describe("RigSpec schema (pod-aware)", () => {
     expect(normalized.pods[0]!.members[0]!.effort).toBeUndefined();
   });
 
+  it("advises on an unknown effort for a Pi member only; known levels and model suffixes stay quiet", () => {
+    const withPi = (extra: Record<string, unknown>) => {
+      const rig = structuredClone(VALID_RIG);
+      rig.pods[0]!.members.push({ id: "pi1", agent_ref: "local:agents/pi", profile: "default", runtime: "pi", cwd: ".", ...extra } as never);
+      return RigSpecSchema.validate(rig);
+    };
+    const quiet = withPi({ effort: "high" });
+    expect(quiet.valid).toBe(true);
+    expect((quiet.advisories ?? []).join(" ")).not.toMatch(/effort/);
+    const suffix = withPi({ model: "x/y:low", effort: "high" });
+    expect(suffix.valid).toBe(true);
+    expect((suffix.advisories ?? []).join(" ")).not.toMatch(/effort/);
+    const bad = withPi({ effort: "none" });
+    expect(bad.valid).toBe(true);
+    expect((bad.advisories ?? []).join(" ")).toMatch(/pods\[0\]\.members\[2\]\.effort: "none" isn't a level Pi is known to accept/);
+    expect((bad.advisories ?? []).join(" ")).toContain("the next managed continuation sends it anyway");
+    const flag = withPi({ effort: "--cwd" });
+    expect(flag.valid).toBe(true);
+    expect((flag.advisories ?? []).join(" ")).toMatch(/pods\[0\]\.members\[2\]\.effort: "--cwd" isn't a level Pi is known to accept \([^)]*\); a managed launch leaves it out/);
+    expect((flag.advisories ?? []).join(" ")).not.toContain("sends it anyway");
+    const codex = structuredClone(VALID_RIG);
+    (codex.pods[0]!.members[1] as Record<string, unknown>)["effort"] = "none";
+    expect(RigSpecSchema.validate(codex).advisories ?? []).toEqual([]);
+  });
+
+  it("advises on an unknown effort for a legacy Pi node only", () => {
+    const spec = (runtime: string, effort: string) => ({
+      schema_version: 1, name: "test", version: "1.0",
+      nodes: [{ id: "n", runtime, effort }], edges: [],
+    });
+    expect(LegacyRigSpecSchema.validate(spec("pi", "high")).advisories ?? []).toEqual([]);
+    const bad = LegacyRigSpecSchema.validate(spec("pi", "none"));
+    expect(bad.valid).toBe(true);
+    expect((bad.advisories ?? []).join(" ")).toMatch(/effort: "none" isn't a level Pi is known to accept/);
+    expect((LegacyRigSpecSchema.validate(spec("pi", "high --cwd")).advisories ?? []).join(" ")).toContain("a managed launch leaves it out");
+    expect(LegacyRigSpecSchema.validate(spec("codex", "none")).advisories ?? []).toEqual([]);
+  });
+
   it("rejects codex_config_profile on non-Codex members", () => {
     const rig = structuredClone(VALID_RIG);
     (rig.pods[0]!.members[0] as Record<string, unknown>)["codex_config_profile"] = "sysadmin";
@@ -193,6 +252,23 @@ describe("RigSpec schema (pod-aware)", () => {
     const result = RigSpecSchema.validate(rig);
     expect(result.valid).toBe(false);
     expect(result.errors[0]).toMatch(/duplicate member id "impl"/);
+  });
+
+  it("members in different pods that derive the same session name get a warning", () => {
+    const rig = structuredClone(VALID_RIG);
+    rig.pods[0]!.id = "dev-impl";
+    rig.pods[0]!.members[0]!.id = "main";
+    rig.pods[0]!.edges[0]!.to = "main";
+    rig.edges[0]!.from = "dev-impl.main";
+    rig.pods[1]!.id = "dev";
+    rig.pods[1]!.members[0]!.id = "impl-main";
+    rig.edges[0]!.to = "dev.impl-main";
+    const result = RigSpecSchema.validate(rig);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.advisories).toEqual([
+      'pods[1].members[0].id: session name "dev-impl-main@dev-rig" is already used by member "dev-impl.main"',
+    ]);
   });
 
   // T9: dot in pod id or member id fails
@@ -588,5 +664,305 @@ describe("malformed topology stays a validation result", () => {
     const result = RigSpecSchema.validate({ ...VALID_RIG, pods: [null, VALID_RIG.pods[1]], edges: [{kind:"escalates_to",from:"absent.worker",to:"arch.reviewer"}] });
     expect(result.errors).toContain("pods[0]: must be an object");
     expect(result.errors).toContain('edges[0].from: "absent.worker" does not resolve to a pod member');
+  });
+});
+
+describe("a Claude member's own agent, prompt file and plugin folders (OPR.0.7.0.9)", () => {
+  const withFields = (index: number, fields: Record<string, unknown>) => {
+    const rig = structuredClone(VALID_RIG);
+    Object.assign(rig.pods[0]!.members[index] as Record<string, unknown>, fields);
+    return rig;
+  };
+
+  it("reads the three named settings on a Claude member, as paths beside the spec", () => {
+    const rig = withFields(0, { agent_file: "agents/reviewer.md", append_system_prompt_file: "prompts/house.md", plugin_dirs: ["plugins/review"] });
+    expect(RigSpecSchema.validate(rig).valid).toBe(true);
+    expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]).toMatchObject({
+      agentFile: "agents/reviewer.md", appendSystemPromptFile: "prompts/house.md", pluginDirs: ["plugins/review"] });
+  });
+
+  it("takes an empty plugin_dirs as none", () => {
+    expect(RigSpecSchema.validate(withFields(0, { plugin_dirs: [] })).valid).toBe(true);
+  });
+
+  it("says why it can't take them: another runtime, a path outside the spec's folder, or a malformed list", () => {
+    const errors = (rig: unknown) => RigSpecSchema.validate(rig).errors.join(" | ");
+    expect(errors(withFields(1, { agent_file: "agents/reviewer.md" }))).toMatch(/members\[1\]\.agent_file: only for Claude members/);
+    expect(errors(withFields(0, { append_system_prompt_file: "/etc/prompt.md" }))).toMatch(/append_system_prompt_file: absolute paths are not allowed/);
+    expect(errors(withFields(0, { plugin_dirs: ["../outside"] }))).toMatch(/plugin_dirs\[0\]: path traversal/);
+    expect(errors(withFields(0, { plugin_dirs: "plugins/review" }))).toMatch(/plugin_dirs: must be a list/);
+    expect(errors(withFields(0, { plugin_dirs: ["a", "./a"] }))).toMatch(/plugin_dirs\[1\]: listed twice/);
+    expect(errors(withFields(0, { plugin_dirs: ["x/review", "y/review"] }))).toMatch(/plugin_dirs\[1\]: would be copied where plugin_dirs\[0\] is/);
+  });
+});
+
+describe("a Claude member's own plugin channels (#2044)", () => {
+  const withFields = (index: number, fields: Record<string, unknown>) => {
+    const rig = structuredClone(VALID_RIG);
+    Object.assign(rig.pods[0]!.members[index] as Record<string, unknown>, fields);
+    return rig;
+  };
+  const errors = (rig: unknown) => RigSpecSchema.validate(rig).errors.join(" | ");
+
+  it("reads plugin entries on a Claude member, in order, and the codec writes them back", () => {
+    const rig = withFields(0, { plugin_channels: ["plugin:example-channel@example", "plugin:a.b_c-1@market_place.2"] });
+    expect(RigSpecSchema.validate(rig)).toMatchObject({ valid: true, errors: [] });
+    const member = RigSpecSchema.normalize(rig).pods[0]!.members[0]!;
+    expect(member.pluginChannels).toEqual(["plugin:example-channel@example", "plugin:a.b_c-1@market_place.2"]);
+    const again = RigSpecSchema.normalize(RigSpecCodec.parse(RigSpecCodec.serialize(RigSpecSchema.normalize(rig))) as Record<string, unknown>);
+    expect(again.pods[0]!.members[0]!.pluginChannels).toEqual(member.pluginChannels);
+  });
+
+  it("takes an empty list, or no field, as none", () => {
+    expect(RigSpecSchema.validate(withFields(0, { plugin_channels: [] })).valid).toBe(true);
+    expect(RigSpecSchema.normalize(withFields(0, {})).pods[0]!.members[0]!.pluginChannels).toBeUndefined();
+    expect(RigSpecCodec.serialize(RigSpecSchema.normalize(withFields(0, { plugin_channels: [] })))).not.toContain("plugin_channels");
+  });
+
+  it("is only for Claude members", () => {
+    expect(errors(withFields(1, { plugin_channels: ["plugin:example-channel@example"] }))).toMatch(/members\[1\]\.plugin_channels: only for Claude members/);
+  });
+
+  it("refuses a server entry, a flag, a malformed entry, a non-list and a repeated entry, each by name", () => {
+    expect(errors(withFields(0, { plugin_channels: "plugin:example-channel@example" }))).toMatch(/plugin_channels: must be a list of plugin:<name>@<marketplace> entries/);
+    expect(errors(withFields(0, { plugin_channels: ["server:example"] }))).toMatch(/plugin_channels\[0\]: "server:example" is a server entry; only plugin:<name>@<marketplace> entries are supported/);
+    for (const bad of ["--dangerously-load-development-channels", "plugin:no-marketplace", "plugin:@market", "plugin:name@", "example",
+      "plugin:a@b --settings", "plugin:a@b;x", "plugin:a b@c", "", 7, null]) {
+      expect(errors(withFields(0, { plugin_channels: ["plugin:ok@market", bad] })), JSON.stringify(bad)).toMatch(/plugin_channels\[1\]: must be plugin:<name>@<marketplace>/);
+    }
+    expect(errors(withFields(0, { plugin_channels: ["plugin:a@b", "plugin:a@b"] }))).toMatch(/plugin_channels\[1\]: listed twice \("plugin:a@b"\)/);
+  });
+
+  it("warns about channels beside claude_mcp: none, keeps both settings, and accepts the spec", () => {
+    const rig = withFields(0, { plugin_channels: ["plugin:a@b"], claude_mcp: "none" });
+    const before = structuredClone(rig);
+    expect(RigSpecSchema.validate(rig)).toEqual({ valid: true, errors: [], advisories: [
+      'pods[0].members[0].plugin_channels: claude_mcp is "none", which starts Claude without MCP servers (plugin servers included), so no channel could register; remove claude_mcp: none to use the channels, or remove plugin_channels to keep the MCP opt-out',
+    ] });
+    expect(rig).toEqual(before);
+    expect(RigSpecSchema.normalize(rig).pods[0]!.members[0]).toMatchObject({ pluginChannels: ["plugin:a@b"], claudeMcp: "none" });
+  });
+
+  it.each([
+    { plugin_channels: [], claude_mcp: "none" },
+    { claude_mcp: "none" },
+    { plugin_channels: ["plugin:a@b"] },
+  ])("does not warn when channels and the MCP opt-out do not conflict: %j", fields => {
+    const result = RigSpecSchema.validate(withFields(0, fields));
+    expect(result).toMatchObject({ valid: true, errors: [] });
+    expect(result.advisories ?? []).toEqual([]);
+  });
+});
+
+describe("member launch_wrapper (#2328)", () => {
+  const withMember = (runtime: string, fields: Record<string, unknown>) => ({
+    version: "0.2",
+    name: "wrapper-rig",
+    pods: [
+      {
+        id: "dev",
+        label: "Dev",
+        members: [
+          {
+            id: "worker",
+            agent_ref: "local:agents/worker",
+            profile: "default",
+            runtime,
+            cwd: ".",
+            ...fields,
+          },
+        ],
+        edges: [],
+      },
+    ],
+    edges: [],
+  });
+
+  it.each(["pi", "codex", "claude-code"])("accepts literal argv with bare or absolute executable, empty non-executable args, spaces and metacharacters on %s", (runtime) => {
+    const argv = ["mtn", "sandbox", "exec", "", "--flag='quoted $VAR ; | &'", "--"];
+    const spec = withMember(runtime, { launch_wrapper: argv });
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const normalized = RigSpecSchema.normalize(spec);
+    expect(normalized.pods[0]!.members[0]!.launchWrapper).toEqual(argv);
+
+    const absArgv = ["/usr/local/bin/mtn-wrapper", "--seat", "miles"];
+    const absSpec = withMember(runtime, { launch_wrapper: absArgv });
+    expect(RigSpecSchema.validate(absSpec)).toEqual({ valid: true, errors: [] });
+    expect(RigSpecSchema.normalize(absSpec).pods[0]!.members[0]!.launchWrapper).toEqual(absArgv);
+
+    const dotSegmentArgv = ["/a/../b", "--flag"];
+    const dotSegmentSpec = withMember(runtime, { launch_wrapper: dotSegmentArgv });
+    expect(RigSpecSchema.validate(dotSegmentSpec)).toEqual({ valid: true, errors: [] });
+    expect(RigSpecSchema.normalize(dotSegmentSpec).pods[0]!.members[0]!.launchWrapper).toEqual(dotSegmentArgv);
+  });
+
+  it.each(["pi", "codex", "claude-code"])("accepts [] as explicit clear on %s and retains [] in normalize", (runtime) => {
+    const spec = withMember(runtime, { launch_wrapper: [] });
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const member = RigSpecSchema.normalize(spec).pods[0]!.members[0]!;
+    expect(member.launchWrapper).toEqual([]);
+  });
+
+  it("omits launchWrapper when launch_wrapper is absent", () => {
+    const spec = withMember("codex", {});
+    expect(RigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const member = RigSpecSchema.normalize(spec).pods[0]!.members[0]!;
+    expect(member.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in member).toBe(false);
+  });
+
+  it.each(["omp", "terminal", "stub"])("rejects launch_wrapper (including []) on unsupported runtime %s", (runtime) => {
+    for (const value of [["mtn", "--"], []]) {
+      const result = RigSpecSchema.validate(withMember(runtime, { launch_wrapper: value }));
+      expect(result.valid).toBe(false);
+      expect(result.errors.join(" ")).toMatch(/launch_wrapper.*(?:pi|codex)/i);
+    }
+  });
+
+  it("rejects launch_wrapper at rig or pod level", () => {
+    const rigLevel = { ...withMember("codex", {}), launch_wrapper: ["mtn"] };
+    expect(RigSpecSchema.validate(rigLevel).valid).toBe(false);
+    const podLevel = withMember("codex", {});
+    (podLevel.pods[0] as Record<string, unknown>)["launch_wrapper"] = ["mtn"];
+    expect(RigSpecSchema.validate(podLevel).valid).toBe(false);
+  });
+
+  it("rejects invalid launch_wrapper values (bad types, empty/relative executable, NUL/CR/LF, non-string elements)", () => {
+    const invalidValues: unknown[] = [
+      null,
+      "mtn --",
+      42,
+      true,
+      { executable: "mtn" },
+      [""],
+      ["   "],
+      ["", "--"],
+      ["./wrapper"],
+      ["../wrapper"],
+      ["bin/wrapper"],
+      ["~/wrapper"],
+      ["wrap\0per"],
+      ["wrap\nper"],
+      ["wrap\rper"],
+      ["mtn", "bad\0arg"],
+      ["mtn", "bad\narg"],
+      ["mtn", "bad\rarg"],
+      ["mtn", 123],
+      ["mtn", null],
+    ];
+    for (const badValue of invalidValues) {
+      const result = RigSpecSchema.validate(withMember("codex", { launch_wrapper: badValue }));
+      expect(result.valid, JSON.stringify(badValue)).toBe(false);
+      expect(result.errors.join(" "), JSON.stringify(badValue)).toContain("launch_wrapper");
+      expect(result.errors.join(" "), JSON.stringify(badValue)).not.toContain("unknown key");
+    }
+  });
+
+  it("exposes domain helper contracts for validation, stored parsing, and equality", async () => {
+    const { validateLaunchWrapper, parseStoredLaunchWrapper, sameLaunchWrapper } = await import("../src/domain/launch-wrapper.js");
+    expect(validateLaunchWrapper([])).toEqual([]);
+    expect(validateLaunchWrapper(["mtn", "", "--"])).toEqual(["mtn", "", "--"]);
+    expect(validateLaunchWrapper(["/a/../b", "--"])).toEqual(["/a/../b", "--"]);
+    expect(parseStoredLaunchWrapper(null)).toBeUndefined();
+    expect(parseStoredLaunchWrapper(undefined)).toBeUndefined();
+    expect(parseStoredLaunchWrapper('["mtn","--"]')).toEqual(["mtn", "--"]);
+    for (const invalidStored of ["", "not-json", "null", "[]", "{}", '"mtn"', '[""]', '["./rel"]', '["a\\nb"]', 123]) {
+      expect(() => parseStoredLaunchWrapper(invalidStored)).toThrow();
+    }
+    expect(sameLaunchWrapper(undefined, null)).toBe(true);
+    expect(sameLaunchWrapper([], null)).toBe(true);
+    expect(sameLaunchWrapper([], undefined)).toBe(true);
+    expect(sameLaunchWrapper([], [])).toBe(true);
+    expect(sameLaunchWrapper(["mtn", "--"], ["mtn", "--"])).toBe(true);
+    expect(sameLaunchWrapper(["mtn", "--"], ["mtn"])).toBe(false);
+    expect(sameLaunchWrapper(["mtn"], [])).toBe(false);
+    expect(sameLaunchWrapper(["mtn"], null)).toBe(false);
+  });
+});
+
+describe("legacy flat node launch_wrapper (#2328)", () => {
+  const withLegacyNode = (runtime: string, fields: Record<string, unknown>) => ({
+    schema_version: 1,
+    name: "legacy-wrapper-rig",
+    version: "1.0.0",
+    nodes: [
+      {
+        id: "worker",
+        runtime,
+        cwd: "/workspace",
+        ...fields,
+      },
+    ],
+    edges: [],
+  });
+
+  it.each(["pi", "codex", "claude-code"])("accepts literal argv with bare, absolute, or dot-segment executable, empty non-executable args, spaces and metacharacters on flat %s node", (runtime) => {
+    const argv = ["mtn", "sandbox", "exec", "", "--flag='quoted $VAR ; | &'", "--"];
+    const spec = withLegacyNode(runtime, { launch_wrapper: argv });
+    expect(LegacyRigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const normalized = LegacyRigSpecSchema.normalize(spec);
+    expect(normalized.nodes[0]!.launchWrapper).toEqual(argv);
+
+    const absArgv = ["/usr/local/bin/mtn-wrapper", "--seat", "miles"];
+    const absSpec = withLegacyNode(runtime, { launch_wrapper: absArgv });
+    expect(LegacyRigSpecSchema.validate(absSpec)).toEqual({ valid: true, errors: [] });
+    expect(LegacyRigSpecSchema.normalize(absSpec).nodes[0]!.launchWrapper).toEqual(absArgv);
+
+    const dotSegmentArgv = ["/a/../b", "--flag"];
+    const dotSegmentSpec = withLegacyNode(runtime, { launch_wrapper: dotSegmentArgv });
+    expect(LegacyRigSpecSchema.validate(dotSegmentSpec)).toEqual({ valid: true, errors: [] });
+    expect(LegacyRigSpecSchema.normalize(dotSegmentSpec).nodes[0]!.launchWrapper).toEqual(dotSegmentArgv);
+  });
+
+  it.each(["pi", "codex", "claude-code"])("accepts [] as explicit clear on flat %s node and retains [] in normalize", (runtime) => {
+    const spec = withLegacyNode(runtime, { launch_wrapper: [] });
+    expect(LegacyRigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const node = LegacyRigSpecSchema.normalize(spec).nodes[0]!;
+    expect(node.launchWrapper).toEqual([]);
+  });
+
+  it.each(["pi", "codex", "claude-code"])("omits launchWrapper when launch_wrapper is absent on flat %s node", (runtime) => {
+    const spec = withLegacyNode(runtime, {});
+    expect(LegacyRigSpecSchema.validate(spec)).toEqual({ valid: true, errors: [] });
+    const node = LegacyRigSpecSchema.normalize(spec).nodes[0]!;
+    expect(node.launchWrapper).toBeUndefined();
+    expect("launchWrapper" in node).toBe(false);
+  });
+
+  it.each(["omp", "terminal", "stub"])("rejects launch_wrapper (including []) on unsupported flat runtime %s", (runtime) => {
+    for (const value of [["mtn", "--"], []]) {
+      const result = LegacyRigSpecSchema.validate(withLegacyNode(runtime, { launch_wrapper: value }));
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContain('nodes.worker.launch_wrapper: only valid when runtime is "pi", "codex" or "claude-code"');
+    }
+  });
+
+  it("rejects invalid launch_wrapper values on flat nodes (null, non-array, empty/relative executable, NUL/CR/LF, non-string elements)", () => {
+    const invalidValues: unknown[] = [
+      null,
+      "mtn --",
+      42,
+      true,
+      { executable: "mtn" },
+      [""],
+      ["   "],
+      ["", "--"],
+      ["./wrapper"],
+      ["../wrapper"],
+      ["bin/wrapper"],
+      ["wrap\0per"],
+      ["wrap\nper"],
+      ["wrap\rper"],
+      ["mtn", "bad\0arg"],
+      ["mtn", "bad\narg"],
+      ["mtn", "bad\rarg"],
+      ["mtn", 123],
+      ["mtn", null],
+    ];
+    for (const badValue of invalidValues) {
+      const result = LegacyRigSpecSchema.validate(withLegacyNode("codex", { launch_wrapper: badValue }));
+      expect(result.valid, JSON.stringify(badValue)).toBe(false);
+      expect(result.errors.join(" "), JSON.stringify(badValue)).toContain("nodes.worker.launch_wrapper");
+    }
   });
 });

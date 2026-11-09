@@ -28,6 +28,17 @@ Two rules matter most for strangers:
   manifest and consumers show a notice; anyone with the bundle could read those files.
   Unrecorded login files and other sensitive paths still fail. See [harness login files](rig-bundle.md#harness-login-files).
 
+To start from a running team, use `rig export <team> -o ./my-team/rig.yaml` after creating `my-team`.
+Export keeps the rig's name, including an old `starter` name; choose a descriptive `name` in `rig.yaml`
+before sharing. `rig bundle create --name` names the archive, not the installed rig.
+For a local daemon, export copies the declared culture file from its recorded rig root and keeps any
+existing destination file. Check that file before sharing. A missing, inaccessible or remote source is
+reported for manual copying. If the daemon is reached through a localhost tunnel, copy the culture from
+that host and check it yourself. Agent refs outside the folder are reported as nonportable: copy those agents and their
+imports into the folder and use `local:` refs, or let `rig bundle create --rig-root <original-root>` vendor
+agents into an archive. To include an existing README, declare `docs: [{ path: README.md }]` in `rig.yaml`;
+export does not invent a README or its contents. Check the folder after these edits.
+
 Two optional files sit beside `rig.yaml`:
 - **`bundle.yaml`** declares what people need before installing: setup steps (`preconditions`, shown before install
   and never run), the oldest OpenRig that works (`compatibility.min_cli_version`), and skills shared by several
@@ -109,6 +120,11 @@ or **"Not tested by OpenRig"**, which means exactly that. You're welcome to run 
 
 ## 6. Submit it to openrig.dev/rigs
 
+Before you submit, run `rig bundle check` on the folder at the commit you'll submit. openrig-registry's registry check
+runs the same check, with the latest published OpenRig, on the folder at your `ref`, and any finding fails it. A team
+made with `rig export` has no README of its own: add one and declare it in `rig.yaml` as `docs: [{ path: README.md }]`
+(see [section 1](#1-lay-out-the-folder)).
+
 Open a pull request to [mvschwarz/openrig-registry](https://github.com/mvschwarz/openrig-registry) that adds one file,
 `registry/submissions/<your-team>.yaml`, with three fields: `repository` (your GitHub repository URL), `folder` (the
 folder holding `rig.yaml`, or `.` for the repository root) and `ref` (a branch, tag or commit). No pull requests? Open
@@ -116,8 +132,11 @@ an issue there with the same three things. A maintainer then writes the full ent
 defined in the [bundle formats reference](bundle-formats.md), with the parts only a review can produce, such as the
 pinned commit and each configuration's package digest.
 
-Rig names are unique on the site. If `registry/<your-team>.yaml` already exists, openrig-registry's registry check says the name is taken;
-choose a distinct one, for example `<taken-name>-<your-name>`.
+Rig names are unique on the site. If `registry/<your-team>.yaml` already exists, openrig-registry's registry check
+still replies that your submission was received, and says the name is taken; choose a distinct one, for example
+`<taken-name>-<your-name>`. A team whose `rig.yaml` name matches a listed team's, such as an unchanged copy of one,
+passes the checks with a notice for the maintainer about the shared name. Whether it's listed is the maintainer's
+review decision, not the checks'.
 
 What happens next:
 - a maintainer pins your link to an exact commit, runs the same check, and reads everything your bundle gives to an

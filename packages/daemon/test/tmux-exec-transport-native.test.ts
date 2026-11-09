@@ -30,6 +30,8 @@ async function spawnedFiles(fn: () => Promise<void>): Promise<string[]> {
 async function scenario(mode: "shell" | "argv") {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-exec-"));
   roots.push(root);
+  // Exercise input arriving while a login shell is still starting, without relying on host profile timing.
+  fs.writeFileSync(path.join(root, ".profile"), "sleep 1\nPS1='openrig-ready> '\n");
   const serverDir = path.join(root, "server");
   const emptyDir = path.join(root, "empty");
   fs.mkdirSync(serverDir);
@@ -49,6 +51,15 @@ async function scenario(mode: "shell" | "argv") {
     const files = await spawnedFiles(async () => {
       const created = await adapter.createSession("seat a", root);
       const duplicate = await adapter.createSession("seat a", root);
+      // Wait for the fixture's /bin/sh login prompt. Input typed during system profile startup can be echoed before
+      // the prompt and put the command's output on the prompt line, even though the command succeeds.
+      let shellReady = false;
+      for (let i = 0; i < 200; i++) {
+        const screen = await adapter.capturePaneContent("seat a", 50);
+        if (screen && /(?:^|\n)openrig-ready>$/.test(screen.trimEnd())) { shellReady = true; break; }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(shellReady, "fixture shell did not reach its prompt").toBe(true);
       const typed = await adapter.sendText("seat a", "echo 'openrig-'native", undefined, { bracketed: false });
       const entered = await adapter.sendKeys("seat a", ["Enter"]);
       // The quotes keep the typed line from matching: only the command's output contains the marker.
@@ -116,14 +127,17 @@ describe.skipIf(!nativeAvailable)("tmux shell and argv transports against a real
       noServerSessions: [],
     });
     expect(shell.result.captured).toEqual(["openrig-native"]);
-    // The first line names the command, which each transport renders its own way; the tmux stderr after it,
-    // which every error classifier reads, is the same apart from each run's private directory.
+    for (const run of [shell, argv]) {
+      expect(run.result.noServerCause).toMatch(/^(no server running on|error connecting to) /);
+    }
+    // Write errors retain a command-wrapper line; a probe cause is already tmux's own stderr.
+    // Compare both transports after normalizing only each run's private directory.
     const stderr = ({ result: r, root }: typeof shell) => {
       const tail = (message: string) => message.split("\n").slice(1).join("\n").replaceAll(root, "<root>").trim();
       return {
         missingKill: tail((r.missingKill as { message: string }).message),
         missingKeys: `${(r.missingKeys as { code: string }).code}: ${tail((r.missingKeys as { message: string }).message)}`,
-        noServerCause: tail(r.noServerCause as string),
+        noServerCause: (r.noServerCause as string).replaceAll(root, "<root>").trim(),
       };
     };
     expect(stderr(argv)).toEqual(stderr(shell));

@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -6,22 +9,94 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { SeatStatusService } from "../src/domain/seat-status-service.js";
 import { PodRepository } from "../src/domain/pod-repository.js";
 import { SeatIdentityStore } from "../src/domain/seat-identity-store.js";
+import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
+import { EventBus } from "../src/domain/event-bus.js";
 
 describe("SeatStatusService", () => {
   let db: Database.Database;
   let rigRepo: RigRepository;
   let sessionRegistry: SessionRegistry;
   let service: SeatStatusService;
+  let activityStore: AgentActivityStore;
 
   beforeEach(() => {
     db = createFullTestDb();
     rigRepo = new RigRepository(db);
     sessionRegistry = new SessionRegistry(db);
-    service = new SeatStatusService({ rigRepo });
+    activityStore = new AgentActivityStore({ db, eventBus: new EventBus(db),
+      resolveOccupantGeneration: id => sessionRegistry.currentOccupantTenure(id)?.generationUuid ?? null,
+      isRegisteredOccupantGeneration: (id, generation) => sessionRegistry.isOccupantGenerationRegistered(id, generation) });
+    service = new SeatStatusService({ rigRepo, activityStore });
   });
 
   afterEach(() => {
     db.close();
+  });
+
+  it("does not attach a last tool, another actor's prompt or completed activity to a permission diagnostic", () => {
+    const rig = rigRepo.createRig("permission-status");
+    const node = rigRepo.addNode(rig.id, "worker", { runtime: "claude-code" });
+    const other = rigRepo.addNode(rig.id, "other", { runtime: "claude-code" });
+    const session = sessionRegistry.registerSession(node.id, "worker@permission-status");
+    sessionRegistry.registerSession(other.id, "other@permission-status");
+    sessionRegistry.updateStatus(session.id, "running");
+    const store = activityStore;
+    const generation = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
+    const observedAt = new Date().toISOString();
+    store.observePermissionStop({ nodeId: node.id, sessionName: session.sessionName, generation,
+      actor: null, at: observedAt, command: "Tool: Read", completed: false });
+    expect(service.getStatus(session.sessionName)).toMatchObject({ ok: true, status: {
+      permission_stop: { state: "request_observed", command: "Tool: Read", actor: "main", pending: "unknown" },
+    } });
+    sessionRegistry.mintOccupantTenure(node.id, "handover");
+    expect(store.recordHookEvent({ runtime: "claude-code", sessionName: session.sessionName,
+      hookEvent: "PreToolUse", subtype: "SYNTHETIC_PRIVATE_TOOL", generation: "old-generation" }).ok).toBe(true);
+    expect(store.recordHookEvent({ runtime: "claude-code", sessionName: "other@permission-status",
+      hookEvent: "Notification", subtype: "permission_prompt", hookAgentId: "another-actor" }).ok).toBe(true);
+    const unavailable = { state: "unavailable", command: "unavailable", origin: "unknown" };
+    const read = () => {
+      const before = db.prepare("SELECT total_changes() AS count").get();
+      const result = service.getStatus(session.sessionName);
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.message);
+      expect(result.status.permission_stop).toEqual(unavailable);
+      expect(JSON.stringify(result.status)).not.toContain("SYNTHETIC_PRIVATE_TOOL");
+      expect(db.prepare("SELECT total_changes() AS count").get()).toEqual(before);
+      return result.status;
+    };
+    expect(read().occupant_lifecycle).toBe("active");
+    expect(store.recordHookEvent({ runtime: "claude-code", sessionName: session.sessionName,
+      hookEvent: "Notification", subtype: "permission_prompt", hookAgentId: "subagent" }).ok).toBe(true);
+    expect(store.recordHookEvent({ runtime: "claude-code", sessionName: session.sessionName,
+      hookEvent: "PostToolBatch", hookAgentId: null }).ok).toBe(true);
+    read();
+    const currentGeneration = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
+    store.observePermissionStop({ nodeId: node.id, sessionName: session.sessionName, generation: currentGeneration,
+      actor: null, at: new Date().toISOString(), command: "Tool: Write", completed: false });
+    expect(service.getStatus(session.sessionName)).toMatchObject({ ok: true, status: {
+      permission_stop: { state: "request_observed", command: "Tool: Write" },
+    } });
+    db.prepare("UPDATE nodes SET occupant_lifecycle = 'retired' WHERE id = ?").run(node.id);
+    expect(read().occupant_lifecycle).toBe("retired");
+    db.prepare("UPDATE nodes SET occupant_lifecycle = 'active' WHERE id = ?").run(node.id);
+    store.observePermissionStop({ nodeId: node.id, sessionName: session.sessionName, generation: currentGeneration,
+      actor: null, at: new Date().toISOString(), command: "Tool: Edit", completed: false });
+    expect(service.getStatus(session.sessionName)).toMatchObject({ ok: true, status: {
+      permission_stop: { state: "request_observed", command: "Tool: Edit" },
+    } });
+    sessionRegistry.updateStatus(session.id, "exited");
+    expect(read().session_status).toBe("exited");
+  });
+
+  it("shows an owed restore's delivery failure on the same seat status the operator reads", () => {
+    const rig = rigRepo.createRig("restore-status");
+    const node = rigRepo.addNode(rig.id, "writer", { runtime: "claude-code" });
+    const session = sessionRegistry.registerSession(node.id, "writer@restore-status");
+    sessionRegistry.updateStatus(session.id, "running");
+    const owedRestore = { stage: "turn_boundary" as const, held: true, detail: "OpenRig owes the turn boundary. Last delivery: target_activity_unknown." };
+    const observer = { recoverSeat: () => {}, observedCompaction: () => ({ stage: "compacting" as const, detail: owedRestore.detail }), getOwedRestore: () => owedRestore };
+    const status = new SeatStatusService({ rigRepo, compactionEnforcer: observer }).getStatus(session.sessionName);
+    expect(status.ok && status.status.compaction).toEqual({ stage: "compacting", detail: owedRestore.detail, owedRestore });
   });
 
   it("reports a confirmed missing current session as detached while preserving its registration", async () => {
@@ -48,6 +123,62 @@ describe("SeatStatusService", () => {
     expect(db.prepare("SELECT * FROM sessions WHERE id = ?").get(session.id)).toEqual(stored);
   });
 
+  it("reports the runtime home a Claude or Codex seat's launches use, and where it comes from", () => {
+    const rig = rigRepo.createRig("home-rig");
+    const nodes = {
+      own: rigRepo.addNode(rig.id, "dev.own", { runtime: "codex" }),
+      rel: rigRepo.addNode(rig.id, "dev.rel", { runtime: "codex" }),
+      plain: rigRepo.addNode(rig.id, "dev.plain", { runtime: "claude-code" }),
+      pi: rigRepo.addNode(rig.id, "dev.pi", { runtime: "pi" }),
+      term: rigRepo.addNode(rig.id, "dev.term", { runtime: "terminal" }),
+    };
+    for (const [name, node] of Object.entries(nodes)) sessionRegistry.registerSession(node.id, `dev-${name}@home-rig`);
+    db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?").run(JSON.stringify({ CODEX_HOME: "/homes/own" }), nodes.own.id);
+    db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?").run(JSON.stringify({ CODEX_HOME: "rel/codex" }), nodes.rel.id);
+    const svc = new SeatStatusService({ rigRepo, env: { HOME: "/users/op", CODEX_HOME: "/daemon/codex", PI_CODING_AGENT_DIR: "/daemon/pi-ignored" } });
+    const status = (ref: string) => {
+      const result = svc.getStatus(ref);
+      if (!result.ok) throw new Error(result.code);
+      return result.status;
+    };
+    expect(status("dev-own@home-rig").runtime_home).toEqual({ variable: "CODEX_HOME", home: "/homes/own", source: "member" });
+    expect(status("dev-rel@home-rig").runtime_home).toEqual({ variable: "CODEX_HOME", home: "/daemon/codex", source: "daemon",
+      ignored: { source: "member", value: "rel/codex" } });
+    expect(status("dev-plain@home-rig").runtime_home).toEqual({ variable: "CLAUDE_CONFIG_DIR", home: "/users/op/.claude", source: "native_default" });
+    expect(status("dev-pi@home-rig").runtime_home).toEqual({ variable: "PI_CODING_AGENT_DIR", home: null, source: "native_default" });
+    expect(status("dev-term@home-rig")).not.toHaveProperty("runtime_home");
+  });
+
+  it("names a Claude seat's own subscription token by its label and file, and says when that file wouldn't apply at the next launch", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "seat-token-status-"));
+    try {
+      const ready = path.join(dir, "ready");
+      writeFileSync(ready, "fixture-file-contents", { mode: 0o600 });
+      const rig = rigRepo.createRig("token-rig");
+      const nodes = {
+        ok: rigRepo.addNode(rig.id, "dev.ok", { runtime: "claude-code" }),
+        missing: rigRepo.addNode(rig.id, "dev.missing", { runtime: "claude-code" }),
+        none: rigRepo.addNode(rig.id, "dev.none", { runtime: "claude-code" }),
+      };
+      for (const [name, node] of Object.entries(nodes)) sessionRegistry.registerSession(node.id, `dev-${name}@token-rig`);
+      rigRepo.setNodeClaudeTokenRef(nodes.ok.id, { label: "work", tokenFile: ready });
+      rigRepo.setNodeClaudeTokenRef(nodes.missing.id, { label: "personal", tokenFile: path.join(dir, "gone") });
+      const status = (ref: string) => {
+        const result = service.getStatus(ref);
+        if (!result.ok) throw new Error(result.code);
+        return result.status;
+      };
+      expect(status("dev-ok@token-rig").claude_token).toEqual({ label: "work", token_file: ready, file: "readable" });
+      expect(status("dev-missing@token-rig").claude_token).toMatchObject({ label: "personal", token_file: path.join(dir, "gone"),
+        file: "unusable", problem: expect.stringContaining("doesn't exist"), notice: expect.stringContaining("wasn't applied") });
+      expect(status("dev-none@token-rig")).not.toHaveProperty("claude_token");
+      // The file is checked, never read: its contents appear nowhere.
+      expect(JSON.stringify(status("dev-ok@token-rig"))).not.toContain("fixture-file-contents");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns honest no-handover defaults for an existing active node", () => {
     const rig = rigRepo.createRig("seat-rig");
     const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex", cwd: "/project" });
@@ -60,6 +191,7 @@ describe("SeatStatusService", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.message);
     expect(result.status).toMatchObject({
+      permission_stop: { state: "unavailable", command: "unavailable", origin: "unknown" },
       seat_ref: "dev-impl@seat-rig",
       rig_name: "seat-rig",
       logical_id: "dev.impl",
@@ -179,6 +311,7 @@ describe("SeatStatusService", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toMatchObject({
+      permission_stop: { state: "unavailable", command: "unavailable", origin: "unknown" },
       seat_ref: "dev-impl@seat-rig",
       rig_name: "seat-rig",
       logical_id: "dev.impl",

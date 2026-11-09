@@ -57,12 +57,14 @@ export interface StuckExceptionDeps {
    *  spec not cached; registered-human selection applies.
    *  OPR.0.4.6.FAC1 (arch Q3): boundRig = the stuck instance's bound
    *  rig (read from workflow_instances at detection time) so the
-   *  orchestrator-role dial position resolves capability-aware. */
+   *  orchestrator-role dial position resolves capability-aware.
+   *  instanceId (#2607) = the stuck instance, so the route comes from the spec that instance runs. */
   resolveRoute: (
     workflowName: string,
     workflowVersion: string,
     exceptionClass: WorkflowExceptionClass,
     boundRig?: string | null,
+    instanceId?: string,
   ) => ExceptionRoute | null;
   humanFallbackSeat?: WorkflowHumanDestination;
   log?: (line: string) => void;
@@ -74,7 +76,8 @@ export function makeEnsureStuckExceptionItem(deps: StuckExceptionDeps): EnsureSt
     const exception = classifyDeadlineVerdict(input.workflowName, input.verdict);
     if (!exception) return { outcome: "skipped-healthy" };
 
-    const previous = findQueueRecovery(deps.db, exception.deadlineEvidence!.packetId);
+    // A delivery failure notice at the sender does not own the workflow exception route.
+    const previous = findQueueRecovery(deps.db, exception.deadlineEvidence!.packetId, "slack-undeliverable");
     if (previous) return { outcome: "deduped", qitemId: previous.qitemId };
 
     // Honor historical occurrence rows, including their closed disposition.
@@ -115,7 +118,7 @@ export function makeEnsureStuckExceptionItem(deps: StuckExceptionDeps): EnsureSt
       detectionBoundRig = row?.bound_rig ?? null;
     }
     const route =
-      deps.resolveRoute(input.workflowName, input.workflowVersion, "stuck_overdue", detectionBoundRig) ?? {
+      deps.resolveRoute(input.workflowName, input.workflowVersion, "stuck_overdue", detectionBoundRig, stuckInstanceId) ?? {
         position: "fallback" as const,
         destinationSession: workflowHumanDestination(deps.humanFallbackSeat),
         tier: "human-gate",
@@ -134,26 +137,30 @@ export function makeEnsureStuckExceptionItem(deps: StuckExceptionDeps): EnsureSt
       `evidence: ${evidenceRef}\n` +
       `resolve: inspect the current owner and deadline; packet age alone does not establish idle. This item clears when the instance leaves the exception state.`;
     const scopeTags = packetScopeTags(readInstanceScope(deps.db, e.instanceId), e.stepId);
-    const createItem = (destination: string, tier: string) =>
+    // Routed to the person, a stuck workflow is an approval whose wait costs now: alert them.
+    const createItem = (destination: string, tier: string, toPerson: boolean) =>
       deps.queueRepo.create({
         qitemId: recoveryId(deps.db, e.packetId),
         sourceSession: input.createdBySession,
         destinationSession: destination,
         body,
         priority: "urgent",
+        // OpenRig's own escalation: it wakes as OpenRig's, marked urgent by OpenRig.
+        wakeTrigger: "openrig",
         tier,
         tags: [...workflowExceptionTags(exception.identity), recoveryTag(e.packetId), ...scopeTags],
         summary: exception.reason,
         evidenceRef,
+        ...(toPerson ? { humanAlert: true } : {}),
       });
     let created;
     try {
-      created = await createItem(route.destinationSession, route.tier);
+      created = await createItem(route.destinationSession, route.tier, route.humanRouted === true);
     } catch (error) {
       if (!(error instanceof QueueRepositoryError) || error.code !== "unknown_destination_rig" || route.humanRouted) throw error;
       // An unavailable agent rig may use the registered human fallback.
       // Other admission/storage failures retain their original diagnosis.
-      created = await createItem(workflowHumanDestination(deps.humanFallbackSeat), "human-gate");
+      created = await createItem(workflowHumanDestination(deps.humanFallbackSeat), "human-gate", true);
     }
     log(
       `workflow exception: stuck_overdue item ${created.qitemId} created for instance ${e.instanceId} (step ${e.stepId ?? "?"}, ${route.position})`,

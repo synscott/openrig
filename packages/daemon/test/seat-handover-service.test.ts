@@ -1,4 +1,13 @@
+import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
+import { CodexInPlaceRestart } from "../src/domain/seat-restart-in-place.js";
+import { NativePermissionStore } from "../src/domain/native-permission-store.js";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { ensureSeatSkillPlugin, seatSkillLocation, seatSkillPaths } from "../src/domain/seat-skill-storage.js";
+import { reconcileSkillLoadout, resolvePluginSkills } from "../src/domain/skill-catalog.js";
+import { prepareSeatLaunchAdditions, systemPromptPendingNote } from "../src/domain/seat-launch-additions.js";
 import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -19,6 +28,10 @@ import { observeCodexSandbox } from "../src/domain/permission-drift.js";
 import { AppliedLaunchObservationStore } from "../src/domain/applied-launch-observation-store.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { DefaultOccupantInvalidator, type OccupantInvalidator } from "../src/domain/occupant-invalidator.js";
+import { managedBlockText } from "../src/domain/managed-blocks.js";
+import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
+import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 
 describe("SeatHandoverService", () => {
   let db: Database.Database;
@@ -48,6 +61,7 @@ describe("SeatHandoverService", () => {
   let getDefaultShell: ReturnType<typeof vi.fn>;
   let getPaneCommand: ReturnType<typeof vi.fn>;
   let service: SeatHandoverService;
+  let currentCodexPermissions: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     db = createFullTestDb();
@@ -85,6 +99,7 @@ describe("SeatHandoverService", () => {
     // KI-14: healthy default — the respawned pane comes up as a blank shell.
     getDefaultShell = vi.fn(async () => "/bin/zsh");
     getPaneCommand = vi.fn(async () => "zsh");
+    currentCodexPermissions = vi.fn(async () => ({ state: "unverified", reason: "fixture has no native policy" }));
     service = newService();
   });
 
@@ -100,8 +115,9 @@ describe("SeatHandoverService", () => {
     return { runtime: "codex", launchHarness, checkReady } as unknown as RuntimeAdapter;
   }
 
-  function newService(adapter: TmuxAdapter = tmux(), occupantInvalidator: OccupantInvalidator = { invalidateRetiringOccupant }): SeatHandoverService {
+  function newService(adapter: TmuxAdapter = tmux(), occupantInvalidator: OccupantInvalidator = { invalidateRetiringOccupant }, runtime = "codex"): SeatHandoverService {
     return new SeatHandoverService({
+      codexPermissions: { currentCodexPermissions },
       db,
       rigRepo,
       sessionRegistry,
@@ -110,7 +126,7 @@ describe("SeatHandoverService", () => {
       tmuxAdapter: adapter,
       now: () => new Date("2026-04-24T18:30:00.000Z"),
       newSuccessorId: () => "01SUCCID0",
-      runtimeAdapters: { codex: codexAdapter() },
+      runtimeAdapters: { [runtime]: { ...codexAdapter(), runtime } },
       contextUsageStore: { readSidecar } as never,
       resumeTokenCapturer: { captureCodexThreadId } as never,
       ...(claudeProcessStartedAt ? { claudeProcessStartedAt } : {}),
@@ -122,9 +138,9 @@ describe("SeatHandoverService", () => {
     });
   }
 
-  function seedSeat(opts?: { rigName?: string; runtime?: string; withSession?: boolean; model?: string; codexConfigProfile?: string; effort?: string }) {
+  function seedSeat(opts?: { rigName?: string; runtime?: string; withSession?: boolean; model?: string; codexConfigProfile?: string; effort?: string; advisor?: string }) {
     const rig = rigRepo.createRig(opts?.rigName ?? "seat-rig");
-    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: opts?.runtime ?? "codex", cwd: "/project", model: opts?.model, codexConfigProfile: opts?.codexConfigProfile, effort: opts?.effort });
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: opts?.runtime ?? "codex", cwd: "/project", model: opts?.model, codexConfigProfile: opts?.codexConfigProfile, effort: opts?.effort, advisor: opts?.advisor });
     let sessionId: string | null = null;
     if (opts?.withSession !== false) {
       const session = sessionRegistry.registerSession(node.id, `dev-impl@${rig.name}`);
@@ -160,6 +176,284 @@ describe("SeatHandoverService", () => {
     ])));
   }
 
+  it.each(["fresh", "fork:dev-impl@seat-rig", "rebuild"])("records a %s successor as launched without changing its handover tenure or lineage", async source => {
+    const { rig, node, sessionId } = seedSeat();
+    sessionRegistry.updateResumeToken(sessionId!, "codex_id", "codex-thread-1", "hook");
+    const previous = db.prepare("SELECT * FROM occupant_tenures WHERE node_id = ? ORDER BY generation_ordinal").all(node.id);
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source });
+    expect(result).toMatchObject({ ok: true, result: { sideEffects: { provenanceRecordWritten: true } } });
+    const tenures = db.prepare("SELECT * FROM occupant_tenures WHERE node_id = ? ORDER BY generation_ordinal").all(node.id);
+    expect(tenures).toHaveLength(previous.length + 1);
+    expect(tenures.slice(0, -1)).toEqual(previous);
+    expect(tenures.at(-1)).toMatchObject({ kind: "handover", generation_ordinal: 2,
+      generation_uuid: respawnPane.mock.calls[0]![2]!.env.OPENRIG_OCCUPANT_GENERATION });
+    expect(sessionRegistry.getSessionsForRig(rig.id).find(session => session.id === sessionId)?.status).toBe("superseded");
+    const event = db.prepare("SELECT payload FROM events WHERE type = 'seat.handover_completed' ORDER BY seq DESC LIMIT 1").get() as { payload: string };
+    expect(JSON.parse(event.payload)).toMatchObject({ nodeId: node.id, previousOccupant: "dev-impl@seat-rig", currentOccupant: "dev-impl@seat-rig", source });
+    expect(db.prepare("SELECT origin FROM sessions WHERE node_id = ? AND status = 'running'").get(node.id)).toEqual({ origin: "launched" });
+  });
+
+  // #875: a Codex seat whose launch carried its guidance as developer instructions left none in the repository AGENTS.md,
+  // and a successor's launch carries none. The handover puts the missing blocks back from the saved startup context before
+  // the successor starts, as an exact resume does.
+  it.each(["fresh", "fork:dev-impl@seat-rig", "rebuild"])("a %s Codex successor starts with the seat's guidance in its repository AGENTS.md (#875)", async source => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "handover-guidance-"));
+    try {
+      const { node, sessionId } = seedSeat();
+      sessionRegistry.updateResumeToken(sessionId!, "codex_id", "codex-thread-1", "hook");
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run(root, node.id);
+      const culture = path.join(root, "spec", "culture.md");
+      fs.mkdirSync(path.dirname(culture), { recursive: true });
+      fs.writeFileSync(culture, "Team culture.\n");
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, '[]', '[]', 'codex')")
+        .run(node.id, JSON.stringify([{ category: "guidance", effectiveId: "culture.md", sourceSpec: "base", sourcePath: path.dirname(culture),
+          resourcePath: "culture.md", absolutePath: culture, mergeStrategy: "managed_block", target: "AGENTS.md" }]));
+      const agents = path.join(root, "AGENTS.md");
+      let atLaunch: string | null = null;
+      launchHarness.mockImplementation(async () => {
+        atLaunch = fs.existsSync(agents) ? fs.readFileSync(agents, "utf8") : null;
+        return { ok: true, resumeToken: "codex-launch-tok", resumeType: "codex_id", appliedLaunch: observeCodexSandbox(" -s workspace-write") };
+      });
+      expect(await service.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source })).toMatchObject({ ok: true });
+      expect(atLaunch).toContain("Team culture.");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // #2456: a Claude successor's launch carries no guidance either, so a rebuild into a working directory without the seat's
+  // blocks (after `rig seat set-cwd`, say) started without them. The handover puts them back in the rig's Claude file first.
+  it.each([
+    ["fresh", "CLAUDE.md"],
+    ["rebuild", "CLAUDE.md"],
+    ["fresh", "CLAUDE.local.md"],
+    ["rebuild", "CLAUDE.local.md"],
+  ] as const)("a %s Claude successor starts with the seat's guidance in the rig's %s (#2456)", async (source, file) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "handover-guidance-claude-"));
+    try {
+      const { rig, node } = seedSeat({ runtime: "claude-code" });
+      if (file !== "CLAUDE.md") rigRepo.setRigClaudeManagedBlockFile(rig.id, file);
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run(root, node.id);
+      const culture = path.join(root, "spec", "culture.md");
+      fs.mkdirSync(path.dirname(culture), { recursive: true });
+      fs.writeFileSync(culture, "Team culture.\n");
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, '[]', '[]', 'claude-code')")
+        .run(node.id, JSON.stringify([{ category: "guidance", effectiveId: "culture.md", sourceSpec: "base", sourcePath: path.dirname(culture),
+          resourcePath: "culture.md", absolutePath: culture, mergeStrategy: "managed_block", target: "CLAUDE.md" }]));
+      const guidance = path.join(root, file);
+      capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+      let atLaunch: string | null = null;
+      launchHarness.mockImplementation(async () => {
+        atLaunch = fs.existsSync(guidance) ? fs.readFileSync(guidance, "utf8") : null;
+        return { ok: true, resumeToken: "claude-successor", resumeType: "claude_id" };
+      });
+      const claude = new SeatHandoverService({ db, rigRepo, sessionRegistry, discoveryRepo, eventBus,
+        tmuxAdapter: tmux(), runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
+        predecessorRecapResolver: resolvePredecessorRecap as never, readinessTimeoutMs: 50, sleep: async () => {} });
+      const result = await claude.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      expect(atLaunch).toContain("Team culture.");
+      if (file !== "CLAUDE.md") expect(fs.existsSync(path.join(root, "CLAUDE.md"))).toBe(false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // #2456: a start fails when a required startup file can't be delivered, while a handover's successor starts anyway. So the
+  // handover names each required file its successor started without, on its result and on the event the seat list reads.
+  it("names the required guidance files a successor started without, on the result and the handover event (#2456)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "handover-required-"));
+    try {
+      const { node } = seedSeat();
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run(root, node.id);
+      const present = path.join(root, "spec", "present.md");
+      fs.mkdirSync(path.dirname(present), { recursive: true });
+      fs.writeFileSync(present, "Present and required.\n");
+      const projected = path.join(root, "spec", "culture.md");
+      const required = path.join(root, "spec", "sop.md");
+      const optional = path.join(root, "spec", "notes.md");
+      const file = (absolutePath: string, isRequired: boolean) => ({ path: path.basename(absolutePath), absolutePath, ownerRoot: root,
+        deliveryHint: "guidance_merge", required: isRequired, appliesOn: ["startup", "restore"] });
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, '[]', 'codex')")
+        .run(node.id,
+          JSON.stringify([{ category: "guidance", effectiveId: "culture.md", sourceSpec: "base", sourcePath: path.dirname(projected),
+            resourcePath: "culture.md", absolutePath: projected, mergeStrategy: "managed_block", target: "AGENTS.md" }]),
+          JSON.stringify([file(present, true), file(required, true), file(optional, false)]));
+      const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source: "fresh" });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      const handed = (result as unknown as { result: { startedWithoutRequired?: string[]; newSessionId: string } }).result;
+      // A projected guidance file fails a start when it can't be written, as a required startup file does; an optional one doesn't.
+      expect(handed.startedWithoutRequired).toEqual([projected, required]);
+      const event = db.prepare("SELECT payload FROM events WHERE type = 'seat.handover_completed' ORDER BY seq DESC LIMIT 1").get() as { payload: string };
+      expect(JSON.parse(event.payload)).toMatchObject({ startedWithoutRequired: [projected, required], successorSessionId: handed.newSessionId });
+      expect(fs.readFileSync(path.join(root, "AGENTS.md"), "utf8")).toContain("Present and required.");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // Round 1: a projected guidance file and an optional startup file can share one block id. The block is still required,
+  // since a start fails at projection before the optional file is delivered.
+  it("keeps a block required when an optional startup file shares its id with a projected one (#2456)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "handover-required-same-id-"));
+    try {
+      const { node } = seedSeat();
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run(root, node.id);
+      const projected = path.join(root, "spec", "culture.md");
+      const optional = path.join(root, "startup", "culture.md");
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, '[]', 'codex')")
+        .run(node.id,
+          JSON.stringify([{ category: "guidance", effectiveId: "culture.md", sourceSpec: "base", sourcePath: path.dirname(projected),
+            resourcePath: "culture.md", absolutePath: projected, mergeStrategy: "managed_block", target: "AGENTS.md" }]),
+          JSON.stringify([{ path: "culture.md", absolutePath: optional, ownerRoot: root, deliveryHint: "guidance_merge", required: false, appliesOn: ["startup", "restore"] }]));
+      const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source: "fresh" });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      // The block's put-back source is the later writer's, as at launch; the block stays required.
+      expect((result as unknown as { result: { startedWithoutRequired?: string[] } }).result.startedWithoutRequired).toEqual([optional]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // A fresh or rebuild successor is a new conversation that no start delivered to, so its one first turn points it to each
+  // send_text startup file a fresh start delivers, role first. A required one that's missing marks the seat. A fork carries
+  // its parent's conversation, which already had them, and gets no list.
+  it.each(["fresh", "rebuild", "fork:dev-impl@seat-rig"])("a %s successor's first turn points to the seat's startup files, role first (#2456)", async (source) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "handover-startup-files-"));
+    try {
+      const { node, sessionId } = seedSeat();
+      sessionRegistry.updateResumeToken(sessionId!, "codex_id", "codex-thread-1", "hook");
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run(root, node.id);
+      const role = path.join(root, "guidance", "role.md");
+      const context = path.join(root, "startup", "context.md");
+      const missing = path.join(root, "startup", "brief.txt");
+      for (const [file, text] of [[role, "You are the implementer.\n"], [context, "Project context.\n"]] as const) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, text);
+      }
+      const text = (absolutePath: string, extra: Record<string, unknown> = {}) => ({ path: path.relative(root, absolutePath), absolutePath, ownerRoot: root,
+        deliveryHint: "send_text", required: true, appliesOn: ["fresh_start", "restore"], ...extra });
+      // Saved in the order a spec might list them; the role comes first in the list all the same.
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, '[]', ?, '[]', 'codex')")
+        .run(node.id, JSON.stringify([text(context), text(role, { orientation: "role" }), text(missing)]));
+      const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      const turns = sendText.mock.calls.map((call) => String(call[1]));
+      const listed = turns.find((turn) => turn.includes("Your seat's startup files"));
+      const handed = (result as unknown as { result: { startedWithoutRequired?: string[] } }).result;
+      if (source.startsWith("fork:")) {
+        expect(listed).toBeUndefined();
+        expect(handed.startedWithoutRequired).toBeUndefined();
+        return;
+      }
+      expect(listed, JSON.stringify(turns)).toBeDefined();
+      const at = (needle: string) => listed!.indexOf(needle);
+      expect(at(role)).toBeGreaterThan(at("Your seat's startup files"));
+      expect(at(role)).toBeLessThan(at(context));
+      expect(listed).toContain(`MISSING: ${missing}`);
+      // The list comes before the predecessor's context: its terminal for a fresh successor, its durable chain for a rebuild.
+      expect(at("Your seat's startup files")).toBeLessThan(at(source === "fresh" ? "--- Predecessor terminal" : "The durable chain is EMPTY"));
+      expect(handed.startedWithoutRequired).toEqual([missing]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  // #2456 part 3: a block already in the guidance file. OpenRig keeps a record of what it last wrote there, so a handover
+  // refreshes a block it wrote whose source has changed, keeps a block a person edited and names it, and names a block it
+  // has no record of as possibly stale instead of replacing it.
+  describe("a Claude handover and a block already in its guidance file (#2456)", () => {
+    let root: string;
+    let culture: string;
+    let guidance: string;
+    beforeEach(() => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), "handover-refresh-"));
+      const { node } = seedSeat({ runtime: "claude-code" });
+      db.prepare("UPDATE nodes SET cwd = ? WHERE id = ?").run(root, node.id);
+      culture = path.join(root, "spec", "culture.md");
+      fs.mkdirSync(path.dirname(culture), { recursive: true });
+      fs.writeFileSync(culture, "Team culture.\n");
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, '[]', '[]', 'claude-code')")
+        .run(node.id, JSON.stringify([{ category: "guidance", effectiveId: "culture.md", sourceSpec: "base", sourcePath: path.dirname(culture),
+          resourcePath: "culture.md", absolutePath: culture, mergeStrategy: "managed_block", target: "CLAUDE.md" }]));
+      guidance = path.join(root, "CLAUDE.md");
+      capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+    });
+    afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+    /** One fresh handover; returns its notes and the guidance file as the successor launched with it. */
+    async function handOver(): Promise<{ notes: string[]; atLaunch: string | null }> {
+      let atLaunch: string | null = null;
+      launchHarness.mockImplementation(async () => {
+        atLaunch = fs.existsSync(guidance) ? fs.readFileSync(guidance, "utf8") : null;
+        return { ok: true, resumeToken: "claude-successor", resumeType: "claude_id" };
+      });
+      const claude = new SeatHandoverService({ db, rigRepo, sessionRegistry, discoveryRepo, eventBus,
+        tmuxAdapter: tmux(), runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
+        predecessorRecapResolver: resolvePredecessorRecap as never, readinessTimeoutMs: 50, sleep: async () => {} });
+      const result = await claude.handover({ seatRef: "dev-impl@seat-rig", reason: "replace occupant", source: "fresh" });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      return { notes: (result as { result: { launchAdditionNotes?: string[] } }).result.launchAdditionNotes ?? [], atLaunch };
+    }
+
+    it("refreshes a block OpenRig wrote whose source has changed since", async () => {
+      expect((await handOver()).atLaunch).toContain("Team culture.");
+      fs.writeFileSync(culture, "Team culture, revised.\n");
+      const { atLaunch } = await handOver();
+      expect(atLaunch).toContain("Team culture, revised.");
+      expect(atLaunch).not.toContain("Team culture.\n");
+    });
+
+    it("keeps a block a person edited, and names it", async () => {
+      await handOver();
+      fs.writeFileSync(guidance, fs.readFileSync(guidance, "utf8").replace("Team culture.", "Team culture. My own note."));
+      fs.writeFileSync(culture, "Team culture, revised.\n");
+      const { notes, atLaunch } = await handOver();
+      expect(atLaunch).toContain("Team culture. My own note.");
+      expect(atLaunch).not.toContain("Team culture, revised.");
+      expect(notes.some((note) => note.includes("guidance_block_edited") && note.includes("culture.md")), JSON.stringify(notes)).toBe(true);
+      // The successor is told too, in one line of its packet.
+      const packets = sendText.mock.calls.map((call) => String(call[1])).filter((text) => text.includes("OpenRig guidance note"));
+      expect(packets).toHaveLength(1);
+      expect(packets[0]).toContain("culture.md");
+    });
+
+    it("leaves a block it has no record of writing, and says it may be stale", async () => {
+      fs.writeFileSync(guidance, `# Notes\n\n${managedBlockText("culture.md", "Older culture.")}\n`);
+      const { notes, atLaunch } = await handOver();
+      expect(atLaunch).toContain("Older culture.");
+      expect(atLaunch).not.toContain("Team culture.");
+      expect(notes.some((note) => note.includes("guidance_block_may_be_stale") && note.includes("culture.md")), JSON.stringify(notes)).toBe(true);
+    });
+  });
+
+  it.each(["stop", "restart", "clean"] as const)("allows %s for a launched handover but refuses discovered and directly adopted occupants", async operation => {
+    for (const provenance of ["adopted", "discovered", "launched"] as const) {
+      const { node, sessionId } = seedSeat({ rigName: `${operation}-${provenance}` });
+      const seatRef = `dev-impl@${operation}-${provenance}`;
+      if (provenance === "adopted") {
+        sessionRegistry.markSuperseded(sessionId!);
+        sessionRegistry.registerClaimedSession(node.id, seatRef);
+      } else {
+        const source = provenance === "launched" ? "fresh" : `discovered:${seedDiscovery().id}`;
+        expect(await service.handover({ seatRef, reason: "replace occupant", source })).toMatchObject({ ok: true });
+      }
+      const current = sessionRegistry.getBindingForNode(node.id)!;
+      const adapter = Object.assign(tmux(), { probeSession: vi.fn(async () => ({ state: operation === "clean" ? "absent" as const : "present" as const })) });
+      const restartAdapter = Object.assign(codexAdapter(), { buildResumeCommand: vi.fn(), verifyResumeInPane: vi.fn(), sendResumeCommand: vi.fn() });
+      const lifecycle = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: adapter, runtimeAdapters: { codex: restartAdapter } });
+      // The restart engine has its own process/OS fixtures. This cell exercises handover registration
+      // through the real lifecycle eligibility checks, stopping at that engine's native-effect boundary.
+      const restart = vi.spyOn(CodexInPlaceRestart.prototype, "execute").mockResolvedValue({ ok: true } as never);
+      killSession.mockClear();
+      try {
+        const input = { seatRef, reason: "selected lifecycle operation" };
+        const result = operation === "stop" ? await lifecycle.stopSeat(input)
+          : operation === "clean" ? await lifecycle.cleanSeat(input) : await lifecycle.restartInPlace(input);
+        if (provenance === "launched") {
+          expect(result).toMatchObject({ ok: true });
+          if (operation === "stop") expect(killSession).toHaveBeenCalledWith(current.tmuxSession);
+          if (operation === "clean") expect(sessionRegistry.getBindingForNode(node.id)).toBeNull();
+          if (operation === "restart") expect(restart).toHaveBeenCalledWith(expect.objectContaining({ seat: expect.objectContaining({ nodeId: node.id }), sessionName: current.tmuxSession }), expect.anything());
+        } else {
+          expect(result).toMatchObject({ ok: false, code: "claimed_session" });
+          expect(killSession).not.toHaveBeenCalled(); expect(restart).not.toHaveBeenCalled();
+          expect(sessionRegistry.getBindingForNode(node.id)?.tmuxSession).toBe(current.tmuxSession);
+        }
+      } finally { restart.mockRestore(); }
+    }
+  });
+
   it("binds an active seat to an already-created discovered successor", async () => {
     const { rig, node, sessionId } = seedSeat();
     const discovered = seedDiscovery();
@@ -192,8 +486,9 @@ describe("SeatHandoverService", () => {
       },
       sideEffects: {
         departingSessionKilled: false,
+        departingProcess: "not-touched",
         startupContextDelivered: false,
-        provenanceRecordWritten: false,
+        provenanceRecordWritten: true,
       },
     });
     expect(result.result.previousSessionIdsSuperseded).toContain(sessionId);
@@ -408,10 +703,12 @@ describe("SeatHandoverService", () => {
     ["default source", undefined],
     ["fresh source", "fresh"],
     ["rebuild source", "rebuild"],
-    ["fork source", "fork:abc123"],
+    ["fork source", "fork:dev-impl@seat-rig"],
     ["discovered source", "discovered:some-id"],
   ])("keeps dry-run mutation-free across %s (AC-1)", async (_label, source) => {
-    seedSeat();
+    const { sessionId } = seedSeat();
+    // A fork source is resolved in the dry run too, so it names a seat with a native conversation id.
+    if (source?.startsWith("fork:")) db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run("codex-thread-1", sessionId);
     const before = durableRows();
 
     const result = await service.handover({
@@ -779,6 +1076,137 @@ describe("SeatHandoverService", () => {
     expect(sleeps).toContain(200);
   });
 
+  it.each([
+    ...[
+    ...(["fresh", "rebuild"] as const).flatMap(source =>
+      (["clear", "staged", "unreadable", "edited", "unrelated"] as const).map(screen => ({ source, screen, held: false }))),
+    ...(["clear", "staged", "edited", "unreadable"] as const).map(screen => ({ source: "rebuild" as const, screen, held: true })),
+    ...(["retry-failed", "retry-failed-staged-message", "send-failed", "submit-failed"] as const)
+      .map(screen => ({ source: "rebuild" as const, screen, held: false })),
+    ].map(row => ({ ...row, continuityPresent: true })),
+    { source: "rebuild" as const, screen: "staged" as const, held: false, continuityPresent: false },
+  ])("#1544 $source packet submission with $screen composer evidence (held=$held, continuity=$continuityPresent)", async ({ source, screen, held, continuityPresent }) => {
+    const { node } = seedSeat({ runtime: "claude-code" });
+    db.exec(outboxEntriesSchema.sql);
+    db.exec(seatDeliveryGuardSchema.sql);
+    const outbox = new OutboxHandler(db);
+    if (held) outbox.retain({ outboxId: "held-rebuild", senderSession: "orch-lead@seat-rig",
+      destinationSession: "dev-impl@seat-rig", body: "Retain this work without replaying it." },
+    { nodeId: node.id, session: "dev-impl@seat-rig", occupant: null, pane: null });
+    const heldBefore = outbox.getById("held-rebuild");
+    const notice = "1 held message was kept for this seat and not delivered: read it with rig seat held-messages dev-impl@seat-rig.";
+    const bindingBefore = sessionRegistry.getBindingForNode(node.id);
+    const sleeps: number[] = [];
+    const reads: Array<string | null> = [];
+    let packet = "";
+    let enters = 0;
+    if (!continuityPresent) hasSession.mockResolvedValue(false);
+    const frame = (text: string) => `Claude Code v2.1.303\n${text.split("\n").map((line, i) => `${i === 0 ? "❯" : " "} ${line}`).join("\n")}\n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)`;
+    const visible = () => screen === "unreadable" ? null : frame(screen === "clear" ? ""
+      : ["staged", "retry-failed", "retry-failed-staged-message"].includes(screen) ? packet : screen === "edited" ? `${packet}\nEdited by the operator.` : "Unrelated operator draft.");
+    capturePaneScreen.mockImplementation(async () => {
+      if (!packet) return "predecessor screen tail";
+      const pane = visible();
+      reads.push(pane);
+      if (reads.length > 8) throw new Error("fixture exceeded the finite submission observation budget");
+      return pane;
+    });
+    sendText.mockImplementation(async (_session: string, text: string) => {
+      if (!packet) packet = text;
+      return screen === "send-failed" ? { ok: false, message: "synthetic initial delivery failure" } : { ok: true };
+    });
+    sendKeys.mockImplementation(async (_session: string, keys: string[]) => {
+      if (packet && keys.includes("Enter")) enters++;
+      if (screen === "submit-failed" && enters === 1) return { ok: false, message: "synthetic initial submit failure" };
+      if (screen === "retry-failed-staged-message" && enters === 2) return { ok: false, message: "the prompt still looked staged in the input box" };
+      return screen === "retry-failed" && enters === 2
+        ? { ok: false, message: "synthetic retry delivery failure" } : { ok: true };
+    });
+    launchHarness.mockResolvedValue({ ok: true, resumeToken: "22222222-2222-4222-8222-222222222222", resumeType: "claude_id" });
+    const handover = new SeatHandoverService({ db, rigRepo, sessionRegistry, discoveryRepo, eventBus,
+      tmuxAdapter: tmux(), runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
+      now: () => new Date("2026-04-24T18:30:00.000Z"), newSuccessorId: () => "01SUCCID0",
+      contextUsageStore: { readSidecar } as never, predecessorRecapResolver: resolvePredecessorRecap as never,
+      rebuildPrimingResolver: () => ({ artifacts: [{ address: "/fixture-seat/RECAP.md", label: "authored recap" }] }),
+      rebuildArtifactExists: () => true, readinessTimeoutMs: 50, sleep: async ms => { sleeps.push(ms); },
+    });
+    const result = await handover.handover({ seatRef: "dev-impl@seat-rig", source, reason: "submission evidence" });
+    const bindingAfter = sessionRegistry.getBindingForNode(node.id);
+    const candidates = db.prepare("SELECT status,claimed_node_id FROM discovered_sessions").all();
+    const completed = db.prepare("SELECT payload FROM events WHERE type = 'seat.handover_completed'").all() as Array<{ payload: string }>;
+    console.info("ISSUE1544_SUBMISSION", JSON.stringify({ source, screen, held, continuityPresent, result, enters, sleeps, reads,
+      sent: sendText.mock.calls, keys: sendKeys.mock.calls, heldBefore, heldAfter: outbox.getById("held-rebuild"),
+      visibleAfter: visible(), bindingBefore, bindingAfter, candidates, completed: completed.map(row => JSON.parse(row.payload)) }));
+    expect(packet).toContain(source === "rebuild" ? "# Seat rebuild handover" : "OpenRig seat handover");
+    const typedNotice = held && screen === "clear";
+    expect(sendText.mock.calls).toEqual(typedNotice
+      ? [["dev-impl@seat-rig", packet], ["dev-impl@seat-rig", notice]] : [["dev-impl@seat-rig", packet]]);
+    if (held) {
+      expect(heldBefore).toMatchObject({ body: "Retain this work without replaying it.", deliveryState: "retained", deliveredAt: null });
+      expect(outbox.getById("held-rebuild")).toEqual(heldBefore);
+      expect.soft(result).toMatchObject({ ok: true, result: { warnings: [notice] } });
+    }
+    if (screen === "send-failed") expect(sleeps).toEqual([]);
+    else expect(sleeps[0]).toBe(200);
+    expect(killSession).not.toHaveBeenCalled();
+    expect.soft(result.ok && result.result.sideEffects.startupContextDelivered,
+      "delivery requires a clear composer, not only successful paste and Enter").toBe(screen === "clear");
+    if ((screen === "staged" && source === "fresh") || ["retry-failed", "retry-failed-staged-message", "send-failed", "submit-failed"].includes(screen)) {
+      expect.soft(result, "fresh staged packets and real transport errors still fail delivery").toMatchObject({ ok: false, code: "context_delivery_failed" });
+      expect.soft(bindingAfter).toEqual(bindingBefore);
+      expect.soft(candidates).toEqual([expect.objectContaining({ status: "vanished", claimed_node_id: null })]);
+      expect.soft(completed).toEqual([]);
+      expect.soft(enters).toBe(screen === "send-failed" ? 0 : screen === "submit-failed" ? 1 : 2);
+      expect(hasSession).not.toHaveBeenCalled();
+      if (screen === "retry-failed-staged-message") {
+        expect(result).toMatchObject({ ok: false, message: expect.stringContaining("the prompt still looked staged in the input box") });
+      }
+      if (screen === "retry-failed") {
+        expect(result).toMatchObject({ ok: false, message: expect.stringContaining("synthetic retry delivery failure") });
+        expect(sendKeys.mock.calls).toEqual(Array.from({ length: 2 }, () => ["dev-impl@seat-rig", ["Enter"]]));
+        if (!result.ok) {
+          expect.soft(result.guidance).toContain("may still process the priming packet");
+          expect.soft(result.guidance).toMatch(/inspect the successor.*resolve.*before.*attempt/i);
+          expect.soft(result.guidance).toContain("binding is unchanged");
+          expect.soft(result.guidance).toContain("re-wakeable from its provider session file");
+        }
+      }
+      return;
+    }
+    if (screen === "staged") {
+      expect.soft(enters).toBe(2);
+      expect.soft(hasSession, "staged screen evidence must still reach ordinary continuity verification").toHaveBeenCalledTimes(1);
+      if (!continuityPresent) {
+        expect.soft(result).toMatchObject({ ok: false, code: "successor_tmux_absent" });
+        expect.soft(bindingAfter).toEqual(bindingBefore);
+        expect.soft(candidates).toEqual([expect.objectContaining({ status: "vanished", claimed_node_id: null })]);
+        expect.soft(completed).toEqual([]);
+        return;
+      }
+      const restorePacket = { status: "unconfirmed", reason: "the prompt still looked staged in the input box" };
+      expect.soft(result, "a running rebuild successor completes unconfirmed after normal continuity checks").toMatchObject({
+        ok: true, result: { restorePacket, sideEffects: { startupContextDelivered: false } },
+      });
+      expect.soft(bindingAfter).toMatchObject({ tmuxSession: "dev-impl@seat-rig", tmuxPane: "%9" });
+      expect.soft(candidates).toEqual([expect.objectContaining({ status: "claimed", claimed_node_id: node.id })]);
+      expect.soft(completed.map(row => JSON.parse(row.payload))).toEqual([expect.objectContaining({ restorePacket })]);
+      return;
+    }
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    if (!result.ok) return;
+    expect(bindingAfter).toMatchObject({ tmuxSession: "dev-impl@seat-rig", tmuxPane: "%9" });
+    expect(candidates).toEqual([expect.objectContaining({ status: "claimed", claimed_node_id: node.id })]);
+    expect(completed).toHaveLength(1);
+    expect(enters, "only confirmed submission permits the held notice's Enter").toBe(typedNotice ? 2 : 1);
+    expect(sendKeys.mock.calls).toEqual(Array.from({ length: typedNotice ? 2 : 1 }, () => ["dev-impl@seat-rig", ["Enter"]]));
+    if (screen === "clear") expect(result.result.restorePacket).toBeUndefined();
+    else {
+      const reason = screen === "unreadable" ? "the input box could not be observed" : "the input box did not clearly show the prompt as submitted";
+      expect.soft(result.result.restorePacket).toEqual({ status: "unconfirmed", reason });
+      expect.soft(JSON.parse(completed[0]!.payload).restorePacket).toEqual({ status: "unconfirmed", reason });
+    }
+  });
+
   it("recap leg (B16): the resolver runs BEFORE the successor launches (the successor overwrites the name-keyed sidecar)", async () => {
     seedSeat({ runtime: "codex" });
     resolvePredecessorRecap.mockReturnValue({ recap: [{ role: "user", content: "pre-launch read" }], recordPath: "/p/a.jsonl" });
@@ -792,6 +1220,101 @@ describe("SeatHandoverService", () => {
   });
 
   // OPR.0.5.5.5 (05-handover-sources-real) INVERTED the former B3 pin: fork and
+  it.each(["floor", "inherit", "policy", null] as const)("rebuild respects a deliberate same-mode selection (%s), not an old choice alone", async mode => {
+    const { node } = seedSeat();
+    const store = new NativePermissionStore(db);
+    const setter = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux() });
+    if (mode === "policy") {
+      await setter.setPolicy({ seatRef: "dev-impl@seat-rig", ref: "builtin:locked", actor: "old operator", reason: "earlier launch" });
+      db.prepare("UPDATE events SET created_at = '2026-04-19 00:00:00' WHERE type = 'node.policy_changed' AND node_id = ?").run(node.id);
+    } else if (mode !== "inherit") {
+      store.write(node.id, { runtime: "codex", mode: "floor" }, "old operator", "earlier launch");
+      db.prepare("UPDATE node_permission_selections SET updated_at = '2026-04-19 00:00:00' WHERE node_id = ?").run(node.id);
+    }
+    const envelope = { approvalPolicy: "never", sandboxPolicy: { type: "danger-full-access" } };
+    currentCodexPermissions.mockResolvedValue({ state: "observed", envelope, profile: null,
+      processStartedAt: "Mon Apr 20 12:00:00 2026", observedAt: "2026-04-20T12:01:00Z" });
+    if (mode !== null) {
+      const selected = mode === "policy"
+        ? await setter.setPolicy({ seatRef: "dev-impl@seat-rig", ref: "builtin:locked", actor: "person", reason: "choose successor permissions" })
+        : await setter.setPermissions({ seatRef: "dev-impl@seat-rig", mode, actor: "person", reason: "choose successor permissions" });
+      expect(selected).toMatchObject({ ok: true, changed: false });
+      expect(signalPaneProcess).not.toHaveBeenCalled();
+      expect(launchHarness).not.toHaveBeenCalled();
+    }
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", source: "rebuild", reason: "context wall" });
+    expect(result).toMatchObject({ ok: true, result: { sourceOutcome: { permissions: { state: mode === null ? "emitted" : "selection_used" } } } });
+    const binding = launchHarness.mock.calls[0]![0];
+    expect(binding.launchPosture).toBe("floor");
+    expect(binding.codexRebuildPermissions).toEqual(mode === null ? envelope : undefined);
+  });
+
+  it("rebuild uses the seat's own envelope over the observed predecessor policy", async () => {
+    const { node } = seedSeat();
+    const own = { sandbox: "read-only", approval: "on-request" };
+    db.prepare("UPDATE nodes SET codex_permissions_json = ? WHERE id = ?").run(JSON.stringify(own), node.id);
+    currentCodexPermissions.mockResolvedValue({ state: "observed", envelope: { approvalPolicy: "never", sandboxPolicy: { type: "danger-full-access" } },
+      profile: null, processStartedAt: "Mon Apr 20 12:00:00 2026", observedAt: "2026-04-20T12:01:00Z" });
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", source: "rebuild", reason: "context wall" });
+    expect(result).toMatchObject({ ok: true, result: { sourceOutcome: { permissions: { state: "selection_used" } } } });
+    const binding = launchHarness.mock.calls[0]![0];
+    expect(binding.codexRebuildPermissions).toBeUndefined();
+    expect(binding.codexPermissions).toEqual(own);
+  });
+
+  it.each(["minted", "mint fails"] as const)("a rebuild handover's receipt reads its lineage record back (%s)", async (mint) => {
+    const { node } = seedSeat();
+    // The tenure mint is best-effort: a failed one is logged and swallowed, and the handover still completes.
+    const failing = mint === "mint fails"
+      ? [vi.spyOn(sessionRegistry, "mintOccupantTenure").mockImplementation(() => { throw new Error("ledger unavailable"); }),
+        vi.spyOn(console, "warn").mockImplementation(() => {})]
+      : [];
+    try {
+      const result = await service.handover({ seatRef: "dev-impl@seat-rig", source: "rebuild", reason: "context wall" });
+      expect(result).toMatchObject({ ok: true, result: { sideEffects: { provenanceRecordWritten: mint === "minted" } } });
+      if (mint === "minted") expect(sessionRegistry.currentOccupantTenure(node.id)).toMatchObject({ kind: "handover" });
+    } finally {
+      for (const spy of failing) spy.mockRestore();
+    }
+  });
+
+  it.each([["graceful", "ended-graceful"], ["forced", "ended-forced"]] as const)(
+    "a rebuild handover's receipt says how the departing process ended (%s)", async (exit, reported) => {
+      seedSeat();
+      // The retiree exits on TERM, or only once KILL follows the TERM window.
+      if (exit === "forced") isPaneDead.mockImplementation(async () => signalPaneProcess.mock.calls.some((call) => call[1] === "KILL"));
+      const result = await service.handover({ seatRef: "dev-impl@seat-rig", source: "rebuild", reason: "context wall" });
+      expect(result).toMatchObject({ ok: true, result: { sideEffects: { departingSessionKilled: false, departingProcess: reported } } });
+      expect(signalPaneProcess.mock.calls.some((call) => call[1] === "KILL")).toBe(exit === "forced");
+    });
+
+  it.each(["observed", "unverified", "changed selection", "cleared selection", "profile change", "older selection"])(
+    "rebuild permission result: %s", async state => {
+      const { node } = seedSeat(state === "profile change" ? { codexConfigProfile: "next-profile" } : undefined);
+      const envelope = { approvalPolicy: "on-request", sandboxPolicy: { type: "workspace-write",
+        network_access: false, exclude_tmpdir_env_var: false, exclude_slash_tmp: false } };
+      if (state !== "unverified") currentCodexPermissions.mockImplementation(async () => {
+        expect(signalPaneProcess).not.toHaveBeenCalled();
+        if (state === "changed selection" || state === "older selection") {
+          new NativePermissionStore(db).write(node.id, { runtime: "codex", mode: "full_bypass" }, "person", "successor choice");
+          if (state === "older selection") db.prepare("UPDATE node_permission_selections SET updated_at = '2026-04-19 00:00:00' WHERE node_id = ?").run(node.id);
+        }
+        if (state === "cleared selection") eventBus.emit({ type: "node.permissions_changed", nodeId: node.id,
+          rigId: node.rig_id, from: { runtime: "codex", mode: "full_bypass" }, to: null, actor: "person", reason: "inherit",
+          source: "seat_selection", effect: "future_launches_only" });
+        return { state: "observed", envelope, processStartedAt: "Mon Apr 20 12:00:00 2026",
+          observedAt: "2026-04-20T12:01:00Z", profile: null };
+      });
+      const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "rebuild", source: "rebuild" });
+      expect(result).toMatchObject({ ok: true, result: { sourceOutcome: { mode: "rebuild",
+        permissions: { state: (state === "changed selection" || state === "cleared selection" || state === "profile change") ? "selection_used" : state === "unverified" ? "unverified" : "emitted" } } } });
+      const binding = launchHarness.mock.calls[0]![0];
+      if (state === "observed" || state === "older selection") expect(binding.codexRebuildPermissions).toEqual(envelope);
+      else expect(binding.codexRebuildPermissions).toBeUndefined();
+      if (state === "changed selection") expect(binding.launchPosture).toBe("full_bypass");
+      expect(respawnPane).toHaveBeenCalledTimes(1);
+    });
+
   // rebuild now EXECUTE (full coverage in seat-handover-sources.test.ts). What
   // survives of B3 is its safety core: a source that cannot proceed refuses
   // HONESTLY and pre-mutation — never a blank successor reported complete.
@@ -812,14 +1335,27 @@ describe("SeatHandoverService", () => {
     expect(durableRows()).toBe(before);
   });
 
-  it("B3: still returns a dry-run PLAN for fork/rebuild (planning is not blocked)", async () => {
-    seedSeat({ runtime: "codex" });
+  it("B3: still returns a dry-run PLAN for a fork source the real run can resolve (planning is not blocked)", async () => {
+    const { sessionId } = seedSeat({ runtime: "codex" });
+    db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run("codex-thread-1", sessionId);
     const before = durableRows();
 
-    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:abc", dryRun: true });
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:dev-impl@seat-rig", dryRun: true });
 
     expect(result.ok).toBe(true);
     expect(result.ok && "plan" in result && result.plan.willMutate).toBe(false);
+    expect(durableRows()).toBe(before);
+  });
+
+  it("a dry run refuses a fork source the real run refuses, with the same refusal, and writes nothing", async () => {
+    seedSeat({ runtime: "codex" });
+    const before = durableRows();
+
+    const dryRun = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:0b0165d7", dryRun: true });
+    const run = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fork:0b0165d7" });
+
+    expect(dryRun).toMatchObject({ ok: false, code: "fork_source_not_found" });
+    expect(dryRun).toEqual(run);
     expect(durableRows()).toBe(before);
   });
 
@@ -837,7 +1373,8 @@ describe("SeatHandoverService", () => {
     if (!result.ok || !("result" in result)) throw new Error("expected handover result");
     // The FR-3 derive-helper was reused; the token is persisted with provenance
     // "adoption" on the new claimed session, and never appears in the event log.
-    expect(captureCodexThreadId).toHaveBeenCalledWith("successor-session");
+    // The seat's node goes with it, so a seat with its own CODEX_HOME is searched there.
+    expect(captureCodexThreadId).toHaveBeenCalledWith("successor-session", { nodeId: node.id });
     const newSession = db.prepare(
       "SELECT resume_type, resume_token, resume_provenance FROM sessions WHERE node_id = ? AND session_name = ?"
     ).get(node.id, "successor-session") as Record<string, string | null>;
@@ -1280,6 +1817,25 @@ describe("SeatHandoverService", () => {
     });
   });
 
+  it.each([undefined, "none"] as const)("carries current rules, model, Advisor and MCP selection (%s) to the successor", async claudeMcp => {
+    const { node } = seedSeat({ runtime: "claude-code", model: "claude-sonnet-5-5", advisor: "opus" });
+    rigRepo.setNodeClaudeMcp(node.id, claudeMcp ?? null);
+    capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+    const rules = { allow: [], deny: ["Read(./private/**)"] };
+    const writer = new SeatLifecycleService({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux() });
+    expect(await writer.setPermissions({ seatRef: "dev-impl@seat-rig", rules, actor: "operator@seat-rig", reason: "Set successor rules" })).toMatchObject({ ok: true });
+    launchHarness.mockResolvedValue({ ok: true, resumeToken: "claude-successor", resumeType: "claude_id" });
+    const claudeService = new SeatHandoverService({ db, rigRepo, sessionRegistry, discoveryRepo, eventBus,
+      tmuxAdapter: tmux(), runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
+      predecessorRecapResolver: resolvePredecessorRecap as never, readinessTimeoutMs: 50, sleep: async () => {} });
+    const result = await claudeService.handover({
+      seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh", operator: "orch-lead@seat-rig",
+    });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    expect(launchHarness).toHaveBeenCalledTimes(1);
+    expect(launchHarness.mock.calls[0]![0]).toMatchObject({ nodeId: node.id, model: "claude-sonnet-5-5", advisor: "opus", claudePermissions: rules, claudeMcp });
+  });
+
   it("#75: an effort-pinned seat's handover launches the successor with that effort — the REAL lookupNode→createSuccessor→launchHarness path", async () => {
     seedSeat({ runtime: "codex", effort: "high" });
     const result = await service.handover({
@@ -1292,6 +1848,92 @@ describe("SeatHandoverService", () => {
     expect(launchHarness).toHaveBeenCalledTimes(1);
     const successorBinding = launchHarness.mock.calls[0]![0] as { effort?: string };
     expect(successorBinding.effort).toBe("high");
+  });
+
+  it("OPR.0.7.0.9 (K2): a Claude seat's launch additions reach its fresh handover successor's launch, and the new conversation's start is recorded", async () => {
+    const { rig } = seedSeat({ runtime: "claude-code" });
+    capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+    const src = fs.mkdtempSync(path.join(os.tmpdir(), "handover-additions-"));
+    try {
+      fs.writeFileSync(path.join(src, "prompt.md"), "Short answers.\n");
+      const paths = seatSkillPaths({ rigId: rig.id, logicalId: "dev.impl", runtime: "claude-code" });
+      const prepared = prepareSeatLaunchAdditions(paths, { appendSystemPromptFile: path.join(src, "prompt.md") });
+      if (!prepared.ok) throw new Error(prepared.message);
+      launchHarness.mockImplementation(async () => ({ ok: true, resumeToken: "claude-successor-tok", resumeType: "claude_id" }));
+      const claude = new SeatHandoverService({
+        db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter: tmux(),
+        now: () => new Date("2026-04-24T18:30:00.000Z"), newSuccessorId: () => "01SUCCID0",
+        runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
+        contextUsageStore: { readSidecar } as never, resumeTokenCapturer: { captureCodexThreadId } as never,
+        claudeProcessStartedAt: async () => "2026-04-24T18:29:59.000Z",
+        occupantInvalidator: { invalidateRetiringOccupant }, activityOracle: { declareOccupantSwap },
+        predecessorRecapResolver: resolvePredecessorRecap as never, readinessTimeoutMs: 50, sleep: async () => {},
+      });
+      await claude.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh", operator: "orch-lead@seat-rig" });
+      expect(launchHarness).toHaveBeenCalledTimes(1);
+      const successorBinding = launchHarness.mock.calls[0]![0] as { launchAdditions?: { appendSystemPromptFile?: string } };
+      expect(successorBinding.launchAdditions?.appendSystemPromptFile).toBe(prepared.additions.appendSystemPromptFile);
+      // The successor's conversation starts with today's prompt: nothing pending for it.
+      expect(systemPromptPendingNote(paths, "claude-successor-tok")).toBeUndefined();
+    } finally {
+      fs.rmSync(src, { recursive: true, force: true });
+    }
+  });
+
+  it("#2426: a Claude seat that loads openrig-core itself drops OpenRig's earlier copies of its skills once its predecessor has exited, before its successor starts, and names them", async () => {
+    const saved = process.env["OPENRIG_HOME"];
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "handover-core-copies-"));
+    process.env["OPENRIG_HOME"] = home;
+    try {
+      // The vendored core, which the seat's saved selection loads directly, and the copies a launch before #2433 left.
+      const core = path.join(home, "plugins", "openrig-core");
+      fs.mkdirSync(path.join(core, ".claude-plugin"), { recursive: true });
+      fs.writeFileSync(path.join(core, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "openrig-core", version: "0.7.9" }));
+      for (const id of ["alpha", "edited"]) {
+        fs.mkdirSync(path.join(core, "skills", id), { recursive: true });
+        fs.writeFileSync(path.join(core, "skills", id, "SKILL.md"), `---\nname: ${id}\ndescription: The ${id} skill.\n---\n\nUse it.\n`);
+      }
+      const { rig, node } = seedSeat({ runtime: "claude-code" });
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, '[]', '[]', 'claude-code')")
+        .run(node.id, JSON.stringify([{ category: "plugin", absolutePath: core }]));
+      const paths = seatSkillPaths({ rigId: rig.id, logicalId: "dev.impl", runtime: "claude-code" });
+      ensureSeatSkillPlugin(paths);
+      const old = reconcileSkillLoadout({
+        loadout: { catalogRoot: home, catalogRevision: null, catalogDigest: null, projectSelectionDeclared: false, projectSelection: [],
+          entries: resolvePluginSkills({ pluginId: "openrig-core", pluginRoot: core, runtime: "claude-code" }).entries },
+        runtime: "claude-code", cwd: paths.root, apply: true, topologyOwner: "dev-impl@seat-rig", location: seatSkillLocation(paths),
+      });
+      expect(old.errors).toEqual([]);
+      fs.writeFileSync(path.join(paths.skillsRoot, "edited", "SKILL.md"), "My own notes.\n");
+      const alpha = path.join(paths.skillsRoot, "alpha");
+      // Nothing is removed under the running predecessor; the successor's harness starts without the copy.
+      const presentWhenSignalled: boolean[] = [];
+      signalPaneProcess.mockImplementation(async () => { presentWhenSignalled.push(fs.existsSync(alpha)); return { ok: true }; });
+      const presentAtLaunch: boolean[] = [];
+      launchHarness.mockImplementation(async () => { presentAtLaunch.push(fs.existsSync(alpha)); return { ok: true, resumeToken: "claude-successor-tok", resumeType: "claude_id" }; });
+      capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+      const claude = new SeatHandoverService({
+        db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter: tmux(),
+        now: () => new Date("2026-04-24T18:30:00.000Z"), newSuccessorId: () => "01SUCCID0",
+        runtimeAdapters: { "claude-code": { runtime: "claude-code", launchHarness, checkReady } as unknown as RuntimeAdapter },
+        contextUsageStore: { readSidecar } as never, resumeTokenCapturer: { captureCodexThreadId } as never,
+        claudeProcessStartedAt: async () => "2026-04-24T18:29:59.000Z",
+        occupantInvalidator: { invalidateRetiringOccupant }, activityOracle: { declareOccupantSwap },
+        predecessorRecapResolver: resolvePredecessorRecap as never, readinessTimeoutMs: 50, sleep: async () => {},
+      });
+      const result = await claude.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh", operator: "orch-lead@seat-rig" });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+      expect(presentWhenSignalled[0]).toBe(true);
+      expect(presentAtLaunch).toEqual([false]);
+      expect("result" in result ? result.result.warnings : undefined).toEqual(expect.arrayContaining([
+        "Seat skills: removed OpenRig's copy of openrig-core's alpha, which this seat now loads from the plugin itself",
+        `Seat skills: kept ${path.join(paths.skillsRoot, "edited")}, though openrig-core also supplies edited: it was changed after OpenRig wrote it`,
+      ]));
+      expect(fs.readFileSync(path.join(paths.skillsRoot, "edited", "SKILL.md"), "utf8")).toBe("My own notes.\n");
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = saved;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("a seat's declared env (its rig's, with the member's over it) reaches the successor's pane — the REAL lookupNode→createSuccessor→respawn path", async () => {
@@ -1311,5 +1953,45 @@ describe("SeatHandoverService", () => {
     const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh", operator: "orch-lead@seat-rig" });
     expect(result.ok).toBe(true);
     expect((launchHarness.mock.calls[0]![0] as { effort?: string }).effort).toBe("high");
+  });
+
+  it.each(["codex", "claude-code"])("carries the %s seat's persisted launch_wrapper onto the handover successor binding", async runtime => {
+    const { node } = seedSeat({ runtime });
+    if (runtime === "claude-code") {
+      launchHarness.mockImplementation(async () => ({ ok: true, resumeToken: "claude-successor-tok", resumeType: "claude_id" }));
+      capturePaneScreen.mockResolvedValue("Claude Code v2.1.303\n❯ \n────────────────────\n  ⏵⏵ accept edits on (shift+tab to cycle)");
+      claudeProcessStartedAt = async () => "2026-04-24T18:29:59.000Z";
+    }
+    service = newService(undefined, undefined, runtime);
+    rigRepo.setNodeLaunchWrapper(node.id, ["rtk", "--handover"]);
+    const result = await service.handover({
+      seatRef: "dev-impl@seat-rig",
+      reason: "context-wall",
+      source: "fresh",
+      operator: "orch-lead@seat-rig",
+    });
+    expect(result.ok).toBe(true);
+    expect((launchHarness.mock.calls[0]![0] as { launchWrapper?: string[] }).launchWrapper).toEqual(["rtk", "--handover"]);
+  });
+
+  it("fails closed before cutover when the seat's stored launch_wrapper is corrupt", async () => {
+    const { node } = seedSeat({ runtime: "codex" });
+    capturePaneScreen.mockImplementationOnce(async () => {
+      db.prepare("UPDATE nodes SET launch_wrapper = ? WHERE id = ?").run("{corrupt", node.id);
+      return "predecessor screen tail";
+    });
+    const result = await service.handover({
+      seatRef: "dev-impl@seat-rig",
+      reason: "context-wall",
+      source: "fresh",
+      operator: "orch-lead@seat-rig",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      code: "successor_create_failed",
+    });
+    expect((result as { message: string }).message).toMatch(/Permission selection:.*launch_wrapper/);
+    expect(respawnPane).not.toHaveBeenCalled();
+    expect(launchHarness).not.toHaveBeenCalled();
   });
 });

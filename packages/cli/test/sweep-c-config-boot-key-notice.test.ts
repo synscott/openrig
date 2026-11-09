@@ -20,10 +20,18 @@ describe("SWEEP-c — boot-only config keys warn while the daemon runs", () => {
   beforeEach(() => { errSpy = vi.spyOn(console, "error").mockImplementation(() => {}); vi.spyOn(console, "log").mockImplementation(() => {}); });
   afterEach(() => vi.restoreAllMocks());
 
-  it("daemon.port with a RUNNING daemon prints the restart-required notice", async () => {
-    await runSet("daemon.port", "9999", true);
+  it.each([["daemon.port", "9999"], ["daemon.db_conflict", "stop"]])("%s with a RUNNING daemon prints the restart-required notice", async (key, value) => {
+    await runSet(key, value, true);
     const out = errSpy.mock.calls.map((c) => c.join(" ")).join("\n");
     expect(out).toMatch(/next daemon restart|restart the daemon/i);
+  });
+
+  it("tmux selection reports both restart and pending live-session migration", async () => {
+    await runSet("terminal.tmux_server", "isolated", true);
+    const out = errSpy.mock.calls.map(c => c.join(" ")).join("\n");
+    expect(out).toMatch(/next daemon restart/);
+    expect(out).toMatch(/surviving sessions keep their previous server/);
+    expect(out).toContain("rig terminal status");
   });
 
   it("a non-boot key prints NO notice; boot key with daemon down prints NO notice", async () => {

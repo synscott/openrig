@@ -22,12 +22,69 @@ describe("wrapPaneEnvelope — slice 23 envelope renderer (daemon-side)", () => 
     expect(out).toContain('↩ Reply: rig send driver-3@my-rig "..."');
   });
 
+  it.each(["human@kernel", "human@host", "human-alice@kernel", "human-alice@host"])(
+    "gives %s a queue update reply with the existing human-route fields",
+    (sender) => {
+      const body = "Please check this.\nKeep the actor unchanged.";
+      const out = wrapPaneEnvelope(sender, "driver@rig", body, { replyToQitem: "qitem-original" });
+      expect(out).toContain(`From: ${sender}\nTo: driver@rig\n`);
+      expect(out.split("\n---\n")[1]).toBe(body);
+      expect(out.split("\n").at(-1)).toBe(`↩ Reply if needed: rig queue create --destination ${sender} --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify`);
+      expect(out).not.toContain(`rig send ${sender}`);
+      expect(out).not.toContain("--reply-to"); // Slack-thread guidance belongs to registered external addresses.
+    },
+  );
+
+  it.each(["human@kernel@host-origin", "human-reviewer@host@host-origin", "alex@external@host-origin"])(
+    "a forwarded person %s gets a queue hint retaining the origin host",
+    (sender) => {
+      const body = "Original body\nkept verbatim.";
+      const out = wrapPaneEnvelope(sender, "driver@receiver", body);
+      expect(out).toContain("From: " + sender + "\nTo: driver@receiver\n");
+      expect(out.split("\n---\n")[1]).toBe(body);
+      expect(out.split("\n").at(-1)).toBe("↩ Reply if needed: rig queue create --destination " + sender + ' --human-intent update --summary "<one line>" --evidence-ref "<path>" --body "..." --verify');
+    },
+  );
+
+  it("keeps host-qualified look-alike seats and malformed human triples on the ordinary hint", () => {
+    for (const sender of ["humanity@kernel@host-origin", "human@real-rig@host-origin", "dev-human@host@host-origin",
+      "human@kernel@", "human@kernel@host-origin@extra"]) {
+      expect(wrapPaneEnvelope(sender, "driver@receiver", "hi").split("\n").at(-1))
+        .toBe("↩ Reply: rig send " + sender + ' "..."');
+    }
+  });
+
+  it("keeps similarly named real seats on the ordinary reply route", () => {
+    for (const sender of ["human@my-rig", "humanity@kernel", "dev-human@host", "dev-human@rig@origin-host"]) {
+      expect(wrapPaneEnvelope(sender, "driver@rig", "hi").split("\n").at(-1))
+        .toBe(`↩ Reply: rig send ${sender} "..."`);
+    }
+  });
+
   it("routes an external sender's reply through the durable human queue", () => {
     const out = wrapPaneEnvelope("decision-maker@external", "driver@rig", "Decision received.");
     expect(out).toContain("From: decision-maker@external");
     expect(out).toContain('↩ Reply if needed: rig queue create --destination decision-maker@external --summary "<one line>" --body "..." --verify');
     expect(out).not.toContain("rig send decision-maker@external");
     expect(wrapPaneEnvelope("driver@external-tools", "guard@rig", "Status.")).toContain('↩ Reply: rig send driver@external-tools "..."');
+  });
+
+  // Daemon-only: OpenRig's own senders never send through the CLI twin. A seat's name is `{pod}-{member}@{rig}`, so it can't be
+  // `daemon@kernel` or a `system:` actor.
+  it("a person's message that names its row tells the agent how to answer in that Slack thread", () => {
+    const out = wrapPaneEnvelope("alex@external", "driver@rig", "Queue handoff: qitem-1 - check your queue.", { replyToQitem: "qitem-1" });
+    expect(out.split("\n").at(-1)).toBe('↩ Reply if needed: rig queue create --destination alex@external --human-intent update --reply-to qitem-1 --summary "<one line>" --body "..." --verify');
+    expect(wrapPaneEnvelope("lead@rig", "driver@rig", "hi", { replyToQitem: "qitem-1" }).split("\n").at(-1)).toBe('↩ Reply: rig send lead@rig "..."');
+  });
+
+  it("offers no reply when OpenRig itself sent it (daemon@kernel, a system: actor); a seat on a rig named system still gets one", () => {
+    for (const sender of ["daemon@kernel", "system:health"]) {
+      const out = wrapPaneEnvelope(sender, "driver@rig", "Queue handoff: qitem-X - check your queue.");
+      expect(out).toContain(`From: ${sender}`);
+      expect(out.split("\n").at(-1)).toBe("↩ Sent by OpenRig itself, not by a seat. Act on the row it names.");
+      expect(out).not.toContain("rig send");
+    }
+    expect(wrapPaneEnvelope("ops-lead@system", "driver@rig", "Status.")).toContain('↩ Reply: rig send ops-lead@system "..."');
   });
 
   it("preserves the original body verbatim between the dash separators", () => {

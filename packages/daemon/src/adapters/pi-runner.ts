@@ -3,7 +3,7 @@
 // The runner is what makes a Pi seat behave like a normal OpenRig tmux seat
 // while everything underneath stays structured RPC:
 //
-//   pane stdin (rig send / human typing)  ──▶ RPC prompt / steer / follow_up
+//   pane stdin (rig send / human typing)  ──▶ RPC prompt (queued as a steer while busy) / follow_up
 //   pi RPC events (typed JSONL)           ──▶ (a) human-readable pane mirror
 //                                             (b) activity + session_identity
 //                                                 POSTs to the daemon
@@ -29,6 +29,7 @@ import { stripVTControlCharacters } from "node:util";
 import { formatDaemonHostForUrl } from "./daemon-url.js";
 import { credentialTaint, judgeChargeProvenance, piCredentialEvidence, piCredentialNotice, type PiCredentialEvidence } from "./pi-readiness.js";
 import { extractPiUsageFacts, parsePiSessionHeader, tiesPiForkHeader, type PiSessionBoundary, type PiUsageFact } from "../domain/pi-usage-facts.js";
+import { validateLaunchWrapper } from "../domain/launch-wrapper.js";
 import { OpenRouterChargeLookup, openRouterGenerationFetcher, type ChargeProvenance } from "./pi-openrouter-charge.js";
 import { OMP_MAX_FRAME_BYTES, OmpFrameDecoder, ompProtocolV2Limit } from "./omp-rpc-frame.js";
 import { resolveWindowsPiCommand } from "./windows-pi-command.js";
@@ -37,6 +38,34 @@ import {
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER, PI_PROVIDER_ENV_VARS,
   type PiRunnerState, type RunnerRuntime,
 } from "./pi-runner-protocol.js";
+
+/** Bind the selected account's credentials while retaining the seat's own Pi resources. */
+export function preparePiAccount(agentDir: string, accountHome: string | undefined): void {
+  fs.mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const marker = nodePath.join(agentDir, ".openrig-account");
+  const auth = nodePath.join(agentDir, "auth.json");
+  // Validate every explicit home, including the seat's own directory, before changing any link.
+  if (accountHome) {
+    const source = nodePath.join(accountHome, "auth.json");
+    fs.accessSync(source, fs.constants.R_OK);
+    if (!fs.statSync(source).isFile()) throw new Error("Selected Pi auth must be a file");
+  }
+  if (accountHome && fs.realpathSync(accountHome) !== fs.realpathSync(agentDir)) {
+    const source = nodePath.join(accountHome, "auth.json");
+    const current = fs.lstatSync(auth, { throwIfNoEntry: false });
+    if (current && (!current.isSymbolicLink() || !fs.existsSync(marker))) {
+      throw new Error("Existing Pi login is not a managed account link; use a confirmed account switch");
+    }
+    fs.rmSync(auth, { force: true });
+    // Record ownership before linking so a crash between these writes is retryable.
+    fs.writeFileSync(marker, accountHome, { mode: 0o600 });
+    fs.symlinkSync(source, auth);
+  } else if (!accountHome && fs.existsSync(marker)) {
+    // A Pi login may have replaced the link since it was installed.
+    if (fs.lstatSync(auth, { throwIfNoEntry: false })?.isSymbolicLink()) fs.rmSync(auth);
+    fs.rmSync(marker);
+  }
+}
 
 // ── Submitted input boundaries ─────────────────────────────────────────────
 // Canonical TTY buffers can overflow before Node sees even the paste terminator.
@@ -180,11 +209,16 @@ function piCredentialHint(message: string): string {
     : " For managed Pi, configure this provider in the seat's PI_CODING_AGENT_DIR (auth.json or models.json). Its key is not in OpenRig's Pi environment passthrough map; default Pi logins are not automatically shared.";
 }
 
-function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
-  // Empty or control-only fields must not hide a later usable diagnostic.
-  const text = details.map(detail => typeof detail === "string"
+/** The first usable diagnostic, on one line with control characters removed. Empty or control-only fields must not hide
+ *  a later usable one. */
+function diagnosticText(details: unknown[]): string {
+  return details.map(detail => typeof detail === "string"
     ? stripVTControlCharacters(detail).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim()
     : "").find(Boolean) ?? "";
+}
+
+function errorNotice(details: unknown[], runtime: RunnerRuntime): string {
+  const text = diagnosticText(details);
   const marker = runtime === "omp" ? "[omp-runner] ERROR" : PI_RUNNER_ERROR_MARKER;
   return `${marker} ${text.slice(0, 400) || "request failed"}${runtime === "pi" ? piCredentialHint(text) : ""}`;
 }
@@ -219,6 +253,10 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // Pi keeps main's mapping: turn_end carries no notice.
       return runtime === "omp" ? { mirrorLines: [], ...modelErrorNotice(event, runtime) } : { mirrorLines: [] };
     case "turn_start":
+      // Some turn paths omit agent_start; turn_start still opens a turn, so it reports the seat
+      // working and opens the streaming flag — the beat must cover a turn whose only opening
+      // event was turn_start, or a long quiet turn on that path still loses its working state.
+      return { mirrorLines: [], activity: { hookEvent: "active", subtype: "turn_start" }, streaming: runtime === "omp" ? undefined : true };
     case "message_start":
       return { mirrorLines: [] };
     case "message_update": {
@@ -228,8 +266,11 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // same deltas, so appending it repeated the growing text. Thinking and
       // tool-call argument deltas stay out of the pane; tool calls get their
       // own one-line summaries from tool_execution_*.
+      // OMP and Pi both provide text_delta frames. The enclosing message is a
+      // cumulative snapshot, not another delta: appending it duplicates replies.
       const update = event.assistantMessageEvent as Record<string, unknown> | undefined;
-      const delta = update?.type === "text_delta" && typeof update.delta === "string" ? update.delta : "";
+      const hasDelta = update?.type === "text_delta" && typeof update.delta === "string";
+      const delta = hasDelta ? update.delta as string : "";
       return delta ? { mirrorLines: [], mirrorAppend: delta } : { mirrorLines: [] };
     }
     case "message_end":
@@ -251,8 +292,13 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       return { mirrorLines: [] };
     case "compaction_start":
       return { mirrorLines: [`[${runtime}] compacting context…`], activity: { hookEvent: "active", subtype: "compaction" } };
-    case "compaction_end":
-      return { mirrorLines: [`[${runtime}] compaction done`] };
+    case "compaction_end": {
+      // Pi's compaction_end says `aborted` when it was cancelled, and carries `errorMessage` when it failed and wrote no
+      // summary (Pi's docs/rpc.md). An end that names neither is done.
+      const failure = diagnosticText([event.errorMessage]).slice(0, 400);
+      return { mirrorLines: [event.aborted === true ? `[${runtime}] compaction cancelled`
+        : failure ? `[${runtime}] compaction failed: ${failure}` : `[${runtime}] compaction done`] };
+    }
     // OMP names its automatic compaction separately. Pi keeps main's mapping
     // (unmapped), so an idle Pi seat never reads as running after one.
     case "auto_compaction_start":
@@ -378,18 +424,31 @@ export async function readPiSessionEntryIds(
 
 export class RunnerCore {
   private streaming = false;
+  /** Pi runs this runner has opened, each posted as an accepted turn (contract section 4): the working beat names it. */
+  private turn = 0;
   private sessionFile: string | undefined;
   private sessionId: string | undefined;
   private lastEntryId: string | undefined;
   private ready = false;
+  private lastHeartbeatMs: number | null = null;
+  /** When this runner last posted any activity payload, so the streaming beat spaces itself
+   *  behind real events (a tool call is evidence enough; the beat covers the silent gaps). */
+  private lastActivityPostMs: number | null = null;
+  /** Hook event of the last activity this runner posted; null until it posts one. */
+  private lastPostedHook: string | null = null;
   private assistantErrorShown = false;
   private started = false;
-  /** OMP attention (runtime_error | permission_prompt) that must survive the
-   *  end of the turn; cleared by the next agent_start. */
-  private attention: "runtime_error" | "permission_prompt" | null = null;
+  /** OMP failures/approvals survive the turn until agent_start, except typed
+   *  transient assistant failures, released only when agent_end completes. */
+  private attention: "runtime_error" | "permission_prompt" | "transient_turn_error" | null = null;
   /** Whether the last activity posted is that attention. Later activity in
    *  the same turn (a tool call after a denied approval) replaces it. */
   private attentionIsLatest = false;
+  // Native OMP retry summaries have no message/status. Correlate only within
+  // the announced attempt, using the latest typed assistant failure's exact
+  // diagnostic as an identity check, never as a transient-error classifier.
+  private retryAttempt: number | null = null;
+  private retryFailure: string | null = null;
   /** Set once the daemon confirms it persisted the resume token. */
   private identityPersisted = false;
   private identityInFlight = false;
@@ -519,17 +578,26 @@ export class RunnerCore {
       const message = block.slice("/followup ".length);
       this.io.sendRpc({ type: "follow_up", message });
       this.io.mirrorLine(`you (follow-up) ▸ ${message}`);
+      this.acceptIntoOpenRun();
       return;
     }
-    if (this.streaming) {
-      // Mid-stream: steer delivers after the current turn's tool calls,
-      // before the next model call (Pi's documented semantics).
-      this.io.sendRpc({ type: "steer", message: block });
-      this.io.mirrorLine(`you (steer) ▸ ${block}`);
-      return;
-    }
-    this.io.sendRpc({ type: "prompt", message: block });
-    this.io.mirrorLine(`you ▸ ${block}`);
+    // The runtime decides, not the runner: with streamingBehavior "steer", Pi and OMP run the prompt when idle and,
+    // while busy, queue it as a steer, delivered after the current turn's tool calls and before the next model call.
+    // The runner's `streaming` starts only at agent_start, so it can't tell when a turn is about to start (#1932) or
+    // when a prompt was consumed locally and started none. It labels the mirror line only.
+    this.io.sendRpc({ type: "prompt", message: block, streamingBehavior: "steer" });
+    this.io.mirrorLine(this.streaming ? `you (steer) ▸ ${block}` : `you ▸ ${block}`);
+    this.acceptIntoOpenRun();
+  }
+
+  /** A working beat counts only for the latest accepted turn, and each prompt the runner gives the agent is accepted with
+   *  its own number (contract section 4). One sent while a Pi run is open is posted as it's sent, and the run's end
+   *  closes it. One sent while idle is posted when its run opens (handleEvent), so a prompt Pi handles without a run opens
+   *  no turn. */
+  private acceptIntoOpenRun(): void {
+    if (this.runtime !== "pi" || !this.streaming) return;
+    this.turn += 1;
+    this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
   }
 
   /** Child process exit — honest, loud, durable. */
@@ -564,6 +632,13 @@ export class RunnerCore {
         if (this.runtime === "omp") this.io.stopChild?.();
         return;
       }
+      if (record.id === CATCH_UP_ID && this.runtime === "pi") {
+        // A refused catch-up (a saved cursor this session's history doesn't hold, such as an older runner's UI-event
+        // id) is history sync, not the seat's resume: say so, and take a confirmed cursor from the history's tail.
+        this.io.mirrorLine(`[pi-runner] History catch-up didn't run (${message}). That's history sync, separate from the seat's resume; reading the history cursor again.`);
+        this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
+        return;
+      }
       this.io.mirrorLine(`[${this.runtime}-runner] ERROR rpc: ${message}`);
       // Only a rejected input means the seat cannot do the requested work.
       // A mistimed /abort (or any control command) leaves the seat idle.
@@ -578,6 +653,7 @@ export class RunnerCore {
       const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
       this.sessionFile = sessionFile ?? this.sessionFile;
       this.sessionId = sessionId ?? this.sessionId;
+      const wasReady = this.ready;
       this.ready = this.runtime === "pi" || !!this.sessionFile;
       if (!this.ready) {
         this.io.mirrorLine("[omp-runner] ERROR rpc get_state returned no session file; cannot provide a resume token");
@@ -585,7 +661,14 @@ export class RunnerCore {
         return;
       }
       this.writeSidecar({});
-      this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+      if (!wasReady) {
+        // Only the initial transition to ready announces READY in the pane.
+        // Subsequent get_state evaluations confirm liveness silently to avoid
+        // terminal output spam while preserving state updates.
+        this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+      }
+      // Re-post session identity on every successful get_state reply so the
+      // daemon can discover replacement runners and keep session records current.
       this.postSessionIdentity();
       return;
     }
@@ -677,14 +760,51 @@ export class RunnerCore {
     }, () => { /* best-effort: resent on the next refresh */ });
   }
 
-  private raiseAttention(subtype: "runtime_error" | "permission_prompt"): void {
-    // Runtime failures outrank denied approvals. Only emit when the visible
-    // attention changes or intervening activity replaced it.
-    const next = this.attention === "runtime_error" ? this.attention : subtype;
+  private raiseAttention(subtype: "runtime_error" | "permission_prompt" | "transient_turn_error"): void {
+    // Persistent failures and denied approvals outrank transient failures.
+    // Only emit when attention changes or intervening activity replaced it.
+    const next = this.attention === "runtime_error" ? this.attention
+      : this.attention === "permission_prompt" && subtype === "transient_turn_error" ? this.attention : subtype;
     if (this.attention === next && this.attentionIsLatest) return;
     this.attention = next;
     this.attentionIsLatest = true;
-    this.io.postActivity(this.activityPayload("Notification", next));
+    this.io.postActivity(this.activityPayload("Notification", next === "transient_turn_error" ? "runtime_error" : next));
+  }
+
+  /** Idle and streaming heartbeat. A Pi runner only reports at turn and tool boundaries, and the
+   *  daemon reads any hook older than its freshness window as `unknown` (`stale_runtime_hook`): an
+   *  idle seat read `unknown` five minutes after its last turn, and a seat mid-turn read `unknown`
+   *  through a long silent LLM request (the seat-activity oracle stops a bare working hook from
+   *  deciding after 15s, HOOK_AUTHORITY_WINDOW_MS). Beat while ready and not waiting on the
+   *  operator: idle (Stop) when no turn is in flight, and while `streaming` says one is, the
+   *  contract's working beat (`active` / `liveness`, section 4) for the run's accepted turn, each
+   *  at most once per its own interval behind the newest real event. Same honesty
+   *  rule: a runner that dies stops beating and the seat goes back to `unknown` (handlePiExit
+   *  clears `ready`, so no beat outlives the process it vouches for). Pi only; the OMP identity
+   *  handshake has its own retry.
+   *
+   *  Liveness of `streaming` (CodeRabbit 2336): the flag opens on agent_start/turn_start and
+   *  closes only on agent_end — can a turn end without one? Pi's run loop (dist/bundle/chunks,
+   *  runLoop, pi 0.84.4) emits agent_end on every exit: `stopReason === "error" ||
+   *  "aborted"` → finishTurn, turn_end, agent_end, return; decision end → turn_end, agent_end,
+   *  return; loop break → agent_end. That covers /abort (stopReason "aborted"), assistant errors
+   *  and exhausted auto-retries (stopReason "error"), and turns opened by turn_start alone
+   *  (turn_start fires only inside runLoop). A child crash is handlePiExit's honest exit, not a
+   *  silent working state. So a lost agent_end is not a Pi outcome, and no time limit is needed
+   *  on the beat — long silent turns stay covered. */
+  heartbeat(): void {
+    if (this.runtime !== "pi" || !this.ready || this.attention) return;
+    const now = Date.parse(this.io.now());
+    if (this.streaming) {
+      if (this.lastActivityPostMs !== null && now - this.lastActivityPostMs < STREAM_HEARTBEAT_MS) return;
+      this.io.postActivity(this.activityPayload("active", "liveness", { turnId: String(this.turn), livenessSeconds: WORK_LIVENESS_SECONDS }));
+      return;
+    }
+    // `streaming` follows only agent_start/agent_end; turn_start, compaction and auto-retry also report the agent
+    // working. Beat only when the last thing posted was a Stop (or nothing yet), so a beat never lands mid-turn.
+    if (this.lastPostedHook !== null && this.lastPostedHook !== "Stop") return;
+    if (this.lastHeartbeatMs !== null && now - this.lastHeartbeatMs < IDLE_HEARTBEAT_MS) return;
+    this.io.postActivity(this.activityPayload("Stop", "idle_heartbeat"));
   }
 
   private clearAttention(): void {
@@ -693,15 +813,24 @@ export class RunnerCore {
   }
 
   private handleEvent(event: Record<string, unknown>): void {
-    if (this.runtime === "omp" && event.type === "extension_ui_request") {
+    if ((this.runtime === "omp" || this.runtime === "pi") && event.type === "extension_ui_request") {
       const method = event.method;
+      const dialog = method === "select" || method === "confirm" || method === "input" || method === "editor";
+      const detail = [event.title, event.message].filter((text): text is string => typeof text === "string")
+        .map(stripVTControlCharacters).join(" — ").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").slice(0, 400);
+      if (this.runtime === "pi" && !dialog) {
+        if (method === "notify") this.io.mirrorLine(`[pi-runner] ${detail}`);
+        return; // Pi notifications and other fire-and-forget UI requests expect no answer.
+      }
       // RPC does not mount an interactive UI. Reply at once; otherwise the
       // child can wait forever for approval that cannot be given in the pane.
       if (typeof event.id === "string") {
         this.io.sendRpc({ type: "extension_ui_response", id: event.id, cancelled: true });
       }
-      if (method === "select" || method === "confirm" || method === "input" || method === "editor") {
-        this.io.mirrorLine("[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
+      if (dialog) {
+        this.io.mirrorLine(this.runtime === "pi"
+          ? `[pi-runner] Extension ${method}: ${detail}; cancelled because the managed RPC pane cannot answer it. Operator action required: review the cancelled request and re-send an instruction the extension can complete without a dialog.`
+          : "[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
         this.raiseAttention("permission_prompt");
       }
       return;
@@ -710,27 +839,45 @@ export class RunnerCore {
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
     }
-    // Durable cursor: any event carrying a session-entry id advances it.
-    const entryId = typeof event.entryId === "string" ? event.entryId : (typeof event.id === "string" ? event.id : undefined);
+    // Durable cursor: any event carrying a session-entry id advances it. A Pi event's own `id` isn't one (Pi's
+    // history ids reach the cursor through get_entries), so on Pi only an explicit `entryId` counts.
+    const entryId = typeof event.entryId === "string" ? event.entryId
+      : (this.runtime !== "pi" && typeof event.id === "string" ? event.id : undefined);
     if (entryId) {
       this.lastEntryId = entryId;
       this.writeSidecar({});
     }
 
+    if (event.type === "agent_start") this.clearAttention();
     if (this.runtime === "omp") {
-      if (event.type === "agent_start") this.clearAttention();
+      if (event.type === "agent_start" || event.type === "turn_start"
+        || (event.type === "message_start" && message?.role === "assistant")
+        || ((event.type === "message_end" || event.type === "turn_end")
+          && message?.role === "assistant" && message.stopReason !== "error")) this.retryFailure = null;
+      if (event.type === "auto_retry_start") {
+        this.retryAttempt = Number.isInteger(event.attempt) && (event.attempt as number) > 0 ? event.attempt as number : null;
+        this.retryFailure = null;
+      }
       // A successful automatic retry supersedes the failed attempt.
-      if (event.type === "auto_retry_start" && this.attention === "runtime_error") this.clearAttention();
+      if (event.type === "auto_retry_start" && (this.attention === "runtime_error" || this.attention === "transient_turn_error")) this.clearAttention();
       // Some paths omit agent_start; turn_start still opens a new turn.
       if (event.type === "turn_start") this.assistantErrorShown = false;
     }
     const mapped = mapPiEvent(event, this.runtime);
+    // A working beat counts only for the latest accepted turn. Pi's runs start from this runner's prompts, so the run
+    // that opens is posted as one, before its first event; a prompt Pi handles without a run opens none. A prompt sent
+    // into an open run is accepted as it's sent (acceptIntoOpenRun).
+    const opening = this.runtime === "pi" && mapped.streaming === true && !this.streaming;
     if (mapped.streaming !== undefined) this.streaming = mapped.streaming;
+    if (opening) {
+      this.turn += 1;
+      this.io.postActivity(this.activityPayload("UserPromptSubmit", "accepted", { turnId: String(this.turn) }));
+    }
     // OMP writes its JSONL lazily; re-announce identity after each turn until
     // the daemon confirms the token. Pi's get_state identity is final.
     if (event.type === "agent_end" && this.runtime === "omp") this.postSessionIdentity();
     if (event.type === "agent_end") {
-      // QA RED fold (qitem-20260707020922): live events do not reliably carry
+      // QA RED fold: live events do not reliably carry
       // session-entry ids, so the durable cursor starved (lastEntryId stayed
       // null in real runs). Refresh it from the source of truth after every
       // completed turn — get_entries returns append-order entries with stable
@@ -748,11 +895,34 @@ export class RunnerCore {
         this.io.mirrorLine(mapped.errorNotice);
       }
       this.assistantErrorShown = true;
-      // OMP still ends the turn normally after a model failure; the operator
-      // has to act, so the seat shows attention rather than idle.
-      if (this.runtime === "omp") this.raiseAttention("runtime_error");
+      // Only typed, explicitly transient HTTP failures may release the send
+      // guard at agent_end. Unknown/auth/configuration failures stay attention;
+      // diagnostic prose is never used to decide whether a retry is safe.
+      const status = message?.errorStatus;
+      const transient = (event.type === "message_end" || event.type === "turn_end")
+        && message?.role === "assistant" && message.stopReason === "error"
+        && typeof status === "number" && [408, 429, 500, 502, 503, 504, 529].includes(status);
+      if (this.runtime === "omp") {
+        const retrySummary = event.type === "auto_retry_end" && event.success === false
+          && this.retryAttempt !== null && event.attempt === this.retryAttempt
+          && this.retryFailure !== null && event.finalError === this.retryFailure
+          && event.message === undefined && event.error === undefined;
+        if (event.type !== "auto_retry_end") {
+          this.retryFailure = transient && this.retryAttempt !== null && typeof message?.errorMessage === "string"
+            && message.errorMessage.length > 0 ? message.errorMessage : null;
+        } else if (!retrySummary) {
+          this.retryFailure = null;
+        }
+        this.raiseAttention(transient || retrySummary ? "transient_turn_error" : "runtime_error");
+      }
+    }
+    if (this.runtime === "omp" && (event.type === "auto_retry_end" && event.success === true
+      || event.type === "agent_end" && event.isTerminal !== false)) {
+      this.retryAttempt = null;
+      this.retryFailure = null;
     }
     if (!mapped.activity) return;
+    if (event.type === "agent_end" && this.attention === "transient_turn_error") this.clearAttention();
     if (mapped.activity.hookEvent === "Stop" && this.attention) {
       // The turn ended, but the operator still has to act. Drop the Stop; if
       // later activity replaced the attention, restore it as the final state.
@@ -792,14 +962,25 @@ export class RunnerCore {
     ).finally(() => { this.identityInFlight = false; });
   }
 
-  private activityPayload(hookEvent: string, subtype: string | null): Record<string, unknown> {
+  /** Each activity post's place in this runner's event order: posts aren't awaited, so they can arrive out of order. */
+  private activitySequence = 0;
+
+  private activityPayload(hookEvent: string, subtype: string | null, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    this.lastPostedHook = hookEvent;
+    this.lastActivityPostMs = Date.parse(this.io.now());
+    // Any posted Stop is an idle report, so the next beat is due a full interval after it, not just after a beat.
+    if (hookEvent === "Stop") this.lastHeartbeatMs = Date.parse(this.io.now());
     return {
+      sequence: ++this.activitySequence,
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       generation: this.identity.generation ?? null,
       runtime: this.runtime,
       hookEvent,
       subtype,
+      // A Pi runner's idle report holds only while it keeps beating; the daemon expires it after two missed beats.
+      ...(this.runtime === "pi" && hookEvent === "Stop" && subtype !== "pi_exited" ? { livenessSeconds: IDLE_HEARTBEAT_MS / 1000 } : {}),
+      ...extra,
       occurredAt: this.io.now(),
     };
   }
@@ -822,24 +1003,31 @@ export class RunnerCore {
 // ── CLI entry ────────────────────────────────────────────────────────────────
 
 interface RunnerArgs {
+  accountHome?: string;
   runtime?: RunnerRuntime;
   sessionName: string;
   stateRoot: string;
   cwd: string;
   launchId: string;
   model?: string;
+  thinking?: string;
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
   /** OPR.0.7.0.2: report usage facts from persisted entries (the daemon passes it when usage.pi_cost_facts is on). */
   usageFacts?: boolean;
   openRouterCharge?: boolean;
+  /** Pi only: resolved launch_wrapper argv (wrapper[0] must be an absolute path). */
+  launchWrapper?: string[];
 }
 
 export function parseRunnerArgs(argv: string[]): RunnerArgs {
   const args: Partial<RunnerArgs> & { trust?: "approve" | "no-approve" } = {};
+  // The tokens read as flags; a value, such as a --thinking of "--approval-mode", never counts as one.
+  const flags = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]!;
+    flags.add(flag);
     const next = () => {
       const value = argv[++i];
       if (value === undefined) throw new Error(`${flag} requires a value`);
@@ -853,14 +1041,21 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
         args.runtime = runtime;
         break;
       }
+      case "--account-home": args.accountHome = next(); break;
       case "--state-root": args.stateRoot = next(); break;
       case "--cwd": args.cwd = next(); break;
       case "--launch-id": args.launchId = next(); break;
       case "--model": args.model = next(); break;
+      case "--thinking": args.thinking = next(); break;
       case "--session": args.sessionFile = next(); break;
       case "--fork": args.forkRef = next(); break;
       case "--usage-facts": args.usageFacts = true; break;
       case "--openrouter-charge": args.openRouterCharge = true; break;
+      case "--launch-wrapper-arg": {
+        const arg = next();
+        (args.launchWrapper ??= []).push(arg);
+        break;
+      }
       case "--approve": args.trust = "approve"; break;
       case "--no-approve": args.trust = "no-approve"; break;
       case "--approval-mode": {
@@ -877,13 +1072,26 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
   if (!args.cwd) throw new Error("--cwd is required");
   if (!args.launchId) throw new Error("--launch-id is required (launch-attempt scoping)");
   if (args.runtime === "omp") {
-    if (!argv.includes("--approval-mode") || argv.some((flag) => flag === "--approve" || flag === "--no-approve")) {
+    if (!flags.has("--approval-mode") || flags.has("--approve") || flags.has("--no-approve")) {
       throw new Error("OMP requires --approval-mode yolo or always-ask, not Pi trust flags");
     }
-  } else if (!args.trust || argv.includes("--approval-mode")) {
+  } else if (!args.trust || flags.has("--approval-mode")) {
     throw new Error("an explicit trust flag is required: --approve or --no-approve");
   }
   if (args.sessionFile && args.forkRef) throw new Error("--session and --fork are mutually exclusive");
+  if (args.accountHome !== undefined && ((args.runtime ?? "pi") !== "pi" || !nodePath.isAbsolute(args.accountHome) || /[\0\r\n]/.test(args.accountHome))) {
+    throw new Error("--account-home requires an absolute Pi account directory");
+  }
+  if (args.launchWrapper) {
+    if (args.runtime === "omp") {
+      throw new Error("--launch-wrapper-arg is only supported for the Pi runtime");
+    }
+    const validated = validateLaunchWrapper(args.launchWrapper);
+    if (!validated[0] || !nodePath.isAbsolute(validated[0])) {
+      throw new Error(`launch_wrapper[0]: runner requires an absolute executable path (got ${JSON.stringify(validated[0] ?? "")})`);
+    }
+    args.launchWrapper = validated;
+  }
   return args as RunnerArgs;
 }
 
@@ -908,7 +1116,7 @@ function resolveActivityEndpoint(env: NodeJS.ProcessEnv): { baseUrl: string; tok
 }
 
 /** The runner-side sidecar handshake, extracted for hermetic testing (guard
- *  re-verdict, qitem-20260707013815): read the PRIOR record's durable cursor
+ *  re-verdict): read the PRIOR record's durable cursor
  *  FIRST, then stamp the launch-scoped pending record — the write carries the
  *  cursor forward so no reset in the chain can erase it. `catchUpSince` is
  *  only surfaced when resuming: a fresh/fork session has no prior projection
@@ -930,8 +1138,40 @@ export function prepareRunnerSidecar(
   return { catchUpSince: resuming ? prior?.lastEntryId : undefined };
 }
 
+/** Wraps an async send so calls run one after another in call order; a send that rejects doesn't hold up the ones behind it. */
+export function inOrder<A, R>(send: (arg: A) => Promise<R>): (arg: A) => Promise<R> {
+  let tail: Promise<unknown> = Promise.resolve();
+  return (arg) => {
+    const result = tail.then(() => send(arg));
+    tail = result.catch(() => undefined);
+    return result;
+  };
+}
+
 /** How often an OMP runner re-delivers an unconfirmed session identity. */
 const IDENTITY_RETRY_MS = 30_000;
+/** Below the daemon's 5 minute hook freshness window (AGENT_ACTIVITY_FRESHNESS_MS). */
+const IDLE_HEARTBEAT_MS = 3 * 60_000;
+/** One 5s scheduler tick drives both beats. CodeRabbit 2336: the first cut ticked every 15s, so a
+ *  streaming beat could land ~15s (+ delivery) behind a real event — the edge of
+ *  HOOK_AUTHORITY_WINDOW_MS, with a worst case near 25s. A 5s tick with a 5s minimum age posts a
+ *  streaming beat 5–10s after the newest event or beat: inside the window with headroom. The idle
+ *  beat's own 3-minute age gate makes the extra ticks free. */
+const PI_HEARTBEAT_TICK_MS = 5_000;
+/** Minimum age of the newest activity post before the streaming beat may re-assert it. */
+const STREAM_HEARTBEAT_MS = 5_000;
+/** How long one working beat counts (contract section 4). Beats land 5–10 s apart, well inside half of it. */
+const WORK_LIVENESS_SECONDS = 30;
+
+/** The Pi heartbeat scheduler — one 5s tick drives both beats (see PI_HEARTBEAT_TICK_MS).
+ *  Exported so tests drive the real interval with fake timers instead of calling heartbeat()
+ *  by hand, which is exactly the gap that hid the 15s-tick latency in the first cut. */
+export function startHeartbeatTimer(core: { heartbeat(): void }, runtime: RunnerRuntime): { stop(): void } {
+  if (runtime !== "pi") return { stop() {} };
+  const timer = setInterval(() => core.heartbeat(), PI_HEARTBEAT_TICK_MS);
+  timer.unref();
+  return { stop: () => clearInterval(timer) };
+}
 
 export interface ExecutableResolverOps {
   isExecutable(path: string): boolean;
@@ -1029,6 +1269,14 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const paths = piSeatPaths(args.stateRoot, args.sessionName);
   fs.mkdirSync(paths.agentDir, { recursive: true });
   fs.mkdirSync(paths.sessionsDir, { recursive: true });
+  if (runtime === "pi") {
+    try { preparePiAccount(paths.agentDir, args.accountHome); }
+    catch {
+      console.error(`${PI_RUNNER_ERROR_MARKER} Pi account preparation failed for ${JSON.stringify(nodePath.join(args.accountHome ?? paths.agentDir, "auth.json"))}; provide a readable prepared account file and keep any existing seat login intact, then retry the account operation.`);
+      process.exitCode = 2;
+      return;
+    }
+  }
 
   const { catchUpSince } = prepareRunnerSidecar(
     {
@@ -1053,10 +1301,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     openrigHome: process.env.OPENRIG_HOME,
     openrigUrl: endpoint?.baseUrl ?? process.env.OPENRIG_URL,
   });
+  if (runtime === "pi" && args.accountHome && fs.lstatSync(nodePath.join(paths.agentDir, "auth.json"), { throwIfNoEntry: false })?.isSymbolicLink()) {
+    // Only selected accounts load the Node compatibility shim; unrelated launches are unchanged.
+    childEnv.NODE_OPTIONS = `--require=${JSON.stringify(nodePath.resolve(import.meta.dirname, "../../assets/pi-account-lock.cjs"))}`;
+  }
   const childArgs = buildPiChildArgs({
     sessionsDir: paths.sessionsDir,
     sessionName: args.sessionName,
     model: args.model,
+    thinking: args.thinking,
     trust: args.trust,
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,
@@ -1075,14 +1328,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   console.log(`[${runtime}-runner] starting ${runtime} --mode rpc (seat ${args.sessionName})`);
   console.log(`[${runtime}-runner] send text normally; prefixes: "/followup <text>" queues after the turn, "/abort" cancels`);
 
-  // OMP runs under a per-seat HOME. A HOME-dependent launcher on PATH (a mise
-  // shim) cannot find its target there, so resolve the real binary first,
-  // with the runner's own environment.
+  // OMP runs under a per-seat HOME, and wrapped Pi launches hand the resolved
+  // Pi binary to the wrapper so a HOME-dependent launcher on PATH (a mise
+  // shim) is resolved first with the runner's own environment. Unwrapped Pi
+  // stays bare "pi".
   let command: string = runtime;
-  if (runtime === "omp") {
-    const resolved = resolveRuntimeExecutable("omp", process.env);
+  if (runtime === "omp" || args.launchWrapper?.length) {
+    const resolved = resolveRuntimeExecutable(runtime, process.env);
     if (!resolved.ok) {
-      console.error(`[omp-runner] ERROR launch: ${resolved.error}`);
+      console.error(`[${runtime}-runner] ERROR launch: ${resolved.error}`);
       // Record the exit for this launch so the adapter fails it now instead
       // of waiting out its readiness timeout. The durable cursor survives.
       const at = new Date().toISOString();
@@ -1135,7 +1389,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     }
   }
-  const child = spawn(command, [...prefix, ...childArgs], {
+  const spawnFile = args.launchWrapper?.length ? args.launchWrapper[0]! : command;
+  const spawnArgs = args.launchWrapper?.length ? [...args.launchWrapper.slice(1), command, ...prefix, ...childArgs] : [...prefix, ...childArgs];
+  const child = spawn(spawnFile, spawnArgs, {
     cwd: args.cwd,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -1165,6 +1421,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     notice: (line) => { process.stdout.write(`${line}\n`); },
   });
 
+  // One activity post at a time: the daemon reads its newest record by arrival, so a beat still in flight when a turn
+  // starts must not land after the turn's first post. Each post's own 1.5 s timeout bounds the wait behind it.
+  const postInOrder = inOrder((payload: Record<string, unknown>): Promise<Record<string, unknown> | null> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    return fetch(new URL("/api/activity/hooks", endpoint!.baseUrl).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${endpoint!.token}` },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+      .then(async (response) => response.ok && runtime === "omp" ? await response.json() as Record<string, unknown> : null)
+      .catch(() => null)
+      .finally(() => clearTimeout(timeout));
+  });
+
   const io: RunnerIo = {
     sendRpc: (cmd) => {
       try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
@@ -1173,24 +1445,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     mirrorAppend: (text) => process.stdout.write(text),
     postActivity: (payload) => {
       if (!endpoint || typeof fetch !== "function") return;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 1500);
-      const request = fetch(new URL("/api/activity/hooks", endpoint.baseUrl).toString(), {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (runtime !== "omp") {
-        request.catch(() => { /* best-effort — never blocks the loop */ }).finally(() => clearTimeout(timeout));
-        return;
-      }
+      const result = postInOrder(payload).catch(() => null);
       // OMP reads the acknowledgement so identity delivery can retry; null
       // (transport failure or a non-OK reply) means "not yet persisted".
-      return request
-        .then(async (response) => response.ok ? await response.json() as Record<string, unknown> : null)
-        .catch(() => null)
-        .finally(() => clearTimeout(timeout));
+      if (runtime === "omp") return result;
     },
     writeSidecar: (state) => {
       try {
@@ -1257,6 +1515,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // Re-deliver OMP identity until the daemon confirms the resume token.
   const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
   identityRetry?.unref();
+  const heartbeatTimer = startHeartbeatTimer(core, runtime);
   // The last few stderr lines, so an OMP that exits during startup is
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];
@@ -1268,6 +1527,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (stderrTail.length > OMP_STDERR_TAIL_LINES) stderrTail.shift();
     if (runtime === "pi" && !core.isReady() && !reportedPiCapability) {
       const detail = piLaunchCapabilityError(command, args.trust, line, () => {
+        if (args.launchWrapper?.length) return "";
         const version = spawnSync(command, ["--version"], { cwd: args.cwd, env: childEnv, encoding: "utf8",
           timeout: 3000, killSignal: "SIGKILL", maxBuffer: 4096, stdio: ["ignore", "pipe", "pipe"] });
         if (version.error || version.status !== 0) return "";
@@ -1284,7 +1544,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   if (runtime === "pi") {
     child.on("error", (err) => {
-      console.error(`${PI_RUNNER_ERROR_MARKER} failed to spawn pi: ${err.message}`);
+      console.error(`${PI_RUNNER_ERROR_MARKER} failed to spawn ${args.launchWrapper?.length ? `launch_wrapper (${spawnFile})` : "pi"}: ${err.message}`);
       const code = (err as NodeJS.ErrnoException).code === "ENOENT" ? 127 : 1;
       core.handlePiExit(code);
       input.close();
@@ -1307,6 +1567,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (exited) return;
     exited = true;
     clearInterval(identityRetry);
+    heartbeatTimer.stop();
     if (!core.isReady()) {
       const how = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
       const output = stderrTail.length > 0 ? ` Its last output: ${stderrTail.join(" | ")}` : " It printed nothing on stderr.";

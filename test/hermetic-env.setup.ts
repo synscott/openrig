@@ -29,28 +29,38 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { writeRuntimeStubs } from "./stub-runtimes.js";
+import { realRuntimesRequested, writeRuntimeStubs } from "./stub-runtimes.js";
+
+export function fixtureUserHomeEnv(userHome: string, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
+  return { HOME: userHome, ...(platform === "win32" ? { USERPROFILE: userHome } : {}) };
+}
 
 // Scrub inherited instance selectors before product modules capture their defaults.
 // Tests can still set explicit overrides after setup; test/provider opt-in flags
 // are not instance selectors and remain untouched.
 for (const key of [
-  "URL", "PORT", "HOST", "BIND_HOST", "HOST_SELECTED", "DB",
+  "URL", "PORT", "HOST", "BIND_HOST", "HOST_SELECTED", "DB", "TMUX_SERVER",
   "TRANSCRIPTS_PATH", "WORKSPACE_ROOT", "WORKSPACE_SLICES_ROOT",
   "WORKSPACE_STEERING_PATH", "WORKSPACE_SPECS_ROOT", "WORKSPACE_PROJECTS_ROOT",
   "WORKSPACE_CATALOG_PATH", "TOPOLOGY_ROOT", "CONTEXT_ROOT", "CONTEXT_PACKS_ROOT",
   "SKILLS_ROOT", "SHARED_DOCS_ROOT", "FILES_ALLOWLIST", "PROGRESS_SCAN_ROOTS",
-  "SESSION_NAME", "NODE_ID", "RIG_ID", "AUTH_BEARER_TOKEN", "TERMINAL_BEARER_TOKEN",
+  "SESSION_NAME", "NODE_ID", "RIG_ID", "OCCUPANT_GENERATION", "AUTH_BEARER_TOKEN", "TERMINAL_BEARER_TOKEN",
   // Slice 15: a seat with compact output on must not change what the suite prints.
   "OUTPUT_COMPACT",
   // Slice 01: a seat with usage windows on must not change what the suite reads.
   "PROVIDER_USAGE_WINDOWS",
+  // A seat whose setup recorded a provider choice must not change which kernel variant the suite picks.
+  "PROVIDER_SELECTED",
   // A seat with input-box verification on must not change what the transport suites verify.
   "TRANSPORT_VERIFY_INPUT_BOX",
+  "TRANSPORT_LOCAL_USER_GUARD",
 ]) {
   delete process.env[`OPENRIG_${key}`];
   delete process.env[`RIGGED_${key}`];
 }
+// A suite run from a Rex block must not make the CLI and TUI pick Rex, or reach the person's Rex server.
+for (const key of ["REX_SESSION", "REX_BLOCK", "REX_SERVER", "REX_BIN_DIR", "REX_CLIENT"]) delete process.env[key];
+if (process.env["TERM_PROGRAM"] === "rex") delete process.env["TERM_PROGRAM"];
 
 // (2) FORCE a fixture-scoped home — BEFORE importing openrig-compat (whose
 // OPENRIG_HOME const is eager). Node builtins above do not load it; the dynamic
@@ -61,6 +71,17 @@ for (const key of [
 // 1), which flakes any test reading one vs the other under suite ordering. So reuse a
 // fixture home already established in this worker. Named as a realistic `.openrig`-style
 // home (still fixture-scoped via the marker) so path-shape assertions hold against it.
+// Where the fixture home and the worker TMPDIR go: the given temp folder with its symlinks resolved, so a path a
+// test builds and the same path the product resolves are spelled alike. macOS's default is a per-user folder under
+// /var/folders, ~57 characters once resolved, which leaves too little of the 104-byte Unix socket cap for the tmux
+// and daemon sockets under it; in its place the base is /tmp, resolved (/private/tmp), as the CI job gets by running
+// with a short resolved TMPDIR. This includes explicit overrides under /private/var/folders; set
+// OPENRIG_TEST_KEEP_TMPDIR=1 to preserve those exactly. Other roots are kept. mkdtemp makes each folder 0700.
+// A package that keeps its TMPDIR (OPENRIG_TEST_KEEP_TMPDIR=1) keeps it here too, unresolved.
+const keepTmpdir = process.env["OPENRIG_TEST_KEEP_TMPDIR"] === "1";
+const givenTmp = fs.realpathSync(os.tmpdir());
+const tmpBase = keepTmpdir ? os.tmpdir()
+  : process.platform === "darwin" && givenTmp.startsWith("/private/var/folders/") ? fs.realpathSync("/tmp") : givenTmp;
 const existingHome = process.env["OPENRIG_HOME"];
 let createdHome: string | undefined;
 let createdTmp: string | undefined;
@@ -68,7 +89,7 @@ const fixtureHome =
   existingHome && fs.existsSync(path.join(existingHome, ".openrig-fixture"))
     ? existingHome
     : (() => {
-        const h = fs.mkdtempSync(path.join(os.tmpdir(), ".openrig-test-fixture-home-"));
+        const h = fs.mkdtempSync(path.join(tmpBase, ".openrig-test-fixture-home-"));
         fs.writeFileSync(path.join(h, ".openrig-fixture"), "");
         createdHome = h;
         // The worker's own TMPDIR, so every os.tmpdir() mkdtemp a test makes lands in a directory removed with
@@ -76,8 +97,8 @@ const fixtureHome =
         // and a Unix socket path is capped (104 bytes on macOS, where TMPDIR is already ~49 long).
         // A package whose tests are tied to the length of the temp path (the tui's Unix socket tests) opts out with
         // test.env OPENRIG_TEST_KEEP_TMPDIR=1 in its vitest config and keeps the TMPDIR it was given.
-        if (process.env["OPENRIG_TEST_KEEP_TMPDIR"] !== "1") {
-          createdTmp = fs.mkdtempSync(path.join(os.tmpdir(), "o-"));
+        if (!keepTmpdir) {
+          createdTmp = fs.mkdtempSync(path.join(tmpBase, "o-"));
           process.env["TMPDIR"] = createdTmp;
         }
         return h;
@@ -114,15 +135,25 @@ process.env["OPENRIG_COMPACTION_OUT_ROOT"] = path.join(fixtureHome, "compaction-
 // to this fixture. Merely changing HOME would not override OPENRIG_HOME or DB.
 // Keep ordinary user files outside the state root, as in a real installation.
 // Otherwise file-transfer correctly rejects every ~/ path as OpenRig state.
-if (process.env["OPENRIG_E2E_REAL_CODEX"] !== "1") {
+// Vitest sets testPath before setupFiles. Plain Node setup consumers have no native-runtime exception.
+const testPath = process.env["VITEST"] ? (await import("vitest")).expect.getState().testPath : undefined;
+const realCodexTest = realRuntimesRequested(process.env, testPath);
+// These files exercise Codex only; an inherited Claude override never belongs to their fixture.
+delete process.env["CLAUDE_CONFIG_DIR"];
+if (!realCodexTest) {
   const userHome = `${fixtureHome}-user-home`;
   fs.mkdirSync(userHome, { recursive: true });
-  process.env["HOME"] = userHome;
+  Object.assign(process.env, fixtureUserHomeEnv(userHome));
   delete process.env["CODEX_HOME"];
   for (const [key, suffix] of Object.entries({
     XDG_CONFIG_HOME: ".config", XDG_STATE_HOME: ".local/state",
     XDG_DATA_HOME: ".local/share", XDG_CACHE_HOME: ".cache",
   })) process.env[key] = path.join(userHome, suffix);
+
+  if (os.homedir() !== userHome || process.env["CODEX_HOME"] !== undefined
+    || process.env["CLAUDE_CONFIG_DIR"] !== undefined) {
+    throw new Error("test provider homes must stay inside the fixture");
+  }
 
   // codex and claude resolve to stubs that answer at once, so no test runs the host's real
   // binaries (a codex wrapper that hangs under a fixture HOME leaves its probes running).

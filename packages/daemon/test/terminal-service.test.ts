@@ -8,9 +8,14 @@
 //  - the composed view handed to the provider carries the composer's partition.
 
 import { describe, it, expect } from "vitest";
+import { Hono } from "hono";
+import { terminalRoutes } from "../src/routes/terminal.js";
 import { createHash } from "node:crypto";
 import { planHerdrLayout } from "../src/domain/terminal/herdr-adapter.js";
 import { TerminalService, type TerminalServiceDeps } from "../src/domain/terminal/terminal-service.js";
+import { daemonTmuxServerArgs, daemonTmuxServerInfo, setDaemonTmuxServer } from "../src/adapters/tmux-server.js";
+import { RexAdapter } from "../src/domain/terminal/rex-adapter.js";
+import { createRexCliTransport, type RexRun } from "../src/domain/terminal/rex-transport.js";
 import type {
   ComposedView,
   OpenViewResult,
@@ -60,6 +65,55 @@ const savedView: SavedView = {
   ],
 };
 
+describe("SSH tiles follow the viewing instance's effective server mode", () => {
+  it.each([
+    { requestedMode: "inherit", mode: "inherit" },
+    { requestedMode: "isolated", mode: "isolated" },
+    { requestedMode: "isolated", mode: "inherit" },
+    { requestedMode: "inherit", mode: "isolated" },
+  ] as const)("requested $requestedMode, effective $mode", async ({ requestedMode, mode }) => {
+    const previousArgs = [...daemonTmuxServerArgs()];
+    const previousSelection = daemonTmuxServerInfo();
+    try {
+      // Inheritance can still name a non-default LOCAL socket; its presence does
+      // not opt remote tiles into a new command or disclose that local path.
+      setDaemonTmuxServer(["-S", "/local/only/socket"], {
+        requestedMode, mode, serverArgs: ["-S", "/local/only/socket"], executionArgs: [],
+        migrationPending: requestedMode !== mode, blockingSessions: [],
+      });
+      const remote: SavedView = { id: "remote", name: "remote", members: [{
+        seat: "worker@edge", tmuxSession: "worker@edge", host: "edge", readOnly: true,
+      }] };
+      const { deps, herdr } = makeDeps({
+        viewsStore: { get: id => id === remote.id ? remote : null, list: () => [remote] },
+        resolveHost: id => id === "edge" ? { id, transport: "ssh", target: "fixture" } : null,
+      });
+      const svc = new TerminalService(deps);
+      const preview = await svc.previewView({ view: "remote" }) as { planId: string };
+      const result = await svc.openView({ view: "remote", expectedPlan: preview.planId });
+      expect(result.ok).toBe(true);
+      expect(result.code).toBeUndefined();
+      const command = herdr.lastView!.opened[0]!.paneCommand;
+      if (mode === "isolated") {
+        expect(command).toBe("ssh -t 'fixture' 'env OPENRIG_HOST_SELECTED=local rig terminal attach --read-only -- '\"'\"'worker@edge'\"'\"''");
+      } else {
+        // Main's inherited SSH tiles use remote tmux with identity-pinned replacement handling, not remote rig.
+        expect(command).toMatch(/^ssh -t 'fixture' /);
+        expect(command).toContain("OPENRIG_NODE_ID");
+        // A read-only tile only views its seat: it never attaches.
+        expect(command).toContain('open() { t=$1; shift; stty -echo -isig -ixon 2>/dev/null; view "$t" "" "$@"; };');
+        expect(command).not.toMatch(/attach -r|while use/);
+        expect(command).toContain("No replacement for $target; reopen the view with rig terminal open.");
+        expect(command).not.toContain("rig terminal attach");
+        expect(herdr.lastView!.opened[0]!.recoveryCommand).toBe("ssh -t 'fixture' 'tmux attach -r -t '\"'\"'worker@edge'\"'\"''");
+      }
+      expect(command).not.toContain("/local/only/socket");
+    } finally {
+      setDaemonTmuxServer(previousArgs, previousSelection);
+    }
+  });
+});
+
 function makeDeps(overrides: Partial<TerminalServiceDeps> = {}): {
   deps: TerminalServiceDeps;
   herdr: RecordingProvider;
@@ -76,10 +130,9 @@ function makeDeps(overrides: Partial<TerminalServiceDeps> = {}): {
     },
     listRigSeats: (rigArg) => (rigArg === "acme-build" || rigArg === "rig-id-1" ? rigRows : null),
     listPodSeats: (rigArg, pod) => (rigArg === "acme-build" && pod === "dev" ? [rigRows[0]!] : null),
-    listScopeSeats: (scope) =>
-      scope === "mission:4.6" || scope === "slice:02"
-        ? [{ canonicalSessionName: "dev-driver@acme-build", attachmentType: "tmux", tmuxSession: "dev-driver@acme-build", rigName: "acme-build", logicalId: "dev.driver" }]
-        : null,
+    resolveScopeView: view => view === "slice:02" || view === "mission:4.6" ? { task: { kind: view.startsWith("slice:") ? "slice" : "mission", id: view.split(":")[1]!, name: view, complete: true, issues: [], members: [] },
+      members: [{ seat: "dev-driver@acme-build", tmuxSession: "dev-driver@acme-build", host: null, readOnly: true, alive: true }] }
+      : { code: "scope_not_found", error: "Unknown fixture slice" },
     listRigNames: () => ["acme-build"],
     resolveHost: () => null,
     hasSession: () => true,
@@ -130,7 +183,7 @@ describe("TerminalService — view resolution + one-shape result", () => {
     expect(res.opened).toEqual(["dev-driver@acme-build", "rev-r1@acme-build"]);
     // interactive → no `-r` in the composed pane commands
     expect(herdr.lastView?.opened.every((p) => p.readOnly === false)).toBe(true);
-    expect(herdr.lastView?.opened[0]?.paneCommand).toBe("tmux attach -t 'dev-driver@acme-build'");
+    expect(herdr.lastView?.opened[0]?.paneCommand).toContain("'dev-driver@acme-build'");
   });
 
   it("the rig:<id> alias form resolves the same rig (the rig-scoped route delegation)", async () => {
@@ -139,6 +192,7 @@ describe("TerminalService — view resolution + one-shape result", () => {
     const res = await svc.openView({ view: "rig:rig-id-1" });
     expect(res.ok).toBe(true);
     expect(herdr.lastView?.id).toBe("rig:rig-id-1");
+    expect(res.viewDescriptor).toEqual({ kind: "following", name: "rig:rig-id-1" });
     expect(res.opened.length).toBe(2);
   });
 
@@ -159,13 +213,35 @@ describe("TerminalService — view resolution + one-shape result", () => {
     expect((await svc.openView({ view: "pod:acme-build/ghost" })).code).toBe("view_not_found"); // unknown pod
   });
 
+  it("opens a seat:<rig>/<logical-id> as just that seat, interactive (the TUI agent page)", async () => {
+    const { deps, herdr } = makeDeps();
+    const svc = new TerminalService(deps);
+    const res = await svc.openView({ view: "seat:acme-build/rev.r1" });
+    expect(res.ok).toBe(true);
+    expect(res.opened).toEqual(["rev-r1@acme-build"]);
+    expect(herdr.lastView?.opened.every((p) => p.readOnly === false)).toBe(true);
+    expect(herdr.lastView?.id).toBe("seat:acme-build/rev.r1");
+    expect((await svc.openView({ view: "seat:rig-id-1/dev.driver" })).opened).toEqual(["dev-driver@acme-build"]); // rig id form
+  });
+
+  it("a malformed or unknown seat view → view_not_found, naming the expected form", async () => {
+    const { deps } = makeDeps();
+    const svc = new TerminalService(deps);
+    const malformed = await svc.openView({ view: "seat:acme-build" });
+    expect(malformed.code).toBe("view_not_found");
+    expect(malformed.error).toContain("seat:<rig>/<logical-id>");
+    expect((await svc.openView({ view: "seat:acme-build/ghost" })).code).toBe("view_not_found"); // unknown seat
+    expect((await svc.openView({ view: "seat:no-such-rig/dev.driver" })).code).toBe("view_not_found"); // unknown rig
+  });
+
   it.each(["mission:4.6", "slice:02"])("opens %s as a watch view without a team-conversation handoff", async view => {
     const { deps, herdr } = makeDeps();
     const svc = new TerminalService(deps);
     const res = await svc.openView({ view });
     expect(res.ok).toBe(true);
     expect(herdr.lastView?.opened.every((p) => p.readOnly === true)).toBe(true);
-    expect(herdr.lastView?.opened[0]?.paneCommand).toContain("attach -r -t");
+    expect(herdr.lastView?.opened[0]?.paneCommand).toContain('open() { t=$1; shift; stty -echo -isig -ixon 2>/dev/null; view "$t" "" "$@"; };');
+    expect(herdr.lastView?.opened[0]?.paneCommand).not.toMatch(/attach -r|while use/);
     expect(res.notes?.join("\n") ?? "").not.toMatch(/lead pane|Can you see the team/);
   });
 
@@ -184,6 +260,7 @@ describe("TerminalService — view resolution + one-shape result", () => {
     const svc = new TerminalService(deps);
     const res = await svc.openView({ view: "watchtower" });
     expect(res.ok).toBe(true);
+    expect(res.viewDescriptor).toEqual({ kind: "fixed", name: savedView.name });
     const byReadOnly = Object.fromEntries((herdr.lastView?.opened ?? []).map((p) => [p.seat, p.readOnly]));
     expect(byReadOnly["lead@acme-ops"]).toBe(true);
     expect(byReadOnly["builder@acme-ops"]).toBe(false);
@@ -251,9 +328,49 @@ describe("TerminalService — view resolution + one-shape result", () => {
     const { deps } = makeDeps();
     const svc = new TerminalService(deps);
     const all = await svc.status();
-    expect(all.providers.map((p) => p.name).sort()).toEqual(["cmux", "herdr"]);
+    expect(all.providers.map((p) => p.name).sort()).toEqual(["cmux", "herdr", "rex"]);
     const one = await svc.status("tmate");
     expect(one.providers[0]?.status.available).toBe(false);
+  });
+
+  it("checks providers side by side, so a slow one never delays the others", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const asked: string[] = [];
+    const provider = (name: string, wait?: Promise<void>): TerminalProvider => Object.assign(new RecordingProvider(name), {
+      async status(): Promise<ProviderStatus> {
+        asked.push(name);
+        await wait;
+        return { provider: name, available: true, capabilities: {} };
+      },
+    });
+    const map: Record<string, TerminalProvider> = { herdr: provider("herdr", gate), cmux: provider("cmux"), rex: provider("rex") };
+    const { deps } = makeDeps({ resolveProvider: (name) => map[name] ?? null });
+    const report = new TerminalService(deps).status();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(asked).toEqual(["herdr", "cmux", "rex"]);
+    release();
+    expect((await report).providers.map((p) => p.name)).toEqual(["herdr", "cmux", "rex"]);
+  });
+
+  it("a stalled Rex leaves a usable status beside a healthy provider, well inside the CLI's 5 s request", async () => {
+    const budgets: number[] = [];
+    // A rex that never answers and can't even be stopped: its run never settles.
+    const stalled: RexRun = (_argv, _stdin, timeoutMs) => {
+      budgets.push(timeoutMs);
+      return new Promise(() => {});
+    };
+    const rex = new RexAdapter({ transport: createRexCliTransport({ run: stalled, binary: () => "/opt/rex/bin/rex", env: {} }) });
+    const map: Record<string, TerminalProvider> = { herdr: new RecordingProvider("herdr"), rex };
+    const { deps } = makeDeps({ resolveProvider: (name) => map[name] ?? null });
+    const started = Date.now();
+    const report = await new TerminalService(deps).status();
+    expect(Date.now() - started).toBeLessThan(5_000);
+    const byName = Object.fromEntries(report.providers.map((p) => [p.name, p]));
+    expect(byName["herdr"]).toMatchObject({ status: { available: true }, liveness: { alive: true } });
+    expect(byName["rex"]).toMatchObject({ status: { available: false }, liveness: { alive: false } });
+    expect(byName["rex"]!.liveness.detail).toContain("did not answer within 1000 ms");
+    expect(budgets).toEqual([1_000, 1_000]);
   });
 });
 
@@ -651,6 +768,21 @@ describe("TerminalService — an omitted provider falls back from herdr to cmux 
     expect(r.notes?.join("\n") ?? "").not.toContain("Herdr isn't available here");
   });
 
+  it("never picks rex for an omitted provider, even when it is the only live one", async () => {
+    const { deps, herdr, cmux } = makeDeps();
+    down(herdr, "unavailable");
+    down(cmux, "unavailable");
+    const rex = new RecordingProvider("rex");
+    const resolve = deps.resolveProvider;
+    deps.resolveProvider = (name) => (name === "rex" ? rex : resolve(name));
+    const service = new TerminalService(deps);
+    expect(await service.previewView({ view: "acme-build" })).toMatchObject({ provider: "herdr" });
+    expect((await service.openView({ view: "acme-build" })).provider).toBe("herdr");
+    expect(rex.lastView).toBeNull();
+    expect((await service.openView({ view: "acme-build", provider: "rex" })).provider).toBe("rex");
+    expect(rex.lastView).not.toBeNull();
+  });
+
   it("prefers a live herdr when both are there", async () => {
     const { deps, herdr, cmux } = makeDeps();
     const r = await new TerminalService(deps).openView({ view: "acme-build" });
@@ -658,4 +790,65 @@ describe("TerminalService — an omitted provider falls back from herdr to cmux 
     expect(herdr.lastView).not.toBeNull();
     expect(cmux.lastView).toBeNull();
   });
+});
+
+
+describe("slice task preview and explicit viewer capability", () => {
+  function sliceService(complete = true) {
+    const { deps, herdr } = makeDeps();
+    const snapshot = () => ({ task: { kind: "slice", id: "build", name: "Build it", complete,
+      issues: complete ? [] : ["Scope read unavailable"], members: [{ key: { hostId: "local", nodeId: "a" }, seat: "a@team",
+        obligations: [{ qitemId: "work", state: "pending" }], availability: "available", viewerStatus: "not-provisioned" }] },
+      members: [{ seat: "a@team", tmuxSession: "a", alive: true, readOnly: true }] });
+    Object.assign(deps, { resolveScopeView: () => snapshot() });
+    let effects = 0;
+    Object.assign(herdr, { ensureViewer: async () => { effects++; return { ok: false, code: "viewer_unconfirmed", error: "Fixture viewer not started" }; } });
+    return { service: new TerminalService(deps), effects: () => effects };
+  }
+  it("uses authoritative scoped membership instead of the live review band", async () => {
+    const { service } = sliceService();
+    const preview = await service.previewView({ view: "slice:build" });
+    expect(preview).toMatchObject({ task: { kind: "slice", id: "build", name: "Build it", complete: true,
+      members: [{ seat: "a@team", obligations: [{ qitemId: "work", state: "pending" }] }] }, capabilities: { ensureViewer: true } });
+    expect("task" in preview && preview.task).not.toHaveProperty("qitemId");
+  });
+  it("rejects changed scope plans before any owner ensure effect", async () => {
+    const { service, effects } = sliceService();
+    expect(await service.ensureViewer({ view: "slice:build", expectedPlan: "stale", member: { hostId: "local", nodeId: "a" } }))
+      .toMatchObject({ ok: false, code: "preview_changed" });
+    expect(effects()).toBe(0);
+  });
+  it("distinguishes an incomplete scope from an empty scope and never ensures it", async () => {
+    const { service, effects } = sliceService(false);
+    const preview = await service.previewView({ view: "slice:build" });
+    if (!("planId" in preview)) throw new Error("Expected scoped preview");
+    expect(preview.task?.complete).toBe(false);
+    expect(await service.ensureViewer({ view: "slice:build", expectedPlan: preview.planId, member: { hostId: "local", nodeId: "a" } }))
+      .toMatchObject({ ok: false, code: "viewer_unconfirmed" });
+    expect(effects()).toBe(0);
+  });
+});
+
+
+it("keeps unsupported ensure as a client error and maps unknown/ambiguous scope errors explicitly", async () => {
+  const { deps, herdr } = makeDeps(); Object.assign(herdr, { ensureViewer: async () => { throw new Error("No effect"); } });
+  const service = new TerminalService(deps), app = new Hono();
+  app.use("*", async (c, next) => { c.set("terminalService" as never, service as never); await next(); });
+  app.route("/terminal", terminalRoutes({ bearerToken: "fixture-owner-token" }));
+  const unsupported = await app.request("/terminal/viewer/ensure", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer fixture-owner-token" },
+    body: JSON.stringify({ view: "saved:fixed", member: { hostId: "local", nodeId: "a" }, expectedPlan: "p" }) });
+  expect(unsupported.status).toBe(400); expect(await unsupported.json()).toMatchObject({ code: "view_required" });
+  expect((await app.request("/terminal/preview?view=slice:absent")).status).toBe(404);
+  Object.assign(deps, { resolveScopeView: () => ({ code: "scope_ambiguous", error: "Ambiguous scope" }) });
+  expect((await app.request("/terminal/preview?view=slice:duplicate")).status).toBe(409);
+});
+
+
+it("previews mission owners and ensure capability through the same scoped resolver", async () => {
+  const { deps, herdr } = makeDeps();
+  Object.assign(herdr, { ensureViewer: async () => { throw new Error("Preview is passive"); } });
+  Object.assign(deps, { resolveScopeView: () => ({ task: { kind: "mission", id: "work", name: "work", complete: true, issues: [], members: [] }, members: [] }) });
+  const preview = await new TerminalService(deps).previewView({ view: "mission:work" });
+  expect(preview).toMatchObject({ task: { kind: "mission", id: "work", complete: true, members: [] }, capabilities: { ensureViewer: true } });
+  expect("task" in preview && preview.task).not.toHaveProperty("qitemId");
 });

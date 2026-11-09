@@ -183,7 +183,7 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     }
   }
 
-  // Defaults lifecycle + effort advisory
+  // Defaults lifecycle + launch preference advisories
   if (obj["defaults"] && typeof obj["defaults"] === "object") {
     const defaults = obj["defaults"] as Record<string, unknown>;
     if (defaults["lifecycle"]) {
@@ -196,6 +196,9 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     if (defaults["effort"] !== undefined && (typeof defaults["effort"] !== "string" || !(defaults["effort"] as string).trim())) {
       advisories.push(`defaults.effort: non-string value "${defaults["effort"]}" ignored; effort must be a text value`);
     }
+    if (defaults["advisor"] !== undefined && (typeof defaults["advisor"] !== "string" || !(defaults["advisor"] as string).trim())) {
+      advisories.push("defaults.advisor: ignored; advisor must be a non-blank text value");
+    }
   }
 
   // Startup
@@ -206,7 +209,7 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     errors.push("profiles: must be a map (object), not an array or scalar");
   }
 
-  // Profile startup + lifecycle + effort advisory
+  // Profile startup + lifecycle + launch preference advisories
   if (obj["profiles"] && typeof obj["profiles"] === "object" && !Array.isArray(obj["profiles"])) {
     for (const [profileName, profileRaw] of Object.entries(obj["profiles"] as Record<string, unknown>)) {
       if (profileRaw && typeof profileRaw === "object") {
@@ -224,6 +227,9 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
           const prefsObj = prefs as Record<string, unknown>;
           if (prefsObj["effort"] !== undefined && (typeof prefsObj["effort"] !== "string" || !(prefsObj["effort"] as string).trim())) {
             advisories.push(`profiles.${profileName}.preferences.effort: non-string value "${prefsObj["effort"]}" ignored; effort must be a text value`);
+          }
+          if (prefsObj["advisor"] !== undefined && (typeof prefsObj["advisor"] !== "string" || !(prefsObj["advisor"] as string).trim())) {
+            advisories.push(`profiles.${profileName}.preferences.advisor: ignored; advisor must be a non-blank text value`);
           }
         }
       }
@@ -273,6 +279,15 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
             allLocalIds[category] = new Set(mappingEntries.map((e) => e["id"] as string).filter(Boolean));
           }
 
+          if (category === "skills") {
+            entries.forEach((entry, i) => {
+              const onRestore = entry && typeof entry === "object" ? entry["on_restore"] : undefined;
+              if (onRestore !== undefined && onRestore !== "keep_saved" && onRestore !== "follow_source") {
+                advisories.push(`resources.skills[${i}].on_restore: unknown value "${String(onRestore)}"; expected "keep_saved" | "follow_source"; using "keep_saved"`);
+              }
+            });
+          }
+
           // runtime_resources must have runtime field
           if (category === "runtime_resources") {
             for (let i = 0; i < entries.length; i++) {
@@ -297,7 +312,9 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
     for (const [profileName, profileRaw] of Object.entries(obj["profiles"] as Record<string, unknown>)) {
       if (profileRaw && typeof profileRaw === "object") {
         const p = profileRaw as Record<string, unknown>;
-        if (p["uses"] && typeof p["uses"] === "object") {
+        if (p["uses"] != null && (typeof p["uses"] !== "object" || (Array.isArray(p["uses"]) && p["uses"].length > 0))) {
+          advisories.push(`profiles.${profileName}.uses: expected an object; ignored`);
+        } else if (p["uses"] && typeof p["uses"] === "object") {
           const uses = p["uses"] as Record<string, unknown>;
 
           // Reject legacy profile.uses.hooks field with explicit migration error.
@@ -306,10 +323,29 @@ export function validateAgentSpec(raw: unknown): ValidationResult {
             errors.push(`profiles.${profileName}.uses.hooks: removed in plugin-primitive (Phase 3a). Reference plugins via profiles.${profileName}.uses.plugins[] instead.`);
           }
 
-          for (const category of ["skills", "guidance", "subagents", "plugins", "runtime_resources"]) {
+          // Any other key selects nothing; say so rather than ignore it silently (a typo such as "skils").
+          for (const key of Object.keys(uses)) {
+            if (key !== "hooks" && !USES_CATEGORIES.includes(key)) {
+              advisories.push(`profiles.${profileName}.uses.${key}: unknown key ignored; known keys are ${USES_CATEGORIES.join(", ")}`);
+            }
+          }
+
+          for (const category of USES_CATEGORIES) {
             const refs = uses[category];
+            if (typeof refs === "string" && refs.trim()) {
+              advisories.push(`profiles.${profileName}.uses.${category}: scalar ID accepted; use a list instead`);
+              continue;
+            }
+            if (refs != null && !Array.isArray(refs)) {
+              advisories.push(`profiles.${profileName}.uses.${category}: expected an array of resource IDs; ignored`);
+              continue;
+            }
             if (Array.isArray(refs)) {
-              for (const ref of refs as string[]) {
+              for (const [index, ref] of refs.entries()) {
+                if (typeof ref !== "string" || !ref.trim()) {
+                  advisories.push(`profiles.${profileName}.uses.${category}[${index}]: expected a non-empty resource ID; a member using this profile fails to launch`);
+                  continue;
+                }
                 // Qualified refs (namespace:id) are accepted for later resolution
                 if (typeof ref === "string" && ref.includes(":")) {
                   const parts = ref.split(":");
@@ -387,6 +423,9 @@ export function normalizeAgentSpec(raw: Record<string, unknown>): AgentSpec {
       effort: typeof defaults["effort"] === "string" && defaults["effort"].trim()
         ? defaults["effort"].trim()
         : undefined,
+      advisor: typeof defaults["advisor"] === "string" && defaults["advisor"].trim()
+        ? defaults["advisor"].trim()
+        : undefined,
       lifecycle: {
         ...lifecycle,
         compactionStrategy: lifecycle.compactionStrategy ?? "default-compaction",
@@ -421,6 +460,7 @@ function normalizeLifecycle(raw: Record<string, unknown>): LifecycleDefaults {
   };
 }
 
+/** Normalize validated resource declarations, retaining each skill's optional restore policy. */
 function normalizeResources(raw: unknown): AgentResources {
   if (!raw || typeof raw !== "object") {
     return { skills: [], guidance: [], subagents: [], plugins: [], runtimeResources: [] };
@@ -429,7 +469,8 @@ function normalizeResources(raw: unknown): AgentResources {
 
   return {
     skills: Array.isArray(obj["skills"])
-      ? (obj["skills"] as Record<string, unknown>[]).map((s) => ({ id: s["id"] as string, path: s["path"] as string }))
+      ? (obj["skills"] as Record<string, unknown>[]).map((s) => ({ id: s["id"] as string, path: s["path"] as string,
+          onRestore: s["on_restore"] === "follow_source" ? "follow_source" : "keep_saved" }))
       : [],
     guidance: Array.isArray(obj["guidance"])
       ? (obj["guidance"] as Record<string, unknown>[]).map((g) => ({
@@ -513,6 +554,14 @@ function validatePluginResources(entries: Array<Record<string, unknown>>): strin
   return errors;
 }
 
+/** The resource categories a profile's `uses` selects from. */
+const USES_CATEGORIES = ["skills", "guidance", "subagents", "plugins", "runtime_resources"];
+
+function normalizeUses(value: unknown): string[] {
+  if (Array.isArray(value)) return value as string[];
+  return typeof value === "string" && value.trim() ? [value] : [];
+}
+
 function normalizeProfile(raw: Record<string, unknown>): ProfileSpec {
   const uses = raw["uses"] as Record<string, unknown> | undefined;
   return {
@@ -524,16 +573,19 @@ function normalizeProfile(raw: Record<string, unknown>): ProfileSpec {
           effort: typeof (raw["preferences"] as Record<string, unknown>)["effort"] === "string" && ((raw["preferences"] as Record<string, unknown>)["effort"] as string).trim()
             ? ((raw["preferences"] as Record<string, unknown>)["effort"] as string).trim()
             : undefined,
+          advisor: typeof (raw["preferences"] as Record<string, unknown>)["advisor"] === "string" && ((raw["preferences"] as Record<string, unknown>)["advisor"] as string).trim()
+            ? ((raw["preferences"] as Record<string, unknown>)["advisor"] as string).trim()
+            : undefined,
         }
       : undefined,
     startup: raw["startup"] ? normalizeStartupBlock(raw["startup"]) : undefined,
     lifecycle: raw["lifecycle"] ? normalizeLifecycle(raw["lifecycle"] as Record<string, unknown>) : undefined,
     uses: {
-      skills: Array.isArray(uses?.["skills"]) ? uses["skills"] as string[] : [],
-      guidance: Array.isArray(uses?.["guidance"]) ? uses["guidance"] as string[] : [],
-      subagents: Array.isArray(uses?.["subagents"]) ? uses["subagents"] as string[] : [],
-      plugins: Array.isArray(uses?.["plugins"]) ? uses["plugins"] as string[] : [],
-      runtimeResources: Array.isArray(uses?.["runtime_resources"]) ? uses["runtime_resources"] as string[] : [],
+      skills: normalizeUses(uses?.["skills"]),
+      guidance: normalizeUses(uses?.["guidance"]),
+      subagents: normalizeUses(uses?.["subagents"]),
+      plugins: normalizeUses(uses?.["plugins"]),
+      runtimeResources: normalizeUses(uses?.["runtime_resources"]),
     },
     activity: normalizeActivityBlock(raw["activity"]),
   };

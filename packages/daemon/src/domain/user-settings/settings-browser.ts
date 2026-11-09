@@ -30,10 +30,10 @@ interface BrowserSource { id: string; state: State; path: string | null; detail:
 /** Names are presentation policy, never a second setting registry or resolver. */
 const PATHS = new Set(["db.path", "transcripts.path", "workspace.root", "workspace.slices_root",
   "workspace.steering_path", "workspace.specs_root", "workspace.projects_root", "workspace.catalog_path",
-  "topology.root", "context.root", "skills.root", "policies.claude_compaction.message_file_path"]);
+  "topology.root", "context.root", "skills.root", "policies.claude_compaction.message_file_path", "policies.claude_compaction.preparation_root"]);
 const IDENTITIES = new Set(["daemon.host", "host.name", "host.selected", "context.system_world",
   "ui.timezone", "agents.advisor_session", "agents.operator_session", "workspace.operator_seat_name",
-  "workflow.exception_routing", "policies.idle_gate_qitem.auto_register"]);
+  "workflow.exception_routing", "policies.idle_gate_qitem.auto_register", "terminal.tmux_server"]);
 const INSTRUCTIONS = new Set(["policies.claude_compaction.pre_compact_instruction",
   "policies.claude_compaction.compact_instruction", "policies.claude_compaction.message_inline",
   "policies.claude_compaction.post_restore_audit_instruction"]);
@@ -42,7 +42,7 @@ function kindFor(key: string): Kind {
   if (IDENTITIES.has(key)) return "identity";
   if (INSTRUCTIONS.has(key)) return "withheld";
   if (key === "files.allowlist" || key === "progress.scan_roots") return "paths";
-  if (key === "recovery.provider_auth_env_allowlist" || key === "policies.idle_gate_qitem.opt_in_sessions") return "names";
+  if (key === "recovery.provider_auth_env_allowlist" || key === "policies.idle_gate_qitem.opt_in_sessions" || key === "provider.selected") return "names";
   return "scalar";
 }
 
@@ -90,6 +90,7 @@ function sourceFile(file: string): { state: State; bytes: string | null } {
   catch (error) { return { state: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "unavailable", bytes: null }; }
 }
 function application(key: string): string {
+  if (key === "terminal.tmux_server") return "Selected at daemon restart; surviving sessions keep their previous server until deliberately stopped. See terminal status for the effective choice.";
   if (key === "ui.terminal.max_live_terminals") return "Legacy web client; unset resolver value, consumer fallback 2. No TUI limit implied.";
   if (key === "workflow.exception_routing") return "Unset leaves routing to workflow/class/host precedence; running route unverified.";
   if (key === "ui.timezone") return "Daemon-instance value; TUI display timezone is client-local and selected at launch.";
@@ -98,6 +99,7 @@ function application(key: string): string {
   if (key.startsWith("retention.")) return "Read on the retention sweep; last applied value unverified.";
   if (key.startsWith("policies.claude_compaction.")) return "Read by the compaction policy consumer; running action unverified.";
   if (key === "terminal.status_bar" || key.startsWith("runtime.")) return "Future launch behavior; existing sessions not verified.";
+  if (key === "terminal.history_limit") return "Written into ~/.tmux.conf by rig setup; a running tmux server keeps its old limit until it restarts or sources the file.";
   return "Resolved configuration; running application unverified.";
 }
 

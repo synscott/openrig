@@ -23,7 +23,7 @@ describe.runIf(process.platform === "win32")("classic Claude native launch comma
     const identity: Record<string, string> = { OPENRIG_NODE_ID: "node", OPENRIG_SESSION_NAME: "seat@rig", OPENRIG_RUNTIME: "claude-code", OPENRIG_OCCUPANT_GENERATION: "old-generation" };
     vi.spyOn(tmux, "getPaneCommand").mockResolvedValue("powershell.exe");
     vi.spyOn(tmux, "getSessionEnv").mockImplementation(async (_session, key) => identity[key] ?? null);
-    const launch = new SeatLaunchEnvironment(tmux, { OPENRIG_HOME: home, PATH: process.env.PATH! }, home, cli, undefined, "win32");
+    const launch = new SeatLaunchEnvironment(tmux, { OPENRIG_HOME: home, PATH: process.env.PATH! }, home, cli, undefined, undefined, "win32");
     const receiver = path.join(home, "capture argv.cjs");
     fs.writeFileSync(receiver, `console.log(JSON.stringify({argv:process.argv.slice(2), renderer:process.env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN, node:process.env.OPENRIG_NODE_ID, generation:process.env.OPENRIG_OCCUPANT_GENERATION, resumeLaunch:process.env.OPENRIG_RESUME_LAUNCH}));`);
     // Exercise the real native executable boundary without starting Claude.

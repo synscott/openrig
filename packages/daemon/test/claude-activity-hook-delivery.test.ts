@@ -34,7 +34,7 @@ const STATE_DIR = "/custom-instance/O'Brien";
 const RELAY_DEST = `${STATE_DIR}/state/claude-activity-hooks/activity-relay.cjs`;
 const SETTINGS = "/project/.claude/settings.local.json";
 // The concrete, absolute, shell-quoted leg-B firing shape — never ${CLAUDE_PLUGIN_ROOT}.
-const OWNED_CMD = `node ${shellQuote(RELAY_DEST)}`;
+const OWNED_CMD = `${shellQuote(process.execPath)} ${shellQuote(RELAY_DEST)}`;
 const OWNED_MARKER = "state/claude-activity-hooks/activity-relay.cjs";
 const EVENTS = ["SessionStart", "UserPromptSubmit", "Stop", "Notification"] as const;
 
@@ -170,6 +170,24 @@ describe("Claude activity-hook delivery — shipped relay asset executable mode 
 });
 
 describe("Claude activity-hook delivery — ENABLE (entry present, source + manifest readable)", () => {
+  it.each([false, true])("copies the diagnostic formatter without suppressing existing hooks if its copy fails (%s)", async fail => {
+    const source = "/assets/plugins/openrig-core/hooks/scripts/permission-stop-descriptor.cjs";
+    const destination = `${STATE_DIR}/state/claude-activity-hooks/permission-stop-descriptor.cjs`;
+    const fs = enableFs({ [source]: "// synthetic formatter" });
+    const copy = fs.copyFile;
+    fs.copyFile = (src, dest) => {
+      if (src === source && fail) throw new Error("fixture failure");
+      copy(src, dest);
+    };
+    await makeAdapter(fs).project(plan([activityEntry()]), binding());
+    expect(fs._store[RELAY_DEST]).toBe("// relay");
+    expect(fs._store[destination]).toBe(fail ? undefined : "// synthetic formatter");
+    for (const event of EVENTS) {
+      const commands = (readSettings(fs).hooks?.[event] ?? []).flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+      expect(commands).toContain(OWNED_CMD);
+    }
+  });
+
   it("leaves identical shared relay bytes alone and refreshes a changed installed asset", async () => {
     const fs = enableFs();
     const copy = fs.copyFile;
@@ -225,6 +243,22 @@ describe("Claude activity-hook delivery — ENABLE (entry present, source + mani
     expect(Object.keys(readSettings(fs).hooks)).toEqual(["Stop"]);
   });
 
+  it("adds the optional permission observation and formatter during normal managed reprojection", async () => {
+    const source = `${dirname(RELAY_SRC)}/permission-stop-descriptor.cjs`;
+    const formatter = readFileSync(new URL("../assets/plugins/openrig-core/hooks/scripts/permission-stop-descriptor.cjs", import.meta.url), "utf8");
+    const manifest = readFileSync(new URL("../assets/plugins/openrig-core/hooks/claude.json", import.meta.url), "utf8");
+    const fs = enableFs({ [MANIFEST_SRC]: manifest, [source]: formatter,
+      [SETTINGS]: JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: OWNED_CMD }] }] } }) });
+    await makeAdapter(fs).project(plan([activityEntry()]), binding());
+    const settings = readSettings(fs);
+    const commands = (settings.hooks.PermissionRequest ?? []).flatMap((group: any) => group.hooks.map((hook: any) => hook.command));
+    expect(commands).toContain(OWNED_CMD);
+    expect(fs._store[`${STATE_DIR}/state/claude-activity-hooks/permission-stop-descriptor.cjs`]).toBe(formatter);
+    for (const event of EVENTS) {
+      expect(settings.hooks[event].flatMap((group: any) => group.hooks.map((hook: any) => hook.command))).toContain(OWNED_CMD);
+    }
+  });
+
   it("is idempotent: a second project() adds no duplicate owned entries", async () => {
     const fs = enableFs();
     const adapter = makeAdapter(fs);
@@ -259,6 +293,8 @@ describe("Claude activity-hook delivery — instance path transition", () => {
     const userCommands = [
       `echo ${shellQuote(oldPath)}`,
       `node 'user-arg' ${shellQuote(priorInstance)}`,
+      `${shellQuote(process.execPath)} ${shellQuote(priorInstance)} 'extra'`,
+      `${shellQuote("/custom/wrapper")} ${shellQuote(priorInstance)}`,
       `node ${shellQuote(priorInstance + ".backup")}`,
     ];
     const seeded = JSON.stringify({ env: { USER_SETTING: "keep" }, hooks: { Stop: [{ hooks: [

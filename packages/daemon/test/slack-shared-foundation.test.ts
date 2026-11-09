@@ -2,7 +2,7 @@
 // rig's representative or a configured seat; a person's top-level message becomes the root its answer
 // lands under; the hub relays a channel another machine owns, keeps a failed relay and retries it;
 // the receiving route takes a relayed envelope; and every post names the machine it comes from.
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { Hono } from "hono";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -59,6 +59,23 @@ describe("a rig's representative", () => {
     const twins = topology();
     twins.prepare("INSERT INTO rigs (id, name) VALUES ('rig-w2', 'workshop')").run();
     expect(resolveRigRepresentative(twins, "workshop")).toBeNull(); // two rigs share the name
+  });
+
+  it("is the relaunched rig's lead when an archived earlier generation shares the name, so its channel reaches that lead", () => {
+    const db = topology();
+    db.prepare("INSERT INTO rigs (id, name, archived_at) VALUES ('rig-w0', 'workshop', '2026-10-17 00:00:00')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id) VALUES ('n-first', 'rig-w0', 'orch.first')").run();
+    db.prepare("INSERT INTO nodes (id, rig_id, logical_id) VALUES ('n-first-child', 'rig-w0', 'dev.first')").run();
+    db.prepare("INSERT INTO edges (id, rig_id, source_id, target_id, kind) VALUES ('e0', 'rig-w0', 'n-first', 'n-first-child', 'delegates_to')").run();
+    db.prepare("INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s0', 'n-first', 'orch-first@workshop', 'stopped')").run();
+    expect(resolveRigRepresentative(db, "workshop")).toBe("orch-lead@workshop");
+    // The Slack subsystem's own composition, for a person's top-level message in the rig's mapped channel.
+    const cfg = { channel: "C0MACHINE", channelMap: [{ match: "workshop", channel: "C0WS" }] };
+    expect(resolveInboundChannelDestination(cfg, "C0WS", (rig) => resolveRigRepresentative(db, rig))).toBe("orch-lead@workshop");
+    // A name resolves among unarchived rigs only, as the CLI's rig handles do, so archived rigs alone send the message to the
+    // inbound destination. An archived rig stays reachable by id and by its threads.
+    db.prepare("UPDATE rigs SET archived_at = '2026-10-23 00:00:00' WHERE id = 'rig-w'").run();
+    expect(resolveRigRepresentative(db, "workshop")).toBeNull();
   });
 });
 
@@ -147,6 +164,31 @@ describe("the hub relays a channel another machine owns", () => {
     return { r, rows, forwardDeadLetter };
   }
   const message = (channel: string): SocketEnvelope => ({ envelope_id: "e1", type: "events_api", payload: { event: { type: "message", user: "U1", text: "hi", ts: "700.1", channel } } });
+
+  it("counts only pending live and retry relay attempts, including failed sends", async () => {
+    let finish!: (result: { ok: false; error: string } | { ok: true }) => void;
+    const h = hub(() => new Promise((resolve) => { finish = resolve; }));
+    const live = handleEnvelope(message("C0VPS04"), () => {}, h.r);
+    await vi.waitFor(() => expect(h.r.getRelayAttemptsInFlight()).toBe(1));
+    expect(h.forwardDeadLetter.readAll()).toHaveLength(0);
+    finish({ ok: false, error: "synthetic failure" });
+    await live;
+    expect(h.r.getRelayAttemptsInFlight()).toBe(0);
+    expect(h.forwardDeadLetter.readAll()).toHaveLength(1);
+    const retry = h.r.retryDeadLetters();
+    await vi.waitFor(() => expect(h.r.getRelayAttemptsInFlight()).toBe(1));
+    expect(h.forwardDeadLetter.readAll()).toHaveLength(1);
+    finish({ ok: true });
+    await retry;
+    expect(h.r.getRelayAttemptsInFlight()).toBe(0);
+    expect(h.forwardDeadLetter.readAll()).toHaveLength(0);
+  });
+
+  it("clears the attempt count when the transport throws", async () => {
+    const h = hub(async () => { throw new Error("synthetic error"); });
+    await expect(h.r.forwardEnvelope("vps04", message("C0VPS04"))).rejects.toThrow("synthetic error");
+    expect(h.r.getRelayAttemptsInFlight()).toBe(0);
+  });
 
   it("sends a message, a reaction and a click for that channel there, untouched, and handles nothing here", async () => {
     const sent: Array<[string, SocketEnvelope]> = [];
@@ -310,12 +352,12 @@ describe("each post names its machine", () => {
 
   it("adds the machine after a seat sender, once", () => {
     const local = buildOutboundMessage(q, { sourceLabel: "openrig", attribution: attributionFromSession("operator-agent@kernel"), machine: "vps04" });
-    expect(local.text).toContain("from operator-agent@kernel on vps04");
+    expect(local.text).toContain("From operator-agent@kernel on vps04");
     const remote = buildOutboundMessage(q, { sourceLabel: "openrig", attribution: attributionFromSession("operator-agent@kernel@vps05"), machine: "vps04" });
-    expect(remote.text).toContain("from operator-agent@kernel@vps05");
+    expect(remote.text).toContain("From operator-agent@kernel@vps05");
     expect(remote.text).not.toContain(" on vps04");
     const unchanged = buildOutboundMessage(q, { sourceLabel: "openrig", attribution: attributionFromSession("operator-agent@kernel") });
-    expect(unchanged.text).toContain("from operator-agent@kernel");
+    expect(unchanged.text).toContain("From operator-agent@kernel");
     expect(unchanged.text).not.toContain(" on ");
   });
 });

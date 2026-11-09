@@ -1,12 +1,14 @@
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { PodRepository } from "./pod-repository.js";
-import type { SessionRegistry } from "./session-registry.js";
+import { SessionAddressConflict, type SessionRegistry } from "./session-registry.js";
 import type { EventBus } from "./event-bus.js";
 import type { PersistedEvent } from "./types.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { startTmuxTranscriptCapture } from "./transcript-capture.js";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 
 export type SelfAttachSuccess = {
   ok: true;
@@ -14,6 +16,7 @@ export type SelfAttachSuccess = {
   logicalId: string;
   sessionId: string;
   sessionName: string;
+  senderAddress: string;
   attachmentType: "tmux" | "external_cli";
   env: {
     OPENRIG_NODE_ID: string;
@@ -33,7 +36,9 @@ export type SelfAttachFailureCode =
   | "duplicate_logical_id"
   | "invalid_member_name"
   | "runtime_required"
-  | "runtime_mismatch";
+  | "runtime_mismatch"
+  | "tmux_server_mismatch"
+  | "address_conflict";
 
 export type SelfAttachResult =
   | SelfAttachSuccess
@@ -46,6 +51,7 @@ interface SelfAttachServiceDeps {
   sessionRegistry: SessionRegistry;
   eventBus: EventBus;
   tmuxAdapter?: TmuxAdapter;
+  tmuxServer?: { socketPath?: string; mode: "inherit" | "isolated" };
   transcriptStore?: TranscriptStore;
   claudeContextProvisioner?: {
     ensureContextCollector(binding: { cwd?: string | null; tmuxSession?: string | null }): void;
@@ -86,6 +92,7 @@ interface TmuxAttachContext {
   tmuxSession: string;
   tmuxWindow?: string;
   tmuxPane?: string;
+  tmuxSocketPath?: string;
 }
 
 export type SelfAttachContext = ExternalCliAttachContext | TmuxAttachContext;
@@ -100,6 +107,7 @@ export class SelfAttachService {
   private transcriptStore: TranscriptStore | null;
   private claudeContextProvisioner: SelfAttachServiceDeps["claudeContextProvisioner"] | null;
   private activityEnv: { url?: string; token?: string };
+  private tmuxServer: SelfAttachServiceDeps["tmuxServer"];
 
   constructor(deps: SelfAttachServiceDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("SelfAttachService: rigRepo must share the same db handle");
@@ -112,12 +120,15 @@ export class SelfAttachService {
     this.sessionRegistry = deps.sessionRegistry;
     this.eventBus = deps.eventBus;
     this.tmuxAdapter = deps.tmuxAdapter ?? null;
+    this.tmuxServer = deps.tmuxServer;
     this.transcriptStore = deps.transcriptStore ?? null;
     this.activityEnv = deps.activityEnv ?? {};
     this.claudeContextProvisioner = deps.claudeContextProvisioner ?? null;
   }
 
   async attachToNode(opts: AttachToNodeOptions): Promise<SelfAttachResult> {
+    const serverFailure = this.checkTmuxServer(opts.context);
+    if (serverFailure) return serverFailure;
     const rig = this.rigRepo.getRig(opts.rigId);
     if (!rig) {
       return { ok: false, code: "rig_not_found", error: "Target rig not found" };
@@ -148,11 +159,14 @@ export class SelfAttachService {
       logicalId: node.logicalId,
       runtime: node.runtime ?? opts.runtime,
       cwd: node.cwd ?? opts.cwd,
-      context: this.resolveContext(node.logicalId, rig.rig.name, opts.displayName, opts.context),
+      displayName: opts.displayName,
+      context: this.resolveContext(node.id, node.logicalId, rig.rig.name, opts.displayName, opts.context),
     });
   }
 
   async attachToPod(opts: AttachToPodOptions): Promise<SelfAttachResult> {
+    const serverFailure = this.checkTmuxServer(opts.context);
+    if (serverFailure) return serverFailure;
     const rig = this.rigRepo.getRig(opts.rigId);
     if (!rig) {
       return { ok: false, code: "rig_not_found", error: "Target rig not found" };
@@ -188,7 +202,8 @@ export class SelfAttachService {
         rigId: opts.rigId,
         nodeId: node.id,
         logicalId,
-        context: this.resolveContext(logicalId, rig.rig.name, opts.displayName, opts.context),
+        displayName: opts.displayName,
+        context: this.resolveContext(node.id, logicalId, rig.rig.name, opts.displayName, opts.context),
       });
       return attached;
     });
@@ -200,8 +215,19 @@ export class SelfAttachService {
       this.eventBus.notifySubscribers(result.event);
       return this.toSuccess(result.nodeId, result.logicalId, result.sessionId, result.sessionName, result.attachmentType, runtime);
     } catch (error) {
+      if (error instanceof SessionAddressConflict) return { ok: false, code: "address_conflict", error: error.message };
       return { ok: false, code: "duplicate_logical_id", error: (error as Error).message };
     }
+  }
+
+  private checkTmuxServer(context?: SelfAttachContext): SelfAttachResult | undefined {
+    const expected = this.tmuxServer?.socketPath;
+    if (this.tmuxServer?.mode !== "isolated" || !expected || context?.attachmentType !== "tmux") return;
+    const canonical = (file: string) => { try { return realpathSync(file); } catch { return resolve(file); } };
+    if (context.tmuxSocketPath && canonical(context.tmuxSocketPath) === canonical(expected)) return;
+    return { ok: false, code: "tmux_server_mismatch", error: context.tmuxSocketPath
+      ? "This shell uses a different tmux server. Open a shell on the server reported by rig terminal status before attaching it."
+      : "This instance uses an isolated tmux server. Update the CLI so attach --self can report this shell's socket." };
   }
 
   private async attachExistingNode(args: {
@@ -211,6 +237,7 @@ export class SelfAttachService {
     logicalId: string;
     runtime?: string | null;
     cwd?: string | null;
+    displayName?: string;
     context: SelfAttachContext;
   }): Promise<SelfAttachResult> {
     const attachTx = this.db.transaction(() =>
@@ -218,6 +245,7 @@ export class SelfAttachService {
         rigId: args.rigId,
         nodeId: args.nodeId,
         logicalId: args.logicalId,
+        displayName: args.displayName,
         context: args.context,
       })
     );
@@ -226,6 +254,7 @@ export class SelfAttachService {
       const result = attachTx();
       return this.finalizeAttach(args.rigName, result, args.runtime, args.cwd);
     } catch (error) {
+      if (error instanceof SessionAddressConflict) return { ok: false, code: "address_conflict", error: error.message };
       return { ok: false, code: "already_bound", error: (error as Error).message };
     }
   }
@@ -249,6 +278,7 @@ export class SelfAttachService {
       this.eventBus.notifySubscribers(result.event);
       return this.toSuccess(result.nodeId, result.logicalId, result.sessionId, result.sessionName, result.attachmentType, runtime);
     } catch (error) {
+      if (error instanceof SessionAddressConflict) return { ok: false, code: "address_conflict", error: error.message };
       return { ok: false, code: "already_bound", error: (error as Error).message };
     }
   }
@@ -257,6 +287,7 @@ export class SelfAttachService {
     rigId: string;
     nodeId: string;
     logicalId: string;
+    displayName?: string;
     context: SelfAttachContext;
   }): {
     nodeId: string;
@@ -270,6 +301,10 @@ export class SelfAttachService {
       ? args.context.tmuxSession
       : args.context.sessionName ?? `unknown-${args.nodeId.slice(-6)}`;
 
+    this.sessionRegistry.assertAddressAvailable(args.nodeId, sessionName, args.context.attachmentType === "tmux");
+    if (args.context.attachmentType === "tmux" && args.displayName?.trim()) {
+      this.db.prepare("UPDATE nodes SET label=? WHERE id=?").run(args.displayName.trim(), args.nodeId);
+    }
     this.sessionRegistry.updateBinding(args.nodeId, args.context.attachmentType === "tmux"
       ? {
           attachmentType: "tmux",
@@ -299,6 +334,7 @@ export class SelfAttachService {
   }
 
   private resolveContext(
+    nodeId: string,
     logicalId: string,
     rigName: string,
     displayName?: string,
@@ -308,9 +344,16 @@ export class SelfAttachService {
       return context;
     }
     const explicit = context?.attachmentType === "external_cli" ? context.sessionName?.trim() : displayName?.trim();
+    let sessionName = `${logicalId.replace(/\./g, "-")}@${rigName}`;
+    if (explicit) {
+      // Release keeps history; an ordinary re-attach is not an identity repair.
+      const savedName = this.db.prepare("SELECT 1 FROM sessions WHERE node_id=? AND session_name=? LIMIT 1")
+        .get(nodeId, explicit);
+      sessionName = explicit.includes("@") || savedName ? explicit : `${explicit}@${rigName}`;
+    }
     return {
       attachmentType: "external_cli",
-      sessionName: explicit || `${logicalId.replace(/\./g, "-")}@${rigName}`,
+      sessionName,
     };
   }
 
@@ -350,9 +393,11 @@ export class SelfAttachService {
     // agent it starts) produces activity signal: OPENRIG_RUNTIME is required by
     // the relay to build a payload; url+token let it reach the ingest endpoint
     // directly (file-discovery is the fallback when they are absent).
+    const senderAddress = attachmentType === "tmux"
+      ? this.sessionRegistry.resolveAddress(sessionName)?.senderAddress ?? sessionName : sessionName;
     const env: SelfAttachSuccess["env"] = {
       OPENRIG_NODE_ID: nodeId,
-      OPENRIG_SESSION_NAME: sessionName,
+      OPENRIG_SESSION_NAME: senderAddress,
     };
     if (runtime) env.OPENRIG_RUNTIME = runtime;
     if (this.activityEnv.url) env.OPENRIG_URL = this.activityEnv.url;
@@ -363,6 +408,7 @@ export class SelfAttachService {
       logicalId,
       sessionId,
       sessionName,
+      senderAddress,
       attachmentType,
       env,
     };

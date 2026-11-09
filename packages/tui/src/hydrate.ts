@@ -21,8 +21,9 @@ import type { ConnectionsRead, ControlPlaneRead, SlackManifestRead } from "./con
 import type { UsageRead } from "./usage/usage-model.js";
 import { DaemonClient } from "./daemon-client.js";
 import { parse as parseYaml } from "yaml";
-import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
+import type { AgentRow, FleetSnapshot, HealthCoverage, HealthRecord, HostNode, NeedsItem, PodNode, QueueRead, RecentTransitionSnap, SeatActivitySummary, SeatEffortRead, SliceDetailSnap, SpecEntry, ViewState } from "./types.js";
 import { isHumanSeatSession } from "./pulse/pulse-model.js";
+import { sanitizeHostDisplayName } from "./topology/host-label.js";
 
 // Narrow read-shapes: just the served fields this module consumes (names match
 // the daemon's serialized output — see the Phase-2 endpoint-shape survey).
@@ -52,12 +53,19 @@ interface HealthProjectionRead {
   coverage?: HealthCoverage[];
 }
 interface NodeInventoryRead {
+  needsAttention?: boolean;
+  arbitratedNeedsInput?: boolean | null;
+  needsInputEvidence?: { rung: string; observedAt: string } | null;
+
   nodeId?: string;
   logicalId: string;
   podNamespace?: string | null;
   nodeKind: "agent" | "infrastructure";
   runtime: string | null;
   model?: string | null;
+  /** Configured launch effort and its provenance, served by the node inventory. */
+  effort?: string | null;
+  effortSource?: "seat_choice" | "authored" | "runtime_default" | null;
   lifecycleState: string;
   sessionStatus?: string | null;
   startupStatus?: string | null;
@@ -79,8 +87,8 @@ interface NodeInventoryRead {
     decidedBy?: string | null;
   } | null;
   identityVerdict?: { verdict?: string; reason?: string | null } | null;
-  /** Present only on a community agent app's seat. */
-  agentApp?: { app: string } | null;
+  /** Present only on a community harness's seat. */
+  communityHarness?: { harness: string } | null;
   canonicalSessionName: string | null;
   tmuxAttachCommand?: string | null;
   cwd?: string | null;
@@ -170,6 +178,11 @@ interface ReviewFleetRead {
 interface AttentionAggregateRead {
   hosts?: Array<{ hostId: string; status: string; error?: string }>;
 }
+/** The host registry (`rig host list`): each registered host with a quick reachability probe. */
+interface HostsRead {
+  ownName?: unknown;
+  hosts?: Array<{ id?: unknown; status?: unknown }>;
+}
 interface StreamItemRead {
   tsEmitted: string;
   sourceSession: string;
@@ -222,10 +235,15 @@ function toAgentRow(node: NodeInventoryRead): AgentRow {
   const identityDownranked = node.identityVerdict?.verdict === "mismatch"
     || (node.identityVerdict?.verdict === "pane_missing" && node.identityVerdict?.reason !== "session_missing");
   return {
+    needsAttention: node.needsAttention ?? null,
+    arbitratedNeedsInput: node.arbitratedNeedsInput ?? null,
+    needsInputEvidence: node.needsInputEvidence ?? null,
     nodeId: node.nodeId,
     name: node.logicalId,
     runtime: node.runtime ?? "unknown",
     model: node.model ?? null,
+    effort: node.effort ?? null,
+    effortSource: node.effortSource ?? null,
     spec: node.resolvedSpecName ?? "",
     profile: node.profile ?? null,
     specVersion: node.resolvedSpecVersion ?? null,
@@ -248,6 +266,7 @@ function toAgentRow(node: NodeInventoryRead): AgentRow {
         : null,
       decidedBy: node.activityState?.decidedBy ?? null,
       signalReason: node.agentActivity?.reason ?? null,
+      signalState: node.agentActivity?.state ?? null,
       signalSource: node.agentActivity?.evidenceSource ?? null,
       eventAt: node.agentActivity?.eventAt ?? null,
     },
@@ -257,23 +276,22 @@ function toAgentRow(node: NodeInventoryRead): AgentRow {
       ? "detached"
       : node.startupStatus === "failed"
         ? "failed"
-      : node.lifecycleState === "attention_required" || identityDownranked || node.startupStatus === "attention_required"
+      : identityDownranked || (node.needsAttention == null
+        && (node.lifecycleState === "attention_required" || node.startupStatus === "attention_required"))
         ? "attention_required"
-        // S19: the SERVED taxonomy display decides first (the daemon's one bridge);
-        // the inline mixing below survives only as the pre-taxonomy fallback.
-        : node.activityState?.display === "needs-input"
-          ? "needs_input"
-          : node.agentActivity?.state === "needs_input"
-            ? "needs_input"
-            : node.sessionStatus === "running" || node.sessionStatus === "ready"
-              ? (node.activityState?.display === "working"
-                  ? "active"
-                  : node.activityState?.display === "idle"
-                    ? "idle"
-                    : (node.terminalActive === true || (node.terminalActive == null && node.agentActivity?.state === "running") ? "active"
-                      // A community agent app gives no idle signal: a quiet screen is unknown, not idle.
-                      : node.agentApp ? "unknown" : "idle"))
-              : (node.sessionStatus ?? "unknown"),
+      : node.needsAttention === true
+        ? ((node.arbitratedNeedsInput ?? node.agentActivity?.state === "needs_input") ? "needs_input" : "attention_required")
+      : node.needsAttention == null && (node.activityState?.display === "needs-input" || node.agentActivity?.state === "needs_input")
+        ? "needs_input"
+        : node.sessionStatus === "running" || node.sessionStatus === "ready"
+          ? (node.activityState?.display === "working"
+            ? "active"
+            : node.activityState?.display === "idle"
+              ? "idle"
+              : (node.terminalActive === true || (node.terminalActive == null && node.agentActivity?.state === "running") ? "active"
+                // A community harness gives no idle signal: a quiet screen is unknown, not idle.
+                : node.communityHarness ? "unknown" : "idle"))
+          : (node.sessionStatus ?? "unknown"),
     live: node.lifecycleState === "running",
     canRun: node.lifecycleState !== "running"
       && node.sessionStatus !== "running"
@@ -298,6 +316,12 @@ function groupPods(nodes: NodeInventoryRead[]): PodNode[] {
     pods.set(pod, list);
   }
   return [...pods.entries()].map(([name, agents]) => ({ name, agents }));
+}
+
+// Rigs are listed as `rig ps` lists them: by name, compared as SQLite's `ORDER BY r.name` does (so uppercase before
+// lowercase). The summary arrives in creation order and the sort is stable, so equal names keep that order, as in `rig ps`.
+function byRigName(a: { name: string }, b: { name: string }): number {
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 }
 
 function toNeedsItem(item: NeedsYouItemRead): NeedsItem {
@@ -358,7 +382,7 @@ function agentSpecTruth(raw?: string): { runtime?: string; skills: string[] } {
  * avoids re-reading every spec every refresh; the key rolls when the library
  * entry's updatedAt changes. Owned by the caller (instance-scoped, no module state). */
 export type SpecReviewCache = Map<string, SpecLibraryReviewRead>;
-export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "pendingDrill">;
+export type HydrateViewContext = Pick<ViewState, "project" | "section" | "viewTab" | "drill" | "file" | "externalUrl" | "terminalView" | "attentionOpen" | "attentionView" | "pendingDrill">;
 
 export async function hydrateSnapshot(
   client: DaemonClient,
@@ -391,8 +415,8 @@ export async function hydrateSnapshot(
 
   if (viewContext?.section === "needs") {
     const [attention, updates, roots] = await Promise.all([
-      safe<NonNullable<FleetSnapshot["attentionRead"]>>("Feed", () => client.humanAttention(viewContext.attentionOpen)),
-      safe<DeliveredHumanUpdates>("delivered updates", () => client.humanUpdates()),
+      safe<NonNullable<FleetSnapshot["attentionRead"]>>("Feed", () => client.humanAttention(viewContext.attentionOpen, viewContext.attentionView ?? "default")),
+      safe<DeliveredHumanUpdates>("delivered updates", () => client.humanUpdates(viewContext.attentionView ?? "default")),
       safe<Awaited<ReturnType<DaemonClient["fileRoots"]>>>("file-roots", () => client.fileRoots()),
     ]);
     const attentionRead = composeHumanUpdates(attention, updates, viewContext.attentionOpen);
@@ -483,18 +507,33 @@ export async function hydrateSnapshot(
   const wantsConnections = viewContext?.section === "connections";
   const wantsSpecs = !viewContext || viewContext.section === "specs" || topologyLeaf?.kind === "agent";
   const wantsTopologyScope = !viewContext || viewContext.section === "topology";
-  const wantsRecent = wantsTopologyScope && (!topologyLeaf || topologyLeaf.kind === "host" || topologyLeaf.kind === "rig");
+  // A pod's Recent tab shows its rig's window; the pod's other tabs draw none of it.
+  const wantsRecent = wantsTopologyScope && (!topologyLeaf || topologyLeaf.kind === "host" || topologyLeaf.kind === "rig"
+    || (topologyLeaf.kind === "pod" && viewContext?.viewTab === "recent"));
   const focusedTopology = !!viewContext && wantsTopologyScope && viewContext.viewTab !== "pulse";
   const broadReads = !readingOnly && !focusedTopology && !wantsConnections;
   // Seat rows (Q / WORK / NOW) join these four lists: only a seat's page and the drilled table tab show them.
   const seatQueueReads = broadReads || (focusedTopology && (topologyLeaf?.kind === "agent" || (!!topologyLeaf && viewContext?.viewTab === "table")));
-  // The names-only landing has no health banner; drilled Table pages do.
-  const healthRequested = broadReads || viewContext?.viewTab === "health" || (wantsTopologyScope && !!topologyLeaf && viewContext?.viewTab === "table");
+  // Pulse's JUST FINISHED reads the whole instance. A seat's page reads its own RECENTLY FINISHED once
+  // the inventory names its session, below; the drilled table tab shows none.
+  const recentlyFinishedReads = broadReads;
+  const seatFinishedReads = focusedTopology && topologyLeaf?.kind === "agent";
+  // render.ts draws healthSummaryLine on the instance Table and on the rig/pod Table and Overview; those focused pages must load health too.
+  const rendersHealthSummary = topologyLeaf?.kind === "agent"
+    || (topologyLeaf?.kind === "host" && viewContext?.viewTab === "table")
+    || ((topologyLeaf?.kind === "rig" || topologyLeaf?.kind === "pod") && (viewContext?.viewTab === "table" || viewContext?.viewTab === "overview"));
+  const healthRequested = broadReads || viewContext?.viewTab === "health" || rendersHealthSummary;
   const wantsGraph = wantsTopologyScope && (!viewContext || viewContext.viewTab === "graph");
   // A pending pod/agent address needs every rig's seats to resolve.
   const pendingInventory = viewContext?.pendingDrill?.resource === "pod" || viewContext?.pendingDrill?.resource === "agent";
+  // Agent detail: read the existing seat-effort report once per refresh. It reads
+  // the running process and native transcript, never launches or restarts anything.
+  const drillRig = [...(viewContext?.drill ?? [])].reverse().find((segment) => segment.kind === "rig")?.name
+    ?? currentRigName
+    ?? null;
+  const seatEffortRef = topologyLeaf?.kind === "agent" && drillRig ? `${topologyLeaf.name}@${drillRig}` : null;
 
-  const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, recentlyFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead] = await Promise.all([
+  const [instanceHealth, healthProjection, agg, summaries, library, review, streamItems, attention, blocked, inProgress, pending, instanceFinished, scopesRead, executionRead, sliceDetailRead, connectionsRead, seatEffortRead, hostsRead] = await Promise.all([
     safe<InstanceHealthRead>("health", () => client.health()),
     !healthRequested ? Promise.resolve(null) : safe<HealthProjectionRead>("health-findings", () => client.healthFindings()),
     !broadReads ? Promise.resolve(null) : safe<AttentionAggregateRead>("attention-aggregate", () => client.attentionAggregate()),
@@ -508,13 +547,16 @@ export async function hydrateSnapshot(
     !seatQueueReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-in-progress", () => client.queueInProgress()),
     // PULSE UP NEXT + JUST FINISHED lane reads (increment 3) — same shipped /list route
     !seatQueueReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-pending", () => client.queuePending()),
-    !broadReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished()),
+    !recentlyFinishedReads ? Promise.resolve(null) : safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished()),
     !broadReads ? Promise.resolve(null) : safe<{ missions: unknown[]; sourceObservation?: { state: string } }>("scopes", () => client.scopesDetailed() as Promise<{ missions: unknown[] }>),
     !broadReads ? Promise.resolve(null) : safe<{ rows: unknown[] }>("execution", () => client.execution(executionMission ?? undefined) as Promise<{ rows: unknown[] }>),
     broadReads && sliceDetailName
       ? safe<SliceDetailSnap>(`slice-detail(${sliceDetailName})`, () => client.sliceDetail(sliceDetailName))
       : Promise.resolve(null),
     wantsConnections ? safe<ConnectionsRead>("connections", () => client.connections()) : Promise.resolve(null),
+    seatEffortRef ? safe<SeatEffortRead>("seat-effort", () => client.seatEffort(seatEffortRef)) : Promise.resolve(null),
+    // Every topology view lists the registered hosts, not only the views that read the attention aggregate.
+    wantsTopologyScope ? safe<HostsRead>("hosts", () => client.hosts()) : Promise.resolve(null),
   ]);
 
   // Optional: an older daemon has no manifest route; the page then points at the CLI instead.
@@ -525,11 +567,14 @@ export async function hydrateSnapshot(
   const agentSpecNames = new Set((library ?? []).filter((entry) => entry.kind === "agent").map((entry) => entry.name));
   if (scopesRead?.sourceObservation?.state === "unavailable") readErrors.push("scopes: proof source updates unavailable; current HTTP basis only");
   if (review?.registryError) readErrors.push(`review-fleet registry: ${review.registryError}`);
+  // A drilled-into host that isn't this one: its pages read none of this host's seats or queue changes.
+  const drilledHost = viewContext?.section === "topology" ? viewContext.drill.find((segment) => segment.kind === "host")?.name : undefined;
+  const remoteDrill = !!drilledHost && drilledHost !== (instanceHealth?.selfHostId?.trim() || "local");
   const recentTransitionsRig = currentRigName ?? (!viewContext ? summaries?.[0]?.name : null) ?? null;
   const recentTransitionsScope = topologyLeaf?.kind === "host"
     ? { kind: "instance" } as const
     : recentTransitionsRig ? { kind: "rig", rig: recentTransitionsRig } as const : null;
-  const recentTransitions = wantsRecent && recentTransitionsScope
+  const recentTransitions = wantsRecent && recentTransitionsScope && !remoteDrill
     ? await safe<RecentTransitionSnap[]>(
         `queue-recent(${recentTransitionsScope.kind === "instance" ? "instance" : recentTransitionsScope.rig})`,
         () => client.queueRecentTransitions(recentTransitionsScope),
@@ -556,8 +601,8 @@ export async function hydrateSnapshot(
     }),
   );
 
-  // Topology: the local host expands to the daemon's rigs; remote hosts come
-  // from the aggregate with reachability only (per-rig start; the all-rigs
+  // Topology: the local host expands to the daemon's rigs; a remote host
+  // lists its rigs only when drilled into (below; per-rig start; the all-rigs
   // level is deliberately under-designed — founder capture).
   const rigs = [];
   const rigsDown: FleetSnapshot["hostsDown"] = [];
@@ -574,7 +619,7 @@ export async function hydrateSnapshot(
       if (!readErrors.includes(warning)) readErrors.push(warning);
     }
     const readInventory = wantsConnections ? connectionsRead?.configuration?.inboundDestination?.split("@")[1] === rig.name
-      : !focusedTopology || topologyLeaf?.kind === "host" || currentRigName === rig.name || pendingInventory;
+      : !focusedTopology || (!remoteDrill && (topologyLeaf?.kind === "host" || currentRigName === rig.name)) || pendingInventory;
     const nodes = readInventory ? await safe<NodeInventoryRead[]>(`nodes(${rig.name})`, () => client.rigNodes(rig.id)) : null;
     for (const node of nodes ?? []) {
       if (node.nodeKind !== "agent" || !node.canonicalSessionName) continue;
@@ -632,16 +677,38 @@ export async function hydrateSnapshot(
       if (spec.name) rigSpecRefs.set(spec.name, refs);
     }
   }
+  const seatSession = seatFinishedReads ? seatActivity.find((seat) => seat.logicalId === topologyLeaf?.name)?.session : undefined;
+  const seatFinished = seatSession
+    ? await safe<QueueItemRead[]>("queue-recently-finished", () => client.queueRecentlyFinished(20, seatSession))
+    : null;
   const aggHosts = agg?.hosts ?? [];
+  const ownName = typeof hostsRead?.ownName === "string" ? sanitizeHostDisplayName(hostsRead.ownName) : undefined;
   const localHost: HostNode = {
     id: "local",
     name: instanceHealth?.selfHostId?.trim() || "local",
+    displayName: ownName && ownName !== "localhost" ? ownName : undefined,
     reachable: true,
-    rigs,
+    rigs: rigs.sort(byRigName),
   };
-  const remoteHosts: HostNode[] = aggHosts
-    .filter((h) => h.hostId !== "local")
-    .map((h) => ({ id: h.hostId, name: h.hostId, reachable: h.status === "ok", rigs: [] }));
+  // A remote host is any registered host, or one the attention aggregate answered for. Its reachability is the aggregate's
+  // answer where there is one, else the registry's probe. Only a drilled-into remote host's rigs are read, through this
+  // daemon's read-only forwarding: their names and states, never their seats. A registry entry for this host is this host.
+  const registered = (hostsRead?.hosts ?? []).flatMap((h) => typeof h.id === "string" && h.id && h.id !== "local"
+    ? [{ id: h.id, reachable: h.status === "reachable" }] : []);
+  const aggStatus = new Map(aggHosts.filter((h) => h.hostId !== "local").map((h) => [h.hostId, h.status]));
+  const remoteIds = [...new Set([...aggStatus.keys(), ...registered.map((h) => h.id)])].filter((id) => id !== localHost.name);
+  const drilledRemote = remoteDrill && drilledHost && remoteIds.includes(drilledHost) ? drilledHost : null;
+  const remoteRigs = drilledRemote
+    ? await safe<RigSummaryRead[]>(`rigs-summary(${drilledRemote})`, () => client.rigsSummary(drilledRemote))
+    : null;
+  const remoteHosts: HostNode[] = remoteIds.map((id) => ({
+    id,
+    name: id,
+    reachable: aggStatus.has(id) ? aggStatus.get(id) === "ok" : registered.some((h) => h.id === id && h.reachable),
+    rigs: id === drilledRemote
+      ? (remoteRigs ?? []).map((rig) => ({ id: rig.id, name: rig.name, lifecycleState: rig.lifecycleState, hasLiveAgents: rig.hasLiveAgents ?? null, pods: [], remoteHost: id })).sort(byRigName)
+      : [],
+  }));
 
   // Specs: RIG + AGENT land well by consuming the existing structured review
   // for BOTH kinds. WORKFLOW remains basics. Reviews are memoized by updatedAt.
@@ -766,6 +833,9 @@ export async function hydrateSnapshot(
 
   return {
     connections: connectionsRead,
+    // Keep the address even when the read failed: the detail page then says the
+    // report was not read instead of silently omitting the effort section.
+    ...(seatEffortRef ? { seatEffort: { seatRef: seatEffortRef, report: seatEffortRead } } : {}),
     controlPlane: instanceHealth,
     slackManifest,
     daemonTarget: (() => { try { const u = new URL(client.baseUrl); return `${u.protocol}//${u.host}${u.pathname}`; } catch { return "unreported"; } })(),
@@ -808,7 +878,7 @@ export async function hydrateSnapshot(
     inProgress: (inProgress ?? []).map(toQueueRead),
     seatActivity,
     pending: (pending ?? []).map(toQueueRead),
-    recentlyFinished: (recentlyFinished ?? []).map(toQueueRead),
+    recentlyFinished: (seatFinished ?? instanceFinished ?? []).map(toQueueRead),
     hydratedAt: new Date().toISOString(),
     hostsDown,
     stream: (streamItems ?? []).map((s) => ({ tsEmitted: s.tsEmitted, sourceSession: s.sourceSession, body: s.body })),

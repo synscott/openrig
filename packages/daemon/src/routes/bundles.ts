@@ -132,7 +132,7 @@ async function extractInstallTimeMetadata(bundlePath: string): Promise<{
     const manifestYaml = fs.readFileSync(manifestPath, "utf-8");
     const bundleManifest = parsePodBundleManifest(manifestYaml) as Record<string, unknown>;
 
-    // B1 safety repair (slice-05 Checkpoint 4.2 / qitem-20260518204906): validate
+    // B1 safety repair (slice-05 Checkpoint 4.2): validate
     // the parsed manifest BEFORE trusting any of its fields. The validators
     // reject unsafe rig_spec values (isRelativeSafePath: no absolute, no ../,
     // no backslash, no empty segments). Schema-version-aware: v2 uses pod-aware
@@ -1227,7 +1227,7 @@ bundleRoutes.post("/install", async (c) => {
     // Plan mode: no run lifecycle
     try {
       const result = await bootstrapOrchestrator.bootstrap({
-        mode: "plan", sourceRef: bundlePath, sourceKind: "rig_bundle", cwdOverride,
+        mode: "plan", sourceRef: bundlePath, sourceKind: "rig_bundle", targetRoot, cwdOverride,
       });
       if (result.status === "planned") {
         eventBus.emit({ type: "bootstrap.planned", runId: result.runId, sourceRef: bundlePath, stages: result.stages.length });
@@ -1264,7 +1264,8 @@ bundleRoutes.post("/install", async (c) => {
       const routing: BundleContentRouting | undefined = bundleRouting
         ?? (result.status === "completed" ? await bootstrapOrchestrator.routeBundleContents(bundlePath) : undefined);
       // The hook already put its failures in warnings; the legacy fallback adds its own here.
-      const warnings = [...(result.warnings ?? []), ...(bundleRouting ? [] : routingFailureWarnings(routing))];
+      const warnings = [...(result.warnings ?? [])];
+      if (!bundleRouting) warnings.push(...(routing?.warnings ?? []).filter(w => !warnings.includes(w)), ...routingFailureWarnings(routing));
       warnings.unshift(...(installMeta.warnings ?? []).filter(w => !warnings.includes(w)));
       const responseBody = routing ? { ...bootstrapResult, ...routing, warnings } : { ...bootstrapResult, warnings };
       if (result.status === "completed") {

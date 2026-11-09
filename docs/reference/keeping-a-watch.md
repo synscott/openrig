@@ -107,6 +107,28 @@ rig queue create --destination <entityId>@external --human-intent update \
 - **`posted` means the connector posted it, not that they read it.** Don't say they saw it.
 - **If delivery fails or is indeterminate,** inspect that task before anything else. Never resend blindly.
 
+## If the timer cannot reach its recipient
+
+A `periodic-reminder` occurrence that definitely fails before input remains owed. The watchdog
+retries through its existing loop, using `queue.wake_retry_interval_seconds` and
+`queue.wake_retry_cap` (by default, three retries five minutes apart). A failed attempt does not
+advance the reminder to its next regular cycle. A confirmed send advances the normal interval;
+recovery does not replay every elapsed cycle.
+
+`rig watchdog show <jobId> --json` includes the failed attempt, its retained outbox IDs, retry
+time and next action. If input may have reached the recipient, that occurrence ends unconfirmed
+and is not automatically sent again. Inspect the recipient and exact outbox record before any
+manual replay. A recurring reminder keeps its next normal cycle under a new occurrence identity. A confirmed receipt survives a daemon restart, so
+finishing its accounting does not type the same occurrence twice.
+
+Exhausted retries end only the failed occurrence, with its cause and next action; a recurring
+reminder keeps its next normal cycle. A permanent transport failure leaves a terminal job:
+correct the destination and register a replacement reminder. A one-shot park timer records its
+failed or unconfirmed wake on the parked row before it ends. A retryable failure is recorded
+there while the timer stays armed. Deliberately held
+input keeps its existing retained-message custody. Condition watches and parked-owner policy
+behavior are unchanged. This does not replay failed occurrences recorded by older versions.
+
 ## "What are you watching for me?"
 
 List **every active state**, not just set-aside ones. A watch being checked can be in progress, and a new one can be
@@ -164,6 +186,27 @@ this one included, and never starts a read on any account. With no host registry
 says so. Use it rather than the single-machine `rig provider status --json`: one allowance used from several
 machines appears once, with each machine's own observation beside it, so you can't count it twice. If it answers that
 usage windows are off, tell the person that before setting the watch, as you would an unreachable channel.
+
+For a Claude login supplied by `CLAUDE_CODE_OAUTH_TOKEN`, an explicit one-credential read is available:
+
+```sh
+rig provider status --refresh --provider claude --claude-token-file /absolute/private/personal.token --credential-label Personal
+```
+
+The file must be readable by the daemon, regular, at most 8 KiB, and contain only the token. Ownership by the daemon user and mode 0600 or
+0400 are recommended; different ownership, broader permissions and symlinks produce warnings, not refusals. Provision it through your existing credential
+custody; never put token values in arguments, seat environment settings, evidence or a queue item. The path is on the selected daemon's
+machine. Repeat the command for another labelled file when you want to compare subscriptions. This option does not fan out with
+`--all-hosts` or `--hosts`.
+
+**Each token refresh spends one model turn.** Status and TUI reads show the cached result and never probe. A timeout or refusal does not
+prove no allowance was spent. The probe uses a temporary home/config/work directory and a single Haiku turn, with CLI flags requesting no tools, hooks or MCP. Unsupported CLI flags or missing events are reported as failures/unknown, not as free capacity. The event format is evidenced on
+Claude Code 2.1.310; other versions may report different fields. These are credential labels you supplied, not provider-verified account
+names, and do not prove a running seat uses that credential. The ordinary status-line sample/account join remains unproven.
+
+Only actually reported window percentages and resets are measurements. A rejected window can have an unknown percentage; overage rejection
+is separate from subscription rejection. Readings and their times survive daemon restart, marked historical until refreshed. Files with
+different references/labels stay separate; equal resets or matching labels on another host never establish one allowance or extra room.
 
 **Never put `--refresh` in the timer's check.** `rig provider status --all-hosts --refresh` starts a native read of the
 accounts on every machine. Run it only when the person asks for a fresh reading now.

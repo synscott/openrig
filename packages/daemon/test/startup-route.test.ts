@@ -3,11 +3,13 @@ import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import { startupRevision } from "../src/routes/startup.js";
 import { defaultProbeRuntimes } from "../src/domain/kernel-boot.js";
 import { SeatLifecycleService } from "../src/domain/seat-lifecycle-service.js";
-import { existsSync, readFileSync } from "node:fs";
-import { verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { verifyCodexPaneProcess, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
 vi.mock("../src/domain/native-process-lineage.js", async (original) => {
   const actual = await original<typeof import("../src/domain/native-process-lineage.js")>();
-  return { ...actual, verifyPaneIdleShell: vi.fn(actual.verifyPaneIdleShell) };
+  return { ...actual, verifyCodexPaneProcess: vi.fn(actual.verifyCodexPaneProcess), verifyPaneIdleShell: vi.fn(actual.verifyPaneIdleShell) };
 });
 vi.mock("../src/domain/kernel-boot.js", async (original) => ({ ...await original<typeof import("../src/domain/kernel-boot.js")>(), defaultProbeRuntimes: vi.fn(async () => ({ codex: "ok", claudeCode: "ok" })) }));
 
@@ -41,6 +43,27 @@ describe("startup consent and effect boundary", () => {
     expect(setup.tmuxAdapter.createSession).not.toHaveBeenCalled();
     const second = await request();
     expect(await second.json()).toMatchObject({ ok: true, rigId: body.rigId, reused: true });
+  });
+  it("prepares a new kernel in the workspace's own kernel folder, outside its projects", async () => {
+    const workspace = mkdtempSync(join(tmpdir(), "startup-kernel-ws-"));
+    const saved = process.env["OPENRIG_WORKSPACE_ROOT"];
+    process.env["OPENRIG_WORKSPACE_ROOT"] = workspace;
+    try {
+      setup = createTestApp(db, { podInstantiatorFsOps: { exists: existsSync, readFile: (path) => readFileSync(path, "utf8") } });
+      const response = await setup.app.request("/api/startup/kernel", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ runtime: "claude-code" }) });
+      const body = await response.json();
+      expect(body).toMatchObject({ ok: true, rigId: expect.any(String) });
+      // Every seat works in `<workspace.root>/kernel`, beside `<workspace.root>/projects` rather than above it, so the
+      // guidance a seat writes in its directory isn't read by project seats. Nothing else is written in the workspace.
+      const cwds = setup.rigRepo.getRig(body.rigId)!.nodes.map((node) => node.cwd);
+      expect(new Set(cwds)).toEqual(new Set([join(workspace, "kernel")]));
+      expect(statSync(join(workspace, "kernel")).isDirectory()).toBe(true);
+      expect(readdirSync(workspace)).toEqual(["kernel"]);
+    } finally {
+      if (saved === undefined) delete process.env["OPENRIG_WORKSPACE_ROOT"]; else process.env["OPENRIG_WORKSPACE_ROOT"] = saved;
+      rmSync(workspace, { recursive: true, force: true });
+    }
   });
   it("rejects a changed occupant or model before invoking fresh launch", async () => {
     const { rig, node } = seat(); const revision = startupRevision(db, node);
@@ -95,6 +118,35 @@ describe("startup consent and effect boundary", () => {
       const seen = await observed(shellPane("claude-code", true).id);
       expect(seen).toMatchObject({ state: "attention_required", detail: "The probe pane returned to a shell instead of staying inside the runtime." });
     });
+  });
+  it("re-probes a Codex status footer after the foreground process is verified", async () => {
+    setup = createTestApp(db, {
+      appDeps: {
+        listProcesses: async () => [
+          { pid: 900, ppid: 1, command: "/bin/zsh", pgid: 900, tpgid: 901, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
+          { pid: 901, ppid: 900, command: "codex --model anthropic/claude-3.5-sonnet",
+            argv: ["codex", "--model", "anthropic/claude-3.5-sonnet"], pgid: 901, tpgid: 901, executableName: "codex", startedAt: "Sat Jan  1 12:00:01 2000" },
+        ],
+      },
+    });
+    const { rig, node } = seat();
+    setup.tmuxAdapter.probeSession = vi.fn(async () => ({ state: "present" } as never));
+    setup.tmuxAdapter.listPanes = vi.fn(async () => [{ id: "%1", index: 0, cwd: "/p", width: 80, height: 24, active: true }]) as never;
+    setup.tmuxAdapter.getPaneCommand = vi.fn(async () => "zsh");
+    setup.tmuxAdapter.getPanePid = vi.fn(async () => 900);
+    let captures = 0;
+    setup.tmuxAdapter.capturePaneContent = vi.fn(async () => {
+      captures++;
+      if (captures === 1) return "  project2 · main\n› codex resume 019a136b-0000-7000-8000-000000000001";
+      return [
+        "› ",
+        "  Ready · Context 13% used · anthropic/claude-3.5-sonnet         ⚠ 2 warnings · f2 to view",
+      ].join("\n");
+    });
+
+    const response = await setup.app.request(`/api/startup/${rig.id}`);
+    expect((await response.json()).seats[0].observed).toMatchObject({ state: "running" });
+    expect(captures).toBe(2);
   });
   it("reports unavailable transport without authorizing fresh replacement", async () => {
     const { rig, node } = seat();

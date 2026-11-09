@@ -1,6 +1,6 @@
 {
   "name": "@openrig/daemon",
-  "version": "0.6.11",
+  "version": "0.7.1",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -8,6 +8,7 @@
     "./windows-launch": { "types": "./dist/windows-launch-surface.d.ts", "import": "./dist/windows-launch-surface.js" },
     "./rig-display-labels": { "types": "./dist/rig-display-labels.d.ts", "import": "./dist/rig-display-labels.js" },
     "./bundle-behaviour": { "types": "./dist/bundle-behaviour-surface.d.ts", "import": "./dist/bundle-behaviour-surface.js" },
+    "./router-line": { "types": "./dist/router-line-surface.d.ts", "import": "./dist/router-line-surface.js" },
     "./spec-validation": {
       "types": "./dist/spec-validation-surface.d.ts",
       "import": "./dist/spec-validation-surface.js"
@@ -27,6 +28,10 @@
     "./gateway-human-registry": {
       "types": "./dist/gateway-human-registry-surface.d.ts",
       "import": "./dist/gateway-human-registry-surface.js"
+    },
+    "./rosters": {
+      "types": "./dist/rosters-surface.d.ts",
+      "import": "./dist/rosters-surface.js"
     },
     "./gateway-protocol": {
       "types": "./dist/gateway-protocol-surface.d.ts",
@@ -83,6 +88,14 @@
     "./local-reading": {
       "types": "./dist/local-reading-surface.d.ts",
       "import": "./dist/local-reading-surface.js"
+    },
+    "./learned-host-bindings": {
+      "types": "./dist/learned-host-bindings-surface.d.ts",
+      "import": "./dist/learned-host-bindings-surface.js"
+    },
+    "./codex-auth": {
+      "types": "./dist/codex-auth-surface.d.ts",
+      "import": "./dist/codex-auth-surface.js"
     }
   },
   "scripts": {
@@ -108,6 +121,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/tar": "^6.1.13",
+    "proper-lockfile": "^4.1.2",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

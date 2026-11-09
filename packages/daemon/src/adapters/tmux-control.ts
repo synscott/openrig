@@ -1,5 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { spawnTmuxClient, TMUX_MAX_BUFFER } from "./tmux-exec.js";
 import type { ArgvExecFn } from "./tmux.js";
 
@@ -11,9 +13,9 @@ import type { ArgvExecFn } from "./tmux.js";
  * Each spawned client costs the daemon a fork of its whole process: some 28 ms of CPU a command at its size, against
  * 0.3 ms for a line written to a client already connected. The client makes a session of its own as it attaches
  * (`new-session`: an existing session is never taken over, whatever its name), named after this daemon's owner id and
- * marked with it (`@openrig-control`), and `destroy-unattached`: tmux destroys it when the client leaves, so the daemon
- * never kills a session itself. Listings leave out this daemon's own session and client, and nothing else: a session
- * another daemon or a person made, whatever its name or mark, is listed as any other.
+ * marked with it (`@openrig-control`), which tmux kills once no client is left in it (a `client-detached` hook, see
+ * `clientArgs`), so the daemon never kills a session itself. Listings leave out this daemon's own session and client,
+ * and nothing else: a session another daemon or a person made, whatever its name or mark, is listed as any other.
  *
  * What it runs and what it gives back are the spawned client's: the same commands, their output, the same error text
  * in `execStderr`, a chain stopped at its first failing command, and output past TMUX_MAX_BUFFER failed with execFile's
@@ -22,8 +24,12 @@ import type { ArgvExecFn } from "./tmux.js";
  * through a chain fails the rest at once, the outcome of the commands it sent unknown, and none is run again; and the
  * blocks tmux's hooks print on their own (an `after-list-panes` in a user's tmux.conf) are not taken for a command's
  * reply, where a spawned client prints a hook's output after its command's. Anything else (a launch,
- * which takes the spawning process's environment; `load-buffer`, see ROUTED; a command line that cannot be written on
- * one line; a global flag; no server yet, or one before 3.2) goes to the spawned client, as before.
+ * which takes the spawning process's environment; `load-buffer` of anything but a short one-line text file, see
+ * `bufferLoadAsSet`, and every `load-buffer` while an `after-load-buffer` or `after-set-buffer` hook is set, see
+ * `bufferHooked`; a command line that cannot be written on
+ * one line; a global flag other than this client's server selection; no server yet, or one before 3.2) goes to the
+ * spawned client, as before. On servers older than tmux 3.7c, or whose version is unknown, all commands use spawned
+ * clients: creating a control client can crash those servers when another session is created (#2304).
  */
 
 /** The session option that marks a control session: its value is the owner id of the daemon whose client made it. */
@@ -38,13 +44,15 @@ export function controlSessionName(owner: string): string {
  *  its rc files): a non-interactive sh that waits forever. */
 const KEEP_ALIVE = ["sh", "-c", "while :; do sleep 86400; done"];
 
-// Commands that only read the server or write into a pane, whose outcome does not depend on the client that sends
-// them as long as they name their target. A launch or an environment change stays spawned. So does `load-buffer`: it
+// Commands that only read the server, write into a pane, or set a named target's option or a named buffer, whose
+// outcome does not depend on the client that sends them as long as they name their target. A launch or an environment change stays spawned. So does `load-buffer`: it
 // would have the server open the file itself, in its own loop (a FIFO with no writer stops the whole server) and in its
-// own view of the filesystem, where a spawned client reads the file and hands the server its bytes.
+// own view of the filesystem, where a spawned client reads the file and hands the server its bytes. A short one-line
+// text file is read here instead, and its bytes set by `set-buffer` (`bufferLoadAsSet`): only that set-buffer is
+// routed, never one a caller sends.
 const ROUTED = new Set([
   "capture-pane", "display-message", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients",
-  "show-environment", "paste-buffer", "delete-buffer", "send-keys",
+  "show-environment", "paste-buffer", "delete-buffer", "send-keys", "set-option",
 ]);
 
 const LISTINGS = new Set(["list-sessions", "list-windows", "list-panes", "list-clients"]);
@@ -57,11 +65,90 @@ const READS = new Set([...LISTINGS, "capture-pane", "display-message", "has-sess
  *  "current" one that a target-less command reads. */
 function namesItsTarget(args: string[]): boolean {
   const [command] = args;
+  if (command === "set-option") return optionTargeted(args);
   if (args.includes("-t")) return true;
   if (command === "list-sessions" || command === "list-clients" || command === "delete-buffer") return true;
   if (command === "list-windows" || command === "list-panes") return args.includes("-a");
   if (command === "show-environment") return args.includes("-g");
   return false;
+}
+
+/** Whether a `set-option` names an absolute target among its flags (`-t`, alone or in a cluster such as `-wt`), and
+ *  none of them expands a format (`-F`: one may read the client that sends it). Without a target, the client's own
+ *  session is the one set; so it is with a relative one (`:0`, `1`, `{last}`, a bare name tmux may also match as a
+ *  window of the current session), resolved against the control client's session. Every flag is read, up to the
+ *  option's name: `-t`'s value is skipped, whatever it reads. */
+function optionTargeted(args: string[]): boolean {
+  let targeted = false;
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--" || arg === "-" || !arg.startsWith("-")) break;
+    if (arg.includes("F")) return false;
+    const t = arg.indexOf("t");
+    if (t < 0) continue;
+    // the target is the next argument; otherwise it is the rest of this one
+    const target = t === arg.length - 1 ? args[++i] : arg.slice(t + 1);
+    if (target === undefined || !absoluteTarget(target)) return false;
+    targeted = true;
+  }
+  return targeted;
+}
+
+/** A target that names the same object from any client: an exact session (`=name`), a pane, window or session id
+ *  (`%N`, `@N`, `$N`), or a session part before the `:` (`name:1`, `=name:`). */
+function absoluteTarget(target: string): boolean {
+  if (/^[=%@$]./.test(target)) return true;
+  const colon = target.indexOf(":");
+  return colon > 0 && !/^[{+-]/.test(target);
+}
+
+/** The most bytes of a file a `load-buffer` is sent as `set-buffer` for. */
+export const SET_BUFFER_MAX_BYTES = 4096;
+
+/** Reads at most `maxBytes` of a regular file, or null for anything else (a FIFO, a device, a symlink, a longer file).
+ *  Opened without blocking, so a FIFO with no writer is never waited on. The read must return exactly the size the
+ *  stat saw: a short read, or a file written meanwhile, is null (the load-buffer stays spawned). */
+export type ReadBufferFile = (path: string, maxBytes: number) => Promise<Buffer | null>;
+
+export const readShortRegularFile: ReadBufferFile = async (path, maxBytes) => {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > maxBytes) return null;
+    const buffer = Buffer.alloc(maxBytes + 1);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes + 1, 0);
+    return bytesRead !== stat.size ? null : buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+};
+
+/** Whether the args are a lone `load-buffer -b <name> <path>` that `bufferLoadAsSet` may turn into a set-buffer: the
+ *  shape alone, with no read of the file. */
+export function isLoneBufferLoad(args: string[]): boolean {
+  if (args.length !== 4 || args[0] !== "load-buffer" || args[1] !== "-b") return false;
+  const [, , name, path] = args as [string, string, string, string];
+  return !(name.endsWith(";") || path === "-" || path.endsWith(";"));
+}
+
+/** A lone `load-buffer -b <name> <path>` of a short one-line text file as the `set-buffer` that sets the same buffer
+ *  to the same bytes, read here as a spawned client reads them; null keeps the load-buffer spawned. Kept spawned: any
+ *  other shape (stdin, other flags, a chain), a file that is not regular or is past the bound, one that cannot be
+ *  read, an empty one, bytes that are not UTF-8 or hold a control character (a newline among them), and a text ending
+ *  in `;`, which tmux's argument parsing takes for its command's end. */
+export async function bufferLoadAsSet(args: string[], read: ReadBufferFile): Promise<string[] | null> {
+  if (!isLoneBufferLoad(args)) return null;
+  const [, , name, path] = args as [string, string, string, string];
+  let bytes: Buffer | null;
+  try {
+    bytes = await read(path, SET_BUFFER_MAX_BYTES);
+  } catch {
+    return null;
+  }
+  if (!bytes || bytes.length === 0) return null;
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes) || /[\u0000-\u001f\u007f]/.test(text) || text.endsWith(";")) return null;
+  return ["set-buffer", "-b", name, "--", text];
 }
 
 /** The argv's commands, as a spawned tmux reads its arguments (cmd-parse.c): an argument ending in `;` ends its
@@ -125,13 +212,15 @@ function quote(arg: string): string {
   return `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
-/** Whether tmux's version (`tmux -V`, or a server's `#{version}`) names 3.2 or later: the client flags of
- *  `new-session -f`. */
+/** Only known fixed server releases: tmux before 3.7c can crash while a control client starts and any other
+ * session is created (#2304). Development/unknown versions fall back to spawned clients; a client binary's
+ * version alone is not evidence of the server's version. */
 export function supportsControlMode(versionLine: string): boolean {
-  const match = /(\d+)\.(\d+)/.exec(versionLine);
+  const match = /^(?:tmux\s+)?(\d+)\.(\d+)([a-z]?)(?=\||\s|$)/.exec(versionLine.trim());
   if (!match) return false;
   const major = Number(match[1]);
-  return major > 3 || (major === 3 && Number(match[2]) >= 2);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && (minor > 7 || (minor === 7 && match[3]! >= "c")));
 }
 
 /** A command's reply: its output lines, none once they went past the bound (`overflow`). */
@@ -277,6 +366,9 @@ export type SpawnControlClient = (args: string[]) => ChildProcessWithoutNullStre
 
 export interface TmuxControlOptions {
   spawnClient?: SpawnControlClient;
+  /** The adapter's fixed server selection (`-S <socket>` or `-L <name>`). Empty keeps tmux's inherited server.
+   *  Only commands carrying this exact selection may use this client's connection. */
+  serverArgs?: readonly string[];
   /** Once the command at the head of the line has had no reply for this long, the client is ended: the reads it owed
    *  are asked again of a spawned client, the writes it owed fail, and the next command starts a new client. Also the
    *  time a client has to attach. */
@@ -286,6 +378,19 @@ export interface TmuxControlOptions {
   owner?: string;
   /** The most output a call may give, as a spawned client's stdout is bounded: TMUX_MAX_BUFFER by default. */
   maxBuffer?: number;
+  /** How a `load-buffer`'s file is read for `set-buffer` (`bufferLoadAsSet`); tests give their own. */
+  readBufferFile?: ReadBufferFile;
+  /** Where it says whether its server allows control mode, once per server version read: the daemon's log by default. */
+  log?: (message: string) => void;
+}
+
+/** Whether commands go over the control client: `on` only while one is attached; `allowed` when the server's version
+ *  allows one but none is attached (not started yet, or it couldn't start, attach or stay); `off` when the version
+ *  rules it out; `undecided` until a spawned client has read the version of a running server. */
+export interface TmuxControlStatus {
+  state: "on" | "allowed" | "off" | "undecided";
+  /** The server's own version, as tmux reports it (`#{version}`). */
+  serverVersion?: string;
 }
 
 const RETRY_MS = [1_000, 5_000, 30_000];
@@ -303,12 +408,20 @@ interface ControlClient {
   users: number;
   /** Set once it takes no new call: it ends as soon as the calls running on it are done. */
   retiring: boolean;
+  /** Whether a buffer hook is set on its server (`bufferHooked`): asked once per client, at its first load. */
+  bufferHooks?: Promise<boolean>;
 }
+
+/** What a spawned `load-buffer` and its `set-buffer` stand-in tell apart: tmux runs the hook after each command named
+ *  after it (`CMD_AFTERHOOK`), so a load sent as set-buffer would run `after-set-buffer` where the user configured
+ *  `after-load-buffer`, and a hook may change the buffer before it is pasted. A session's hook option inherits the
+ *  global one, so one listing reads both scopes, for every session a spawned client's load may run in. */
+const BUFFER_HOOKS_FORMAT = "#{after-load-buffer}#{after-set-buffer}";
 
 /** How long the end of a client (its input closed) may take before it is killed. */
 const END_MS = 2_000;
 
-export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void>; owner: string };
+export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void>; owner: string; status: () => TmuxControlStatus };
 
 /**
  * The ArgvExecFn the daemon's TmuxAdapter runs with when control mode is on: routed commands go to the control client,
@@ -319,7 +432,13 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   const spawnClient = options.spawnClient ?? spawnTmuxClient;
   const replyTimeoutMs = options.replyTimeoutMs ?? 10_000;
   const maxBuffer = options.maxBuffer ?? TMUX_MAX_BUFFER;
+  const readBufferFile = options.readBufferFile ?? readShortRegularFile;
   const now = options.now ?? (() => Date.now());
+  const serverArgs = [...(options.serverArgs ?? [])];
+  const log = options.log ?? ((message: string) => console.warn(message));
+  let control: TmuxControlStatus = { state: "undecided" };
+  /** The server version whose first attached client was logged. */
+  let saidOn: string | undefined;
   let client: ControlClient | null = null;
   let starting: Promise<ControlClient | null> | null = null;
   let failures = 0;
@@ -347,8 +466,8 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     else backOff();
   };
 
-  /** Ends a client as tmux ends one whose input closes: it detaches, after answering what it was sent, and tmux
-   *  destroys its session (`destroy-unattached`). Killed if it has not gone within END_MS. */
+  /** Ends a client as tmux ends one whose input closes: it detaches, after answering what it was sent, and tmux kills
+   *  its session once it has gone (`clientArgs`). Killed if it has not gone within END_MS. */
   const end = (c: ControlClient): Promise<void> => new Promise((resolve) => {
     if (!live.has(c)) {
       resolve();
@@ -388,21 +507,50 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   };
 
   /** The control client's arguments: a session of its own, made as it attaches and never one that exists, marked with
-   *  this daemon's id, destroyed by tmux once no client is in it, and never moving its client elsewhere when it goes. */
+   *  this daemon's id, killed by tmux once no client is in it, and never moving its client elsewhere when it goes.
+   *
+   *  Killed by a `client-detached` hook, not destroyed by `destroy-unattached` (set off here, whatever a tmux.conf sets
+   *  globally). Before tmux 3.8, a client whose input has closed stops counting as in its session while tmux still
+   *  holds it: another client leaving then has tmux destroy the session under it, and the server crashes on the session
+   *  gone (#2304). The hook runs once the client has gone, and `kill-session` takes any client still in the session out
+   *  of it first. tmux also runs a session's `client-detached` for a client that left another session (one whose
+   *  session is gone gets the hooks of the session active last), so the hook kills the session only while no client
+   *  is in it. A hook's commands run in the session the hook is set on, so `kill-session` names no session and kills
+   *  this one, renamed or not. `if-shell -F` reads a format and runs no shell. */
   const clientArgs = (): string[] => [
-    "-C", "new-session", "-s", controlSessionName(owner), "-x", "80", "-y", "24", "-f", "no-output,ignore-size",
+    ...serverArgs, "-C", "new-session", "-s", controlSessionName(owner), "-x", "80", "-y", "24", "-f", "no-output,ignore-size",
     "--", ...KEEP_ALIVE,
     ";", "set-option", CONTROL_OPTION, owner,
-    ";", "set-option", "destroy-unattached", "on",
+    ";", "set-option", "destroy-unattached", "off",
+    ";", "set-hook", "client-detached", "if-shell -F '#{==:#{session_attached},0}' kill-session",
     ";", "set-option", "detach-on-destroy", "on",
   ];
 
-  /** Whether a server runs that a control client may attach to: one of tmux 3.2 or later (its own version, not the
+  /** Records what a server's version allows, once for each version read: a server started again may run another one.
+   *  A version that rules control mode out is said at once: a person who set OPENRIG_TMUX_CONTROL=1 on an older server
+   *  otherwise sees no sign that every command is spawned. One that allows it is said once a client attaches. */
+  const heard = (row: string): void => {
+    const serverVersion = row.split("|")[0]!;
+    if (!serverVersion || serverVersion === control.serverVersion) return;
+    if (supportsControlMode(row)) {
+      control = { state: "allowed", serverVersion };
+      return;
+    }
+    control = { state: "off", serverVersion };
+    const why = /^\d+\.\d+[a-z]?$/.test(serverVersion)
+      ? ": control mode needs a server at tmux 3.7c or later" : ", which isn't a tmux release known to be 3.7c or later";
+    log(`[tmux] OPENRIG_TMUX_CONTROL=1 is set, but this daemon's tmux server runs tmux ${serverVersion}${why}, so every`
+      + " tmux command uses a spawned client. The running server's version decides this, not the tmux binary's. To move"
+      + " a team onto a newer server: rig context get reference/tmux-servers.md#moving-an-existing-team-onto-tmux-control-mode");
+  };
+
+  /** Whether a server runs that a control client may attach to: one of tmux 3.7c or later (its own version, not the
    *  tmux binary's) with a session that is no control session, read by a spawned client. With none, no client is
    *  started: it never starts a server, nor keeps one up that would exit without it (`checkAlone`). */
   const serverReady = async (): Promise<boolean> => {
     try {
-      const rows = (await fallback(["tmux", "list-sessions", "-F", `#{version}|#{${CONTROL_OPTION}}`])).split("\n").filter(Boolean);
+      const rows = (await fallback(["tmux", ...serverArgs, "list-sessions", "-F", `#{version}|#{${CONTROL_OPTION}}`])).split("\n").filter(Boolean);
+      if (rows[0]) heard(rows[0]);
       return supportsControlMode(rows[0] ?? "") && rows.some((row) => row.endsWith("|"));
     } catch {
       return false;
@@ -467,6 +615,10 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       return null;
     }
     failures = 0;
+    if (control.serverVersion !== saidOn) {
+      saidOn = control.serverVersion;
+      log(`[tmux] Control mode is on: this daemon's tmux server runs tmux ${saidOn}.`);
+    }
     // The server may have lost its last other session while this one was made.
     checkAlone(started);
     return started;
@@ -505,6 +657,15 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     }, () => { /* the client is gone already */ });
   };
 
+  /** Whether either buffer hook is set, globally or on any session: asked once per client, and kept for its life (a
+   *  hook set later is not seen until the next client). With one set, or when the client cannot tell, every load
+   *  stays a spawned load-buffer, with the hook the user configured. */
+  const bufferHooked = (c: ControlClient): Promise<boolean> =>
+    c.bufferHooks ??= send(c, ["list-sessions", "-F", BUFFER_HOOKS_FORMAT]).then(
+      (reply) => !reply.ok || reply.overflow || reply.lines.some((line) => line !== ""),
+      () => true,
+    );
+
   /** The error of a write whose client ended before its reply, with what a spawned client finds of its target now: a
    *  server or session gone reads as a spawned client's failure would (`no server running`, `can't find session`), so
    *  the adapter classifies it the same way. A client dropped for no reply is not asked about: the server is not
@@ -513,7 +674,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const t = command.indexOf("-t");
     if (err.message.includes("no reply within") || t < 0 || t + 1 >= command.length) return err;
     try {
-      await fallback(["tmux", "display-message", "-p", "-t", command[t + 1]!, ""]);
+      await fallback(["tmux", ...serverArgs, "display-message", "-p", "-t", command[t + 1]!, ""]);
       return err;
     } catch (probe) {
       const stderr = (probe as { execStderr?: unknown }).execStderr;
@@ -524,22 +685,40 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
 
   const exec = async (argvIn: string[]): Promise<string> => {
     const [bin, ...argsIn] = argvIn;
-    const commandsIn = commandsOf(argsIn);
-    const routable = bin === "tmux" && argsIn.length > 0 && !argsIn[0]!.startsWith("-") && commandsIn.length > 0
-      && commandsIn.every((c) => ROUTED.has(c[0]!) && namesItsTarget(c))
-      && argsIn.every((a) => !/[\n\r\0]/.test(a));
+    // Only the leading global server pair is a selection: capture-pane's own -S is a scrollback bound.
+    // A different server (or any other global flags) belongs to a spawned client, unchanged.
+    const prefix = argsIn.length >= 2 && (argsIn[0] === "-S" || argsIn[0] === "-L") ? argsIn.slice(0, 2) : [];
+    const sameServer = prefix.length === serverArgs.length && prefix.every((arg, i) => arg === serverArgs[i]);
+    // A short one-line text's load-buffer is sent as set-buffer; a spawned client, if one runs it, gets the load-buffer.
+    // The file is read only once a control client is there to take the set-buffer (N1 of the review): without one, the
+    // load-buffer goes spawned, unread here.
+    const loadArgs = argsIn.slice(prefix.length);
+    const loadable = bin === "tmux" && sameServer && !closed && isLoneBufferLoad(loadArgs)
+      && [...prefix, ...loadArgs].every((a) => !/[\n\r\0]/.test(a));
+    if (loadable) {
+      // With a buffer hook set, the load stays spawned: as set-buffer it would run the other hook (#2636 review).
+      const c = await connected();
+      if (!c || await bufferHooked(c)) return fallback(argvIn);
+    }
+    const asSet = loadable ? await bufferLoadAsSet(loadArgs, readBufferFile) : null;
+    const args = asSet ?? argsIn.slice(prefix.length);
+    const commandsIn = sameServer && !args[0]?.startsWith("-") ? commandsOf(args) : [];
+    const routable = bin === "tmux" && commandsIn.length > 0
+      && (asSet !== null || commandsIn.every((c) => ROUTED.has(c[0]!) && namesItsTarget(c)))
+      && [...prefix, ...args].every((a) => !/[\n\r\0]/.test(a));
     // Every listing leaves this daemon's own rows out, from the first one on: its session may be made by the very call
     // that lists, or by another one under way. A row is marked only on this daemon's own mark, so before its session
     // exists the output is unchanged.
     const marked = bin === "tmux" && commandsIn.some((c) => LISTINGS.has(c[0]!));
     const tag = marked ? ownRowTag() : "";
-    const argv = marked ? [bin, ...markOwnRows(argsIn, owner, tag)] : argvIn;
+    const commandArgs = marked ? markOwnRows(args, owner, tag) : args;
+    const argv = marked ? [bin, ...prefix, ...commandArgs] : argvIn;
     const own = (text: string): string => marked ? withoutOwnRows(text, tag) : text;
     const target = routable ? await connected() : null;
     if (!target) return own(await fallback(argv));
     target.users++;
     try {
-      const commands = commandsOf(argv.slice(1));
+      const commands = commandsOf(commandArgs);
       let stdout = "";
       let bytes = 0;
       for (const [index, command] of commands.entries()) {
@@ -570,7 +749,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     }
   };
 
-  /** Ends every client, one attaching included, each after what it was sent: the daemon is stopping. tmux destroys
+  /** Ends every client, one attaching included, each after what it was sent: the daemon is stopping. tmux kills
    *  their sessions as they leave. */
   const close = async (): Promise<void> => {
     closed = true;
@@ -579,5 +758,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     await Promise.all([...live].map(end));
   };
 
-  return Object.assign(exec, { close, owner });
+  // On only while a client is attached: one that can't start, attach or stay leaves commands to the spawned client.
+  const status = (): TmuxControlStatus => (control.state === "allowed" && client ? { ...control, state: "on" } : { ...control });
+  return Object.assign(exec, { close, owner, status });
 }

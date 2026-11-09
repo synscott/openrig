@@ -1,3 +1,4 @@
+import { physicalSessionName } from "./session-registry.js";
 import { resolveNodeFile } from "./scope/node-file.js";
 import { belongsToProject } from "./workspace/project-catalog.js";
 import { inspectGraph } from "./workflow-reconciliation.js";
@@ -40,10 +41,17 @@ import { shellQuote } from "../adapters/shell-quote.js";
 import { parseFrontmatter } from "./slices/slice-indexer.js";
 import { lastMeaningfulTransition } from "./queue-waiting.js";
 import { derivePickup } from "./queue-pickup.js";
+
+/** #2661 (c): the dep's answer for a seat, or null when absent or failing (a read never breaks the view). */
+export function compactionOwedSinceOf(deps: { compactionOwedSince?: (sessionName: string) => string | null }, session: string | null | undefined): string | null {
+  if (!session) return null;
+  try { return deps.compactionOwedSince?.(session) ?? null; } catch { return null; }
+}
 import { resolveWorkNodeDirs } from "./current-work.js";
 import { resolveLegacyTopologyRigsRoot } from "./user-settings/settings-store.js";
 import { BUILD_INFO, type BuildInfo } from "../build-info.js";
 import { validateMissionComposition } from "./lifecycle-manifest.js";
+import { cooperativeReadFile, readRowsCooperatively } from "./execution-candidate-reader.js";
 
 export const INDETERMINATE = "INDETERMINATE" as const;
 export type Indeterminate = typeof INDETERMINATE;
@@ -66,8 +74,11 @@ export interface ExecutionViewDeps {
       needsInput: { count: number; reason: string | null };
       decidedBy: string | null;
       changedAt: string;
+      backgroundWork?: { observedAt: string } | null;
     } | null;
   };
+  /** #2661 (c): since when (ISO) a seat's managed post-compaction restore is owed, or null (the pickup's grace). */
+  compactionOwedSince?: (sessionName: string) => string | null;
   now?: () => Date;
   buildInfo?: BuildInfo;
   /** Injectable for tests; synchronous fakes are also accepted. */
@@ -334,11 +345,10 @@ function hasColumn(db: Database.Database, table: string, column: string): boolea
 function lifecycleProjectAction(input: {
   instanceId: string;
   packetId: string;
-  owner: string;
   acceptance: Record<string, unknown> | null;
   receiptRequired?: boolean;
 }): string {
-  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed> --actor-session ${input.owner}${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
+  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed>${input.receiptRequired ? " --evidence-ref <agent-judged-receipt>" : ""}`;
   if (!input.acceptance) return base;
   const verdicts = Array.isArray(input.acceptance["verdicts"])
     ? input.acceptance["verdicts"].filter((value): value is string => typeof value === "string")
@@ -418,7 +428,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
         gate: step && isRecord(step["gate"]) ? step["gate"] : null,
         acceptance,
         targeted_action: matches.length === 1 && packet
-          ? lifecycleProjectAction({ instanceId, packetId, owner: String(packet.destination_session), acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
+          ? lifecycleProjectAction({ instanceId, packetId, acceptance, receiptRequired: stepId !== null && requiredLifecycleSteps(binding).includes(stepId) })
           : INDETERMINATE,
       };
     });
@@ -438,7 +448,7 @@ function readLifecycleExecutions(db: Database.Database, mission: string, project
             failure["status"] === "unresolved" &&
             row["status"] !== "completed" &&
             row["status"] !== "aborted"
-            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])} --actor-session <you>`
+            ? `rig workflow resume ${instanceId} --occurrence ${String(failure["occurrence_id"])}`
             : null,
         }))
       : [];
@@ -642,46 +652,78 @@ interface ReviewArtifactFact {
   artifactType: string | null;
 }
 
-/** Read review drops co-located with this slice, plus the legacy global registry
- * when no catalogued project was selected. Both sources keep the same slice and
- * built-commit join; unbound global artifacts cannot establish project review. */
-function scanReviewArtifacts(rigsRoot: string, sliceDirOrId: string[], proofDir: string, includeGlobal: boolean): ReviewArtifactFact[] | Indeterminate {
-  const out: ReviewArtifactFact[] = [];
-  let readable = false;
-  const scanDirectory = (dir: string, local: boolean) => {
-    let files: string[];
-    try {
-      files = fs.readdirSync(dir).filter((f) => f.endsWith(".md"));
-      readable = true;
-    } catch { return; }
-    for (const f of files) {
-      let raw: string;
-      try { raw = fs.readFileSync(path.join(dir, f), "utf8"); }
-      catch { continue; }
-      const fm = parseFrontmatter(raw);
-      const sliceVal = typeof fm["slice"] === "string" ? fm["slice"] : null;
-      if (!sliceVal || !sliceDirOrId.includes(sliceVal)) continue;
-      const artifactType = typeof fm["artifact_type"] === "string" ? fm["artifact_type"] : null;
-      // A local QA/guard drop does not become a review leg merely by living in proof/.
-      if (local && !["rev1-r1", "rev1-r2", "adjudication"].includes(artifactType ?? "")) continue;
-      out.push({ path: path.join(dir, f),
-        verdict: typeof fm["verdict"] === "string" ? fm["verdict"] : INDETERMINATE,
-        candidateSha: typeof fm["candidate_sha"] === "string" ? fm["candidate_sha"] : null,
-        artifactType });
-    }
-  };
-  scanDirectory(proofDir, true);
-  if (includeGlobal) {
-    let rigs: string[] = [];
-    try { rigs = fs.readdirSync(rigsRoot); readable = true; } catch { /* Local proof remains usable. */ }
-    for (const rig of rigs) {
-      const stateDir = path.join(rigsRoot, rig, "state");
-      let entries: string[];
-      try { entries = fs.readdirSync(stateDir); } catch { continue; }
-      for (const entry of entries.filter((e) => e.startsWith("review"))) scanDirectory(path.join(stateDir, entry), false);
+/** One parsed review drop, before it is joined to a slice. */
+interface ReviewDrop extends ReviewArtifactFact { slice: string | null }
+
+/** The legacy global registry, listed and parsed once per execution-view read. */
+interface ReviewRegistry { readable: boolean; drops: ReviewDrop[] }
+
+/** Files read, or time spent, before the registry read yields to the event loop. Both are soft. */
+const REGISTRY_SLICE_FILES = 32;
+const REGISTRY_SLICE_MS = 8;
+
+function readReviewDrop(file: string): ReviewDrop | null {
+  let raw: string;
+  try { raw = fs.readFileSync(file, "utf8"); }
+  catch { return null; }
+  const fm = parseFrontmatter(raw);
+  return { path: file,
+    verdict: typeof fm["verdict"] === "string" ? fm["verdict"] : INDETERMINATE,
+    candidateSha: typeof fm["candidate_sha"] === "string" ? fm["candidate_sha"] : null,
+    artifactType: typeof fm["artifact_type"] === "string" ? fm["artifact_type"] : null,
+    slice: typeof fm["slice"] === "string" ? fm["slice"] : null };
+}
+
+function listReviewFiles(dir: string): string[] | null {
+  try { return fs.readdirSync(dir).filter((f) => f.endsWith(".md")).map((f) => path.join(dir, f)); }
+  catch { return null; }
+}
+
+/** Every rig's `state/review*` drops, in the order a per-slice scan met them. Every slice of one read joins this same
+ *  list, so the registry is read once per read, not once per slice; it yields between files so other work runs. */
+async function readReviewRegistry(rigsRoot: string): Promise<ReviewRegistry> {
+  let rigs: string[];
+  try { rigs = fs.readdirSync(rigsRoot); } catch { return { readable: false, drops: [] }; }
+  const drops: ReviewDrop[] = [];
+  let read = 0;
+  let sliceStart = performance.now();
+  for (const rig of rigs) {
+    const stateDir = path.join(rigsRoot, rig, "state");
+    let entries: string[];
+    try { entries = fs.readdirSync(stateDir); } catch { continue; }
+    for (const entry of entries.filter((e) => e.startsWith("review"))) {
+      for (const file of listReviewFiles(path.join(stateDir, entry)) ?? []) {
+        if (read >= REGISTRY_SLICE_FILES || performance.now() - sliceStart >= REGISTRY_SLICE_MS) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          read = 0;
+          sliceStart = performance.now();
+        }
+        read++;
+        const drop = readReviewDrop(file);
+        if (drop) drops.push(drop);
+      }
     }
   }
-  return readable ? out : INDETERMINATE;
+  return { readable: true, drops };
+}
+
+/** Read review drops co-located with this slice, plus the legacy global registry
+ * when no catalogued project was selected (`registry` is null for a project-scoped read). Both sources keep the same slice and
+ * built-commit join; unbound global artifacts cannot establish project review. */
+function scanReviewArtifacts(registry: ReviewRegistry | null, sliceDirOrId: string[], proofDir: string): ReviewArtifactFact[] | Indeterminate {
+  const out: ReviewArtifactFact[] = [];
+  const join = (drops: ReviewDrop[], local: boolean) => {
+    for (const { slice, ...fact } of drops) {
+      if (!slice || !sliceDirOrId.includes(slice)) continue;
+      // A local QA/guard drop does not become a review leg merely by living in proof/.
+      if (local && !["rev1-r1", "rev1-r2", "adjudication"].includes(fact.artifactType ?? "")) continue;
+      out.push(fact);
+    }
+  };
+  const localFiles = listReviewFiles(proofDir);
+  join((localFiles ?? []).map(readReviewDrop).filter((drop): drop is ReviewDrop => drop !== null), true);
+  if (registry) join(registry.drops, false);
+  return localFiles !== null || registry?.readable ? out : INDETERMINATE;
 }
 
 type Rung =
@@ -759,18 +801,26 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   const missionRefs = mission === INDETERMINATE ? [] : missionReferences(missionsRoot, mission);
   const missionLikes = mission === INDETERMINATE ? ["%"] : missionRefs.map((reference) => `%${reference}%`);
   const missionWhere = missionLikes.map(() => "(tags LIKE ? OR body LIKE ?)").join(" OR ");
-  const candidateRows = deps.db
-    .prepare(
-      `SELECT qitem_id, source_session, destination_session, state, tags, body, summary, claimed_at,
+  // post_claim_motion feeds only derivePickup's legacy fallback, which pending and in-progress rows reach: a blocked row
+  // returns parked and a closed row terminal before the count is read. Every row and body is still selected here (the
+  // ladder, EC-3 and wave-map evidence need historical rows); only their unused history count is skipped.
+  const candidateSql = `SELECT qitem_id, source_session, destination_session, state, tags, body, summary, claimed_at,
               last_heartbeat, blocked_on, ts_created, ts_updated,
-              (SELECT COUNT(*) FROM queue_transitions t
+              CASE WHEN queue_items.state IN ('pending','in-progress') THEN (SELECT COUNT(*) FROM queue_transitions t
                  WHERE t.qitem_id = queue_items.qitem_id
                    AND t.ts > queue_items.claimed_at
-                   AND t.transition_note IS NOT 'claimed') AS post_claim_motion
+                   AND t.transition_note IS NOT 'claimed') ELSE 0 END AS post_claim_motion
          FROM queue_items
-        WHERE (${missionWhere})`,
-    )
-    .all(...missionLikes.flatMap((like) => [like, like])) as QueueRowLite[];
+        WHERE (${missionWhere})`;
+  const candidateBinds = missionLikes.flatMap((like) => [like, like]);
+  // On a WAL database file this full scan runs on its own readonly cursor and yields between slices so unrelated
+  // work can run; a native open, prepare or step can still block, since the slice budget is soft. It sees committed
+  // data as of its first step. Inside a transaction, or for a memory or non-WAL database, it stays a synchronous
+  // read on the main handle (no await on that branch).
+  const cooperativeFile = cooperativeReadFile(deps.db);
+  const candidateRows = cooperativeFile === null
+    ? deps.db.prepare(candidateSql).all(...candidateBinds) as QueueRowLite[]
+    : await readRowsCooperatively<QueueRowLite>(cooperativeFile, candidateSql, candidateBinds);
 
   const rows = candidateRows
     .filter(row => mission === INDETERMINATE || rowBindsToMission(row.tags, missionRefs))
@@ -846,8 +896,10 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     const arbitrated = deps.seatActivity?.getSeatStateBySession(r.destination_session) ?? null;
     const pickup = derivePickup({
       state: r.state,
-      lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count,
+      // A blocked row's pickup is parked before it reads its history, so that history is not read at all.
+      lastMeaningfulAt: r.state === "blocked" ? undefined : lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
+      activity: arbitrated?.activity, needsInput: arbitrated?.needsInput.count, needsInputReason: arbitrated?.needsInput.reason,
+      backgroundWork: arbitrated?.backgroundWork ?? null, compactionOwedSince: compactionOwedSinceOf(deps, r.destination_session),
       claimedAt: r.claimed_at,
       lastHeartbeat: r.last_heartbeat,
       postClaimMotionCount: Number(r.post_claim_motion ?? 0),
@@ -928,6 +980,8 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
   // ---- Q4 ladder (also feeds Q2's deps-folded) ----
   const rigsRoot = (deps.rigsRoot ?? resolveLegacyTopologyRigsRoot)();
   const commitCache = new Map<string, string | null>();
+  // Read on first use and shared by every slice of this read; the next read lists the registry again.
+  let registryRead: Promise<ReviewRegistry> | undefined;
   const ladderOf = async (facts: SliceFacts): Promise<Record<string, unknown>> => {
     const fm = facts.frontmatter;
     const locked: Rung = typeof fm["approved-spec-at"] === "string"
@@ -969,7 +1023,8 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // tags, full shas, annotated fields) join by RESOLVED commit; malformed,
     // ambiguous, or non-resolving inputs are excluded with the reason carried —
     // they neither clear nor poison.
-    const artifacts = scanReviewArtifacts(rigsRoot, [facts.dir, ...(typeof facts.id === "string" ? [facts.id] : [])], path.join(path.dirname(facts.specPath), "proof"), !opts?.project);
+    const registry = opts?.project ? null : await (registryRead ??= readReviewRegistry(rigsRoot));
+    const artifacts = scanReviewArtifacts(registry, [facts.dir, ...(typeof facts.id === "string" ? [facts.id] : [])], path.join(path.dirname(facts.specPath), "proof"));
     let reviewed: Record<string, unknown>;
     if (artifacts === INDETERMINATE) {
       reviewed = { value: INDETERMINATE, basis: opts?.project ? `slice-local review-artifact root unreadable (${path.dirname(facts.specPath)}/proof)` : `review-artifact roots unreadable (slice proof/ and ${rigsRoot})`, legs: [] };
@@ -1180,8 +1235,10 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     .map((r) => {
       const activity = deps.seatActivity?.getSeatStateBySession(r.destination_session);
       const pickup = derivePickup({
-        lastMeaningfulAt: lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
-        activity: activity?.activity, needsInput: activity?.needsInput.count,
+        // As in Q1: a blocked row is parked before its history is read; its armed wake is still looked up below.
+        lastMeaningfulAt: r.state === "blocked" ? undefined : lastMeaningfulTransition(deps.db, r.qitem_id)?.at,
+        activity: activity?.activity, needsInput: activity?.needsInput.count, needsInputReason: activity?.needsInput.reason,
+        backgroundWork: activity?.backgroundWork ?? null, compactionOwedSince: compactionOwedSinceOf(deps, r.destination_session),
         state: r.state,
         claimedAt: r.claimed_at,
         lastHeartbeat: r.last_heartbeat,
@@ -1197,7 +1254,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
       let parkKind: "deliberate-with-wake" | "stalled" | "indeterminate";
       if (pickup.state === "parked" && wake) {
         parkKind = "deliberate-with-wake";
-      } else if (pickup.state === "stalled-after-claim") {
+      } else if (pickup.state === "stalled-after-claim" || pickup.stall) {
         parkKind = "stalled";
       } else {
         parkKind = "indeterminate";
@@ -1207,6 +1264,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         qitem_id: r.qitem_id,
         pickup_state: pickup.state,
         ...(pickup.evidence ? { pickup_evidence: pickup.evidence } : {}),
+        ...(pickup.stall ? { pickup_stall: pickup.stall } : {}),
         park_kind: parkKind,
         park_kind_basis: wake
           ? `armed wake ${wake.wake_ref} on queue_transition_wakes`
@@ -1218,7 +1276,7 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     });
 
   // ---- Q6 parallelism health ----
-  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => r.destination_session));
+  const inProgressSeats = new Set(rows.filter((r) => r.state === "in-progress").map((r) => physicalSessionName(deps.db, r.destination_session)));
   // Idle capacity: the ROSTER comes from sessions (names only); idleness comes
   // from the ACTIVITY ORACLE — sessions.status is not consulted (it labeled
   // live working lanes `superseded` on the real board).

@@ -245,6 +245,9 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
         : err.code === "annotation_required" ? 400
         : err.code === "decision_required" ? 400
         : err.code === "qitem_not_leg1_parked" ? 409
+        : err.code === "answer_not_closed" ? 409
+        : err.code === "answer_not_recorded" ? 400
+        : err.code === "decision_revision_changed" ? 409
         : 500;
       return c.json(
         { error: err.code, message: err.message, ...(err.details ?? {}) },
@@ -322,12 +325,17 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
         annotation?: string;
         reason?: string;
         decision?: string;
+        questionId?: string;
+        optionId?: string;
         notify?: boolean;
         auditNotes?: Record<string, unknown>;
+        authority?: string;
         hostId?: string;
+        expectedRevision?: unknown;
       }>()
       .catch(() => ({} as never));
     if (!body.verb) return c.json({ error: "verb is required" }, 400);
+    if (body.expectedRevision !== undefined && typeof body.expectedRevision !== "string") return c.json({ error: "expectedRevision must be a string" }, 400);
     if (!MISSION_CONTROL_VERBS.includes(body.verb)) {
       return c.json(
         {
@@ -346,7 +354,7 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
     // never refused, never laundered. Runs BEFORE the local write AND the cross-host forward.
     const identity = resolveActorWithDeferral(c, { verb: `mission-control ${body.verb}`, bodyClaim: body.actorSession });
     if (!identity.ok) return identity.response;
-    // The SOLE provenance decider (rail 2): transport:v1 ONLY when transport proved it at THIS hop; relay:v1
+    // The SOLE provenance decider (rail 2): transport:v1 ONLY when the header named the actor at THIS hop; relay:v1
     // one hop away; claimed:v1 for the UI deferral OR an unpropagatable/legacy marker (degrade-down default).
     const recordedProvenance = resolveRecordedProvenance(c, identity);
     if (typeof body.hostId === "string" && body.hostId !== "" && body.hostId !== LOCAL_HOST_ID) {
@@ -371,7 +379,8 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
       // RE-STAMP X-OpenRig-Session from THIS daemon's derived actor (`identity.session`, from the
       // chokepoint above) + mark relay provenance — the origin derives the RE-STAMPED actor, never the
       // forwarded body claim (the census's #5/#17 forward sites).
-      const { hostId: _dropped, actorSession: _claim, ...forwardBody } = body as Record<string, unknown>;
+      // The primary user's authority is the terminal's here, never forwarded: the origin sees this daemon's identity.
+      const { hostId: _dropped, actorSession: _claim, authority: _authority, ...forwardBody } = body as Record<string, unknown>;
       const res = await remoteJsonRequest(resolved.host, "/api/mission-control/action", {
         method: "POST",
         body: forwardBody,
@@ -381,7 +390,7 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
           "X-OpenRig-Session": identity.session,
           "X-OpenRig-Relay": getSelfHostId() ?? "unknown",
           // Carry the provenance THIS hop resolved so the origin NEVER launders a claimed-era actor into a
-          // verified one: identity.provenance is transport:v1 (CLI) or claimed:v1 (UI deferral). The origin's
+          // transport-derived one: identity.provenance is transport:v1 (CLI) or claimed:v1 (UI deferral). The origin's
           // resolveRecordedProvenance degrades — a transport:v1 marker ⇒ relay:v1, everything else ⇒ claimed:v1.
           // (Literal capitalized key, matching the sibling X-OpenRig-Session/Relay send convention; the
           // receive side reads it case-insensitively via IDENTITY_PROVENANCE_HEADER.)
@@ -426,8 +435,15 @@ export function missionControlRoutes(opts?: MissionControlRoutesOpts): Hono {
         annotation: body.annotation,
         reason: body.reason,
         decision: body.decision,
+        ...(typeof body.questionId === "string" ? { questionId: body.questionId } : {}),
+        ...(typeof body.optionId === "string" ? { optionId: body.optionId } : {}),
+        // #2446: opt-in; a request without it acts exactly as before. A forward carries it to the origin, which compares it.
+        ...(typeof body.expectedRevision === "string" ? { expectedRevision: body.expectedRevision } : {}),
         notify: body.notify,
         auditNotes: body.auditNotes,
+        // The person at the terminal (the TUI sends no seat header): the actor is the primary user, whoever was asked.
+        // A seat's own transport identity is never replaced by it.
+        ...(body.authority === "primary-user" && identity.provenance === "claimed:v1" ? { authority: "primary-user" as const } : {}),
       });
       return c.json(result);
     } catch (err) {

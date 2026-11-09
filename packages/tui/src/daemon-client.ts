@@ -41,7 +41,7 @@ export interface TerminalOpenResult {
   ok: boolean;
   opened: string[];
   absent: Array<{ seat: string; reason: string }>;
-  degraded: Array<{ seat: string; reason: string }>;
+  degraded: Array<{ seat: string; reason: string; code?: "pane_unconfirmed" }>;
   pages: number;
   error?: string;
   code?: string;
@@ -132,7 +132,10 @@ export class DaemonClient {
     });
     const parsed = await res.json().catch(() => null);
     if (!res.ok) {
-      const detail = parsed && typeof parsed === "object" && "error" in parsed ? ` — ${(parsed as { error: unknown }).error}` : "";
+      const detail = parsed && typeof parsed === "object"
+        ? "error" in parsed ? ` — ${(parsed as { error: unknown }).error}`
+          : "message" in parsed ? ` — ${(parsed as { message: unknown }).message}` : ""
+        : "";
       throw new Error(`daemon write failed: POST ${route} → ${res.status}${detail}`);
     }
     return parsed;
@@ -162,7 +165,8 @@ export class DaemonClient {
     return data;
   }
 
-  humanUpdates() { return this.get("/api/queue/human-updates?limit=20"); }
+  /** Delivered updates, in the same Feed view as the asks (`view`). */
+  humanUpdates(view?: string | null) { return this.get(`/api/queue/human-updates?limit=20${view ? `&view=${encodeURIComponent(view)}` : ""}`); }
   connections() { return this.get("/api/gateway/connections"); }
   slackManifest() { return this.get("/api/gateway/slack/manifest"); }
 
@@ -279,11 +283,38 @@ export class DaemonClient {
   ps() {
     return this.get(`/api/ps`);
   }
-  rigsSummary() {
-    return this.get(`/api/rigs/summary`);
+  /** With `host`, the rigs of that registered host, read through this daemon (its read-only `?host=` forwarding). */
+  rigsSummary(host?: string) {
+    return this.get(host ? `/api/rigs/summary?host=${encodeURIComponent(host)}` : `/api/rigs/summary`);
+  }
+  /** The registered hosts (`rig host list`), each with a quick reachability probe. */
+  hosts() {
+    return this.get(`/api/hosts`);
   }
   rigNodes(rigId: string) {
     return this.get(`/api/rigs/${encodeURIComponent(rigId)}/nodes`);
+  }
+  /** The existing per-seat effort report: requested, saved, emitted and observed.
+   * A refusal is an answer, so the page reader doesn't count it as a failed read. */
+  async seatEffort(seatRef: string): Promise<unknown> {
+    const route = `/api/seat/effort/${encodeURIComponent(seatRef)}`;
+    const res = await this.optionalFetchImpl(`${this.baseUrl}${route}`, {
+      headers: this.headers,
+      signal: AbortSignal.timeout(5_000),
+    });
+    const parsed = await res.json().catch(() => null);
+    if (res.ok) return parsed;
+    if (parsed && typeof parsed === "object"
+      && (parsed as { ok?: unknown }).ok === false
+      && typeof (parsed as { code?: unknown }).code === "string"
+      && typeof (parsed as { message?: unknown }).message === "string") {
+      return parsed;
+    }
+    if (res.status === 404 && parsed == null) return null;
+    const detail = parsed && typeof parsed === "object" && "error" in parsed
+      ? ` — ${(parsed as { error: unknown }).error}`
+      : "";
+    throw new Error(`daemon read failed: GET ${route} → ${res.status}${detail}`);
   }
   reviewAgents(scope: "rig" | "fleet" = "rig") {
     return this.get(`/api/review/agents?scope=${scope}`);
@@ -358,18 +389,20 @@ export class DaemonClient {
   }
   /** Recent terminal transitions (JUST FINISHED) via the SAME shipped /list
    * route with a COMMA multi-state ?state=done,handed-off (queue.ts splits
-   * stateRaw on ","). No fleet-wide finish-time transitions endpoint exists, so
-   * this is a bounded RECENT WINDOW fetched in ts_created order; the PULSE render
-   * re-sorts by tsUpdated DESC (finish time) for newest-first. NOT a new endpoint. */
-  queueRecentlyFinished(limit = 20) {
-    return this.get(`/api/queue/list?state=done,handed-off&limit=${limit}`);
+   * stateRaw on ","). sort=updated picks this bounded RECENT WINDOW by finish time,
+   * so an old item closed just now is in it. A seat's page asks for that seat's own
+   * window, so other seats' finishes can't push its items out. NOT a new endpoint. */
+  queueRecentlyFinished(limit = 20, destinationSession?: string) {
+    const seat = destinationSession ? `&destinationSession=${encodeURIComponent(destinationSession)}` : "";
+    return this.get(`/api/queue/list?state=done,handed-off&sort=updated&limit=${limit}${seat}`);
   }
   /** A single qitem by id via the shipped GET /api/queue/:qitemId (queue.ts:864,
    * returns the QueueItem or 404). Used for the BLOCKED ON AGENTS bounded per-row
    * lookup: blockedOn is a qitem POINTER, so the blocking agent is that qitem's
    * owner (destinationSession). NOT a new endpoint. */
-  humanAttention(item?: string | null) {
-    return this.get(`/api/attention${item ? `?item=${encodeURIComponent(item)}` : ""}`);
+  humanAttention(item?: string | null, view?: string | null) {
+    const query = [item ? `item=${encodeURIComponent(item)}` : null, view ? `view=${encodeURIComponent(view)}` : null].filter(Boolean).join("&");
+    return this.get(`/api/attention${query ? `?${query}` : ""}`);
   }
   queueItem(qitemId: string, options: { optional?: boolean } = {}) {
     return this.get(`/api/queue/${encodeURIComponent(qitemId)}`, options.optional ? this.optionalFetchImpl : this.fetchImpl);
@@ -379,6 +412,11 @@ export class DaemonClient {
   }
   reviewFleet() {
     return this.get(`/api/review/fleet`);
+  }
+  /** The mission-control write Steering uses to answer a request (POST /api/mission-control/action). */
+  missionControlAction(input: { verb: "approve" | "answer" | "resolve"; qitemId: string; actorSession: string; questionId?: string; optionId?: string; decision?: string; authority?: "primary-user" }) {
+    return this.post("/api/mission-control/action", input) as Promise<{ verb: string; qitemId: string; closedQitem: unknown;
+      answer?: { outcome: "recorded" | "answered"; unanswered: string[]; message?: string } }>;
   }
   attentionAggregate() {
     return this.get(`/api/queue/attention-aggregate`);
@@ -403,18 +441,20 @@ export class DaemonClient {
     return await this.get("/api/terminal/views") as { saved: Array<{ id: string; name: string; members: Array<{ seat: string }> }>; rigs: string[] };
   }
   /** The preview behind "Open terminals". That action opens through `rig terminal open --window`, which composes with
-   *  Herdr's layout and falls back to plain tmux without Herdr, so preview the same composition: its planId is the
-   *  window opener's expected plan. A provider-less preview may pick cmux, whose plan the window opener never matches. */
-  async previewTerminal(view: string): Promise<import("./terminals/terminal-model.js").TerminalPreview> {
-    // The interactive TUI has a TTY; measure each preview again after a resize. Unknown stays narrow.
-    const columns = process.stdout.isTTY ? process.stdout.columns : undefined;
+   *  Rex's layout from inside Rex and otherwise Herdr's (falling back to plain tmux), or, from inside cmux, through
+   *  `rig terminal open --provider cmux`. Preview with the provider it will use: its planId is the open's expected plan.
+   *  A provider-less preview may pick cmux, whose plan the window opener never matches. */
+  async previewTerminal(view: string, provider: "herdr" | "rex" | "cmux" = "herdr"): Promise<import("./terminals/terminal-model.js").TerminalPreview> {
+    // The interactive TUI has a TTY; measure each preview again after a resize. Unknown stays narrow. The cmux open sends
+    // no width, and a wide one changes the kernel view's layout and so its plan, so a cmux preview sends none either.
+    const columns = provider !== "cmux" && process.stdout.isTTY ? process.stdout.columns : undefined;
     const viewport = Number.isSafeInteger(columns) && columns! > 0 ? `&viewportColumns=${columns}` : "";
-    return await this.get(`/api/terminal/preview?view=${encodeURIComponent(view)}&provider=herdr${viewport}`) as import("./terminals/terminal-model.js").TerminalPreview;
+    return await this.get(`/api/terminal/preview?view=${encodeURIComponent(view)}&provider=${provider}${viewport}`) as import("./terminals/terminal-model.js").TerminalPreview;
   }
   async openTerminal(view: string, expectedPlan?: string): Promise<TerminalOpenResult> {
     const result = (await this.post(`/api/terminal/open`, { view, ...(expectedPlan !== undefined ? { expectedPlan } : {}) })) as TerminalOpenResult;
     if (!Array.isArray(result.opened) || result.opened.length === 0) {
-      throw new Error(`terminal open failed: ${result.error ?? result.code ?? ([...new Set(result.degraded?.map(m => m.reason))].join("; ") || "no tiles opened")}`);
+      throw new Error(`terminal open failed: ${result.error ?? result.code ?? ([...new Set(result.degraded?.map(m => `${m.code === "pane_unconfirmed" ? "Unconfirmed" : "Skipped"}: ${m.seat} — ${m.reason}`))].join("; ") || "no tiles opened")}`);
     }
     return result;
   }

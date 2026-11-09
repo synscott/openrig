@@ -1,12 +1,13 @@
 // Which tmux server the daemon's sessions live on, as the flags a person's attach command needs.
 //
-// The daemon runs every tmux command without -L or -S, so tmux uses the server named by the
-// daemon's inherited $TMUX when it was started from inside tmux, and otherwise the default
-// server. A person attaching from a new terminal reaches the default server, so an attach
-// command printed for a daemon on another server must name that server.
+// Startup selects either the inherited server or this OpenRig home's dedicated socket.
+// Inherited commands keep tmux's normal environment-based selection; attachment metadata
+// names that server for a new terminal. Isolation fixes both paths to the recorded socket.
 
 import fs from "node:fs";
 import path from "node:path";
+import type { TmuxServerSelection } from "../domain/tmux-server-selection.js";
+import type { TmuxControlStatus } from "./tmux-control.js";
 
 function realpath(p: string): string {
   try {
@@ -25,7 +26,7 @@ function realpath(p: string): string {
  */
 export function tmuxServerArgs(env: NodeJS.ProcessEnv, uid: number | undefined = process.getuid?.()): string[] {
   // tmux puts the socket path first, as is: keep any whitespace in it.
-  const socket = env["TMUX"]?.split(",")[0];
+  const socket = env["TMUX"]?.replace(/,\d+,\d+$/, "");
   if (!socket?.trim()) return [];
   const tmpdir = env["TMUX_TMPDIR"]?.trim() ?? "";
   const customTmpdir = tmpdir !== "" && realpath(tmpdir) !== realpath("/tmp");
@@ -41,23 +42,49 @@ export function tmuxServerArgs(env: NodeJS.ProcessEnv, uid: number | undefined =
 }
 
 let daemonServerArgs: string[] = [];
+let daemonServerSelection: TmuxServerSelection | undefined;
 
-/** Recorded once at daemon startup, from the daemon's own environment. */
-export function setDaemonTmuxServer(args: readonly string[]): void {
+/** Recorded once at daemon startup, before reconciliation or launch. */
+export function setDaemonTmuxServer(args: readonly string[], selection?: TmuxServerSelection): void {
   daemonServerArgs = [...args];
+  daemonServerSelection = selection;
 }
 
-/** The daemon's tmux server flags; empty for the default server. */
+/** Effective startup choice, including a deferred change while old seats survive. */
+export function daemonTmuxServerInfo(): TmuxServerSelection | undefined {
+  return daemonServerSelection;
+}
+
+/** The daemon's effective server flags; empty for legacy/injected compositions. */
 export function daemonTmuxServerArgs(): readonly string[] {
   return daemonServerArgs;
+}
+
+/** Whether OPENRIG_TMUX_CONTROL=1 asked for control mode, and the control client's own account of it: recorded once at
+ *  startup. With no client (psmux, an injected exec) a request reads off. */
+let daemonControl: { requested: boolean; status?: () => TmuxControlStatus } = { requested: false };
+
+export function setDaemonTmuxControl(control: { requested: boolean; status?: () => TmuxControlStatus }): void {
+  daemonControl = control;
+}
+
+/** What `GET /api/adapters/tmux/control` answers, and `rig doctor` reads. */
+export function daemonTmuxControlStatus(): { requested: boolean } & TmuxControlStatus {
+  if (!daemonControl.requested) return { requested: false, state: "off" };
+  return { requested: true, ...(daemonControl.status?.() ?? { state: "off" }) };
 }
 
 function shellWord(value: string): string {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : "'" + value.replace(/'/g, "'\"'\"'") + "'";
 }
 
+/** `tmux`, with the daemon's server flags when it isn't on the default server. */
+function tmuxOnDaemonServer(): string {
+  const server = daemonServerArgs.map((arg, i) => (i % 2 === 0 ? arg : shellWord(arg))).join(" ");
+  return `tmux${server ? ` ${server}` : ""}`;
+}
+
 /** `tmux attach -t <session>`, with the daemon's server flags when it isn't on the default server. */
 export function tmuxAttachCommand(session: string): string {
-  const server = daemonServerArgs.map((arg, i) => (i % 2 === 0 ? arg : shellWord(arg))).join(" ");
-  return `tmux${server ? ` ${server}` : ""} attach -t ${session}`;
+  return `${tmuxOnDaemonServer()} attach -t ${session}`;
 }

@@ -47,6 +47,9 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
   let upBodies: Array<Record<string, unknown>> = [];
   /** Per-test response factory keyed on the freshLogicalIds in the request. */
   let respond: (body: Record<string, unknown>) => Record<string, unknown>;
+  /** One-seat fresh launches the prompt's "y" sends, and the daemon's answer to each. */
+  let launches: Array<{ seat: string; body: Record<string, unknown> }> = [];
+  let launchAnswer: () => { status: number; data: Record<string, unknown> };
 
   beforeAll(async () => {
     server = http.createServer((req, res) => {
@@ -60,6 +63,14 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
           res.end(JSON.stringify(respond(body)));
           return;
         }
+        const launch = req.method === "POST" && req.url?.match(/^\/api\/seat\/launch\/(.+)$/);
+        if (launch) {
+          launches.push({ seat: decodeURIComponent(launch[1]!), body: JSON.parse(raw || "{}") });
+          const answer = launchAnswer();
+          res.writeHead(answer.status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(answer.data));
+          return;
+        }
         res.writeHead(404).end();
       });
     });
@@ -71,6 +82,8 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
 
   beforeEach(() => {
     upBodies = [];
+    launches = [];
+    launchAnswer = () => ({ status: 200, data: { ok: true, sessionName: "dev-impl@myrig" } });
     respond = () => ({ status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "fully_restored", nodes: [], warnings: [] });
   });
 
@@ -116,22 +129,53 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
     });
     const output = logs.join("\n");
     expect(output).toContain("dev.impl: awaiting-decision");
-    expect(output).toContain("--fresh dev.impl");
+    expect(output).toContain(`To deliberately fresh-prime: rig seat launch dev.impl@myrig --fresh --reason "fresh-prime after restore"`);
+    expect(output).not.toContain("rig up --existing");
     expect(exitCode).toBe(1);
     // CRITICAL: exactly one POST — nothing auto-substituted a fresh session.
     expect(upBodies).toHaveLength(1);
   });
 
-  it("TTY ASK accepted: [y/N] offer names seat + reason, then re-runs as a deliberate fresh-prime", async () => {
-    respond = (body) => Array.isArray(body.freshLogicalIds) && (body.freshLogicalIds as string[]).length > 0
-      ? {
-          status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
-          nodes: [{ logicalId: "dev.impl", status: "fresh-primed" }], warnings: [],
-        }
-      : {
-          status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
-          nodes: [{ logicalId: "dev.impl", status: "awaiting-decision", error: "no token available" }], warnings: [],
-        };
+  it("#1332 a partial restore names each awaiting seat by the rig's name and its exact logical id", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "legacy-rig", rigResult: "partially_restored",
+      nodes: [
+        { logicalId: "orch.lead", status: "resumed" },
+        { logicalId: "dev.ops.impl", status: "awaiting-decision", error: "no token available" },
+        { logicalId: "dev.ops-impl", status: "awaiting-decision", error: "no token available" },
+      ],
+      warnings: [],
+    });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "legacy-rig", "--existing"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain(`dev.ops.impl: awaiting-decision — no session started. To deliberately fresh-prime: rig seat launch dev.ops.impl@legacy-rig --fresh --reason "fresh-prime after restore"`);
+    expect(output).toContain(`dev.ops-impl: awaiting-decision — no session started. To deliberately fresh-prime: rig seat launch dev.ops-impl@legacy-rig --fresh --reason "fresh-prime after restore"`);
+    expect(output).not.toContain("rig up --existing");
+    expect(upBodies).toHaveLength(1);
+  });
+
+  it("a seat held back for a missing startup file shows why and how to fix it; the others show as restored", async () => {
+    const reason = "Not launched: Required startup file is missing for dev.qa: /work/startup.md Restore the missing startup file or capture a new snapshot before retrying restore.";
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "dev.impl", status: "resumed" }, { logicalId: "dev.qa", status: "failed", error: reason }],
+      warnings: [],
+    });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain("dev.impl: resumed");
+    expect(output).toContain(`dev.qa: failed — ${reason}`);
+  });
+
+  it("TTY ASK accepted: [y/N] offer names seat + reason, then starts that one seat fresh", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "orch.lead", status: "resumed" }, { logicalId: "dev.impl", status: "awaiting-decision", error: "no token available" }], warnings: [],
+    });
     const prompt = vi.fn(async () => true);
 
     const { logs } = await captureLogs(async () => {
@@ -143,10 +187,39 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
     expect(question).toContain("dev.impl");
     expect(question).toContain("no token available");
     expect(question).toContain("[y/N]");
-    // The accepted seat was re-run as operation B.
-    expect(upBodies).toHaveLength(2);
-    expect(upBodies[1]!.freshLogicalIds).toEqual(["dev.impl"]);
-    expect(logs.join("\n")).toContain("dev.impl: fresh-primed");
+    // #1332: the sibling is running, so the accepted seat starts alone through the printed command's route,
+    // not through a second whole-rig restore (which the daemon refuses while siblings run).
+    expect(upBodies).toHaveLength(1);
+    expect(launches).toEqual([{ seat: "dev.impl@myrig", body: { fresh: true, reason: "fresh-prime after restore" } }]);
+    expect(logs.join("\n")).toContain("dev.impl: fresh-primed (dev-impl@myrig)");
+  });
+
+  it("#1332 TTY ASK accepted: a refused one-seat launch is printed with the daemon's guidance", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "orch.lead", status: "resumed" }, { logicalId: "dev.impl", status: "awaiting-decision", error: "no token available" }], warnings: [],
+    });
+    launchAnswer = () => ({ status: 409, data: { ok: false, code: "seat_live", message: "The seat's pane is still running.", guidance: "Add --stop to replace it deliberately." } });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd(vi.fn(async () => true)).parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(launches).toHaveLength(1);
+    expect(logs.join("\n")).toContain("dev.impl: not started -- The seat's pane is still running.");
+    expect(logs.join("\n")).toContain("Add --stop to replace it deliberately.");
+  });
+
+  it("an attention_required answer reads as needing attention, not as not started", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "orch.lead", status: "resumed" }, { logicalId: "dev.impl", status: "awaiting-decision", error: "no token available" }], warnings: [],
+    });
+    // The daemon's answer when the new process could not be confirmed stopped: it may be running.
+    launchAnswer = () => ({ status: 409, data: { ok: false, code: "attention_required", status: "attention_required", message: "The seat requires attention." } });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd(vi.fn(async () => true)).parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(logs.join("\n")).toContain("dev.impl: needs attention -- The seat requires attention.");
+    expect(logs.join("\n")).not.toContain("not started");
   });
 
   it("TTY ASK declined: no second POST, no session started", async () => {
@@ -163,6 +236,8 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
 
     expect(upBodies).toHaveLength(1);
     expect(logs.join("\n")).toContain("No fresh sessions started");
+    expect(logs.join("\n")).toContain(`rig seat launch dev.impl@myrig --fresh --reason "fresh-prime after restore"`);
+    expect(logs.join("\n")).not.toContain("Re-run with --fresh <seat...>");
     expect(exitCode).toBe(1);
   });
 
@@ -311,5 +386,96 @@ describe("rig up --existing — resume-original default (OPR.0.3.4.2)", () => {
     expect(output).toContain("d: attention_required");
     expect(output).toContain("e: failed");
     expect(exitCode).toBe(1);
+  });
+
+  it("every seat running, some fresh without their conversation: one line says so, and the exit stays 1", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [
+        { logicalId: "orch.lead", status: "resumed" },
+        { logicalId: "dev.impl", status: "fresh-primed" },
+        { logicalId: "dev.qa", status: "fresh" },
+        { logicalId: "infra.shell", status: "fresh", noConversation: true },
+      ],
+      warnings: [],
+    });
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(logs).toContain("All 4 seats are running; 2 started fresh without their conversation. The restore isn't whole, so rig up exits 1.");
+    expect(exitCode).toBe(1);
+  });
+
+  it("one seat running fresh: the line reads for one seat", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [{ logicalId: "dev.impl", status: "fresh-primed" }],
+      warnings: [],
+    });
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(logs).toContain("The one seat is running; 1 started fresh without their conversation. The restore isn't whole, so rig up exits 1.");
+  });
+
+  it("every seat running with a guidance or restore gap: the line names those seats and points at the warnings", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [
+        { logicalId: "orch.lead", status: "resumed", guidanceGaps: ["openrig-core"] },
+        { logicalId: "dev.impl", status: "resumed", restoreGaps: ["claude_activity_hooks: the current selection could not be re-applied: no Claude runtime adapter was available."] },
+        { logicalId: "dev.qa", status: "resumed" },
+      ],
+      warnings: ["Restore activity hooks: the current selection could not be re-applied: no Claude runtime adapter was available."],
+    });
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(logs).toContain("All 3 seats are running; orch.lead, dev.impl came back with a gap named in a warning. The restore isn't whole, so rig up exits 1.");
+    expect(exitCode).toBe(1);
+  });
+
+  it("a seat that isn't running gets no all-running line", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "partially_restored",
+      nodes: [
+        { logicalId: "dev.impl", status: "fresh" },
+        { logicalId: "ext.cli", status: "left_attached", error: "attached with rig attach; left as it is" },
+      ],
+      warnings: [],
+    });
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(logs.join("\n")).not.toContain("seats are running");
+    expect(exitCode).toBe(1);
+  });
+
+  it("a whole restore prints no summary line and exits 0", async () => {
+    respond = () => ({
+      status: "restored", rigId: "rig-1", rigName: "myrig", rigResult: "fully_restored",
+      nodes: [
+        { logicalId: "orch.lead", status: "resumed" },
+        { logicalId: "infra.shell", status: "fresh", noConversation: true },
+      ],
+      warnings: [],
+    });
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "myrig", "--existing"]);
+    });
+    expect(logs.join("\n")).not.toContain("seats are running");
+    expect(exitCode).toBeUndefined();
+  });
+
+  it("help says what exit 1 means after a restore and where to look", () => {
+    let text = "";
+    const cmd = upCommand(deps());
+    cmd.configureOutput({ writeOut: (s) => { text += s; } });
+    cmd.outputHelp();
+    const help = text.replace(/\s+/g, " ");
+    expect(help).toContain("After a restore, rig up exits 0 only when the rig came back whole (rigResult fully_restored).");
+    expect(help).toContain("It exits 1 when it didn't (partially_restored, failed or not_attempted), including when every seat is running but some started fresh without their conversation, or came back with a guidance or restore gap.");
+    expect(help).toContain("read rigResult and each node's status, noConversation, guidanceGaps and restoreGaps to tell these apart");
+    expect(help).toContain("A refused request exits 1 for a conflict (HTTP 409, such as a rig still running or a restore not attempted) and 2 for any other refusal (400, 404 or 500, such as no rig by that name or a failed boot).");
   });
 });

@@ -33,6 +33,7 @@ import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { ClaudeResumeAdapter } from "../src/adapters/claude-resume.js";
 import type { CodexResumeAdapter } from "../src/adapters/codex-resume.js";
 import { createFullTestDb } from "./helpers/test-app.js";
+import { getNodeDetail } from "../src/domain/node-inventory.js";
 
 const TOKEN = "tok-lead";
 
@@ -61,7 +62,7 @@ const nodeFs = {
 
 interface SeatOptions {
   podAware?: boolean;
-  runtime?: "claude-code" | "codex";
+  runtime?: "claude-code" | "codex" | "pi";
   claudeManagedBlockFile?: "CLAUDE.md" | "CLAUDE.local.md";
   userText?: string;
   /** An extra "auto" startup file whose content marks it as a skill. */
@@ -70,7 +71,17 @@ interface SeatOptions {
   freshOnlyFile?: boolean;
   /** An extra older "auto" .md startup file (classified from its content). */
   autoGuidanceFile?: boolean;
+  /** The saved selection carries the seat-skills bootstrap file, as for every seat with skill storage. */
+  seatSkillsLine?: boolean;
+  /** #875: a Pi launch that chose its own agent folder's AGENTS.md, recorded with the startup context. */
+  piAgentFile?: boolean;
 }
+
+/** The resume type each runtime records for its native session. */
+const resumeTypeOf = (runtime: NonNullable<SeatOptions["runtime"]>): string =>
+  runtime === "codex" ? "codex_id" : runtime === "pi" ? "pi_session_file" : "claude_id";
+
+const SEAT_SKILLS_ASSET = path.join(import.meta.dirname, "../assets/guidance/openrig-seat-skills.md");
 
 describe("a seat's guidance across rig down then rig up --existing (exact resume)", () => {
   let db: Database.Database;
@@ -124,7 +135,7 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
     const sess = sessionRegistry.registerSession(node.id, sessionName);
     sessionRegistry.updateStatus(sess.id, "running");
     if (opts.podAware) {
-      sessionRegistry.updateResumeToken(sess.id, runtime === "codex" ? "codex_id" : "claude_id", TOKEN);
+      sessionRegistry.updateResumeToken(sess.id, resumeTypeOf(runtime), TOKEN);
     } else {
       db.prepare("UPDATE sessions SET resume_type = ?, resume_token = ?, restore_policy = ? WHERE id = ?")
         .run("claude_name", TOKEN, "resume_if_possible", sess.id);
@@ -149,6 +160,10 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
       files.push({ path: "NOTES.md", absolutePath: path.join(spec, "NOTES.md"), ownerRoot: spec,
         deliveryHint: "auto", required: false, appliesOn: ["fresh_start", "restore"] });
     }
+    if (opts.seatSkillsLine) {
+      files.push({ path: "openrig-seat-skills.md", absolutePath: SEAT_SKILLS_ASSET, ownerRoot: path.dirname(SEAT_SKILLS_ASSET),
+        deliveryHint: "guidance_merge", required: false, appliesOn: ["fresh_start", "restore"] });
+    }
     if (opts.autoSkillFile) {
       fs.writeFileSync(path.join(spec, "helper.md"), "# SKILL\nA skill, never merged into guidance.");
       files.push({ path: "helper.md", absolutePath: path.join(spec, "helper.md"), ownerRoot: spec,
@@ -157,7 +172,12 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
     const actions = [{ type: "send_text", value: "STARTUP-PROMPT-MUST-NOT-REPLAY", phase: "after_ready", appliesOn: ["fresh_start", "restore"], idempotent: true }];
     db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)")
       .run(node.id, JSON.stringify(entries), JSON.stringify(files), JSON.stringify(actions), runtime);
-    const guidanceFile = path.join(cwd, runtime === "codex" ? "AGENTS.md" : (opts.claudeManagedBlockFile ?? "CLAUDE.md"));
+    const guidanceFile = opts.piAgentFile ? path.join(tmp, "pi-state", sessionName, "agent", "AGENTS.md")
+      : path.join(cwd, runtime === "claude-code" ? (opts.claudeManagedBlockFile ?? "CLAUDE.md") : "AGENTS.md");
+    if (opts.piAgentFile) {
+      fs.mkdirSync(path.dirname(guidanceFile), { recursive: true });
+      db.prepare("UPDATE node_startup_context SET guidance_file = ? WHERE node_id = ?").run(guidanceFile, node.id);
+    }
     if (opts.userText) fs.writeFileSync(guidanceFile, opts.userText);
     mergeManagedBlock(nodeFs, guidanceFile, "lead-role", "You lead this team.");
     mergeManagedBlock(nodeFs, guidanceFile, "SOP.md", "How work flows here.");
@@ -168,7 +188,7 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
 
   /** `rig down` (the real teardown), then `rig up --existing` from its auto snapshot. Records
    *  the guidance file's content at the moment the native harness was started. */
-  async function downThenUpExisting(rigId: string, guidanceFile: string, opts: SeatOptions & { betweenDownAndUp?: () => void; noPane?: boolean } = {}) {
+  async function downThenUpExisting(rigId: string, guidanceFile: string, opts: SeatOptions & { betweenDownAndUp?: () => void; noPane?: boolean; routerLine?: "yes" | "no" } = {}) {
     const runtime = opts.runtime ?? "claude-code";
     const tmux = mockTmux({ noPane: opts.noPane });
     const down = await new RigTeardownOrchestrator({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux, snapshotCapture, eventBus })
@@ -191,17 +211,18 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
       checkReady: vi.fn(async () => ({ ready: true })),
       launchHarness: vi.fn(async () => {
         observe();
-        return { ok: true as const, resumeToken: TOKEN, resumeType: runtime === "codex" ? "codex_id" : "claude_id" };
+        return { ok: true as const, resumeToken: TOKEN, resumeType: resumeTypeOf(runtime) };
       }),
     };
     const restore = new RestoreOrchestrator({
       db, rigRepo, sessionRegistry, eventBus, snapshotRepo, snapshotCapture, checkpointStore,
       nodeLauncher: new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux }),
       tmuxAdapter: tmux, claudeResume, codexResume,
+      ...(opts.routerLine ? { routerLineSettings: { resolveOne: () => ({ value: opts.routerLine === "yes", source: "file", defaultValue: false }) } as never } : {}),
       // The pane's process tree shows the same native session resumed (the joined-resume proof).
       listProcesses: async () => [
         { pid: 1234, ppid: 1, command: "zsh" },
-        { pid: 1235, ppid: 1234, command: runtime === "codex" ? `codex resume ${TOKEN}` : `claude --resume ${TOKEN}` },
+        { pid: 1235, ppid: 1234, command: runtime === "codex" ? `codex resume ${TOKEN}` : runtime === "pi" ? `pi --session ${TOKEN}` : `claude --resume ${TOKEN}` },
       ],
     });
     const up = await restore.restore(down.snapshotId!, { adapters: { [runtime]: adapter as never } });
@@ -223,6 +244,18 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
     const lead = result.nodes.find((n) => n.logicalId === "lead");
     expect(lead?.status).toBe("resumed");
     expect(lead?.guidanceGaps).toBeUndefined();
+    expect(result.rigResult).toBe("fully_restored");
+  });
+
+  // The seat-skills line comes back only with the person's yes, as at a start: after a no, an exact resume leaves the file
+  // without it and reports no gap.
+  it.each(["no", "yes"] as const)("an exact resume after the answer %s puts the seat-skills line back only with a yes", async (routerLine) => {
+    const { rigId, guidanceFile } = launchedSeat({ seatSkillsLine: true });
+    const { result, fileAtHarnessStart } = await downThenUpExisting(rigId, guidanceFile, { routerLine });
+    expect(fileAtHarnessStart).toContain(MANAGED_BLOCK_START("SOP.md"));
+    if (routerLine === "no") expect(fileAtHarnessStart).not.toContain("<!-- BEGIN OpenRig MANAGED BLOCK: openrig-seat-skills.md -->");
+    else expect(fileAtHarnessStart).toContain("<!-- BEGIN OpenRig MANAGED BLOCK: openrig-seat-skills.md -->");
+    expect(result.nodes.find((n) => n.logicalId === "lead")?.guidanceGaps).toBeUndefined();
     expect(result.rigResult).toBe("fully_restored");
   });
 
@@ -249,6 +282,94 @@ describe("a seat's guidance across rig down then rig up --existing (exact resume
     for (const other of ["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"].filter((f) => f !== file)) {
       expect(fs.existsSync(path.join(cwd, other)), `${other} must not be written`).toBe(false);
     }
+  });
+
+  // #875: a Pi seat's blocks live in AGENTS.md. Down takes them out like a Codex seat's, and the exact resume puts them back.
+  it("a Pi seat's exact resume puts back the blocks down took out of its AGENTS.md, and writes no other file", async () => {
+    const { rigId, guidanceFile } = launchedSeat({ podAware: true, runtime: "pi", userText: "Person notes\n" });
+    let afterDown: string | null = null;
+    const { result, fileAtHarnessStart } = await downThenUpExisting(rigId, guidanceFile, { podAware: true, runtime: "pi",
+      betweenDownAndUp: () => { afterDown = fs.readFileSync(guidanceFile, "utf-8"); } });
+    expect(afterDown, "AGENTS.md after rig down").toBe("Person notes\n");
+    expect(fileAtHarnessStart).toContain("Person notes\n");
+    expect(fileAtHarnessStart).toContain(MANAGED_BLOCK_START("lead-role"));
+    expect(fileAtHarnessStart).toContain(MANAGED_BLOCK_START("SOP.md"));
+    expect(result.nodes[0]?.guidanceGaps).toBeUndefined();
+    for (const other of ["CLAUDE.md", "CLAUDE.local.md"]) expect(fs.existsSync(path.join(cwd, other)), other).toBe(false);
+  });
+
+  // #875 direction 2: this Pi seat's launch put its blocks in its own agent folder's AGENTS.md. Down takes them out of that
+  // file, the exact resume puts them back there, and the person's tracked repository AGENTS.md is never written.
+  it("a Pi seat whose launch chose its agent folder keeps the tracked repository AGENTS.md byte-identical across down and the exact resume", async () => {
+    const tracked = "# Project guidance (tracked in git)\nRun the tests before pushing.\n";
+    const repoFile = path.join(cwd, "AGENTS.md");
+    fs.writeFileSync(repoFile, tracked);
+    const { rigId, guidanceFile } = launchedSeat({ podAware: true, runtime: "pi", piAgentFile: true, userText: "My own Pi notes\n" });
+    expect(guidanceFile).not.toBe(repoFile);
+    let afterDown: string | null = null;
+    const { result, adapter, fileAtHarnessStart } = await downThenUpExisting(rigId, guidanceFile, { podAware: true, runtime: "pi",
+      betweenDownAndUp: () => {
+        afterDown = fs.readFileSync(guidanceFile, "utf-8");
+        expect(fs.readFileSync(repoFile, "utf-8"), "the tracked AGENTS.md after rig down").toBe(tracked);
+      } });
+    expect(afterDown, "the agent AGENTS.md after rig down keeps only the person's lines").toBe("My own Pi notes\n");
+    expect(fileAtHarnessStart).toContain("My own Pi notes\n");
+    expect(fileAtHarnessStart).toContain(MANAGED_BLOCK_START("lead-role"));
+    expect(fileAtHarnessStart).toContain(MANAGED_BLOCK_START("SOP.md"));
+    expect(fs.readFileSync(repoFile, "utf-8"), "the tracked AGENTS.md after the exact resume").toBe(tracked);
+    expect(result.nodes[0]?.guidanceGaps).toBeUndefined();
+    // The restore hands the launch's recorded choice to the adapter, so a replayed start would use the same file.
+    expect((adapter.project.mock.calls[0] as unknown[] | undefined)?.[1]).toMatchObject({ guidanceFile });
+  });
+
+  // #2432 X-F1: an older snapshot (no recorded choice) restored exactly after a newer launch recorded the agent file. The
+  // seat resumes on the repository file, so the record must say so: inventory names it, and another rig's down in the same
+  // cwd leaves the guidance this live seat reads.
+  it("an older snapshot restored exactly after a newer recorded launch records the repository file it resumes on", async () => {
+    const { rigId, guidanceFile } = launchedSeat({ podAware: true, runtime: "pi" });
+    const nodeId = (db.prepare("SELECT id FROM nodes WHERE rig_id = ?").get(rigId) as { id: string }).id;
+    const newer = path.join(tmp, "pi-state", "orch-lead@poc", "agent", "AGENTS.md");
+    const recorded = () => (db.prepare("SELECT guidance_file FROM node_startup_context WHERE node_id = ?").get(nodeId) as { guidance_file: string | null }).guidance_file;
+    await downThenUpExisting(rigId, guidanceFile, { podAware: true, runtime: "pi",
+      // After the snapshot was taken, a newer fresh launch recorded the seat's agent file.
+      betweenDownAndUp: () => { db.prepare("UPDATE node_startup_context SET guidance_file = ? WHERE node_id = ?").run(newer, nodeId); } });
+    expect(recorded(), "the record names the file the resumed seat uses").toBeNull();
+    expect(getNodeDetail(db, rigId, "orch.lead")!.installedResources.find((r) => r.id === "lead-role")).toMatchObject({ targetPath: guidanceFile });
+    // Another rig in the same cwd goes down: the resumed seat's live repository guidance stays.
+    const other = rigRepo.createRig("other");
+    const peer = rigRepo.addNode(other.id, "peer", { role: "peer", runtime: "codex", cwd });
+    sessionRegistry.updateStatus(sessionRegistry.registerSession(peer.id, "r02-peer").id, "running");
+    await new RigTeardownOrchestrator({ db, rigRepo, sessionRegistry, tmuxAdapter: mockTmux(), snapshotCapture, eventBus }).teardown(other.id);
+    expect(fs.readFileSync(guidanceFile, "utf-8")).toContain(MANAGED_BLOCK_START("lead-role"));
+    expect(fs.readFileSync(guidanceFile, "utf-8")).toContain(MANAGED_BLOCK_START("SOP.md"));
+  });
+
+  // #2432 X-F2: after the launch recorded the agent file, the person links it to a shared Pi home's file. The exact resume
+  // writes nothing through that link: the conversation resumes, the gap is reported, and nothing falls back to the
+  // repository file.
+  it("a recorded agent file that became a link after its launch gets nothing put back through it, and the gap is reported", async () => {
+    const tracked = "# Project guidance (tracked in git)\n";
+    const repoFile = path.join(cwd, "AGENTS.md");
+    fs.writeFileSync(repoFile, tracked);
+    const { rigId, guidanceFile } = launchedSeat({ podAware: true, runtime: "pi", piAgentFile: true });
+    const shared = path.join(tmp, "shared-pi-home", "AGENTS.md");
+    fs.mkdirSync(path.dirname(shared), { recursive: true });
+    fs.writeFileSync(shared, "The person's own Pi home guidance\n");
+    const { result } = await downThenUpExisting(rigId, guidanceFile, { podAware: true, runtime: "pi",
+      betweenDownAndUp: () => { fs.rmSync(guidanceFile, { force: true }); fs.symlinkSync(shared, guidanceFile); } });
+    expect(fs.readFileSync(shared, "utf-8"), "the shared file").toBe("The person's own Pi home guidance\n");
+    expect(fs.readFileSync(repoFile, "utf-8"), "no fallback into the tracked file").toBe(tracked);
+    expect(result.nodes[0]?.status).toBe("resumed");
+    expect(result.nodes[0]?.guidanceGaps).toEqual(expect.arrayContaining(["lead-role", "SOP.md"]));
+    expect(result.rigResult).not.toBe("fully_restored");
+  });
+
+  it("a Pi seat restored from a snapshot with no recorded choice stays on the repository AGENTS.md (no silent repoint)", async () => {
+    const { rigId, guidanceFile } = launchedSeat({ podAware: true, runtime: "pi" });
+    expect(guidanceFile).toBe(path.join(cwd, "AGENTS.md"));
+    const { adapter, fileAtHarnessStart } = await downThenUpExisting(rigId, guidanceFile, { podAware: true, runtime: "pi" });
+    expect(fileAtHarnessStart).toContain(MANAGED_BLOCK_START("SOP.md"));
+    expect((adapter.project.mock.calls[0] as unknown[] | undefined)?.[1]).toMatchObject({ guidanceFile: null });
   });
 
   it("only a missing block is put back: an existing block keeps its content, and user text is preserved", async () => {

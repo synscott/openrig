@@ -1,7 +1,7 @@
-# What changed in OpenRig 0.6.11
+# What changed in OpenRig 0.7.1
 
-This note is for an agent on an install that was just upgraded to 0.6.11. It lists only what behaves differently from
-0.6.10 and what to do about it. For everything OpenRig can do, read the capability map:
+This note is for an agent on an install that was just upgraded to 0.7.1. It lists only what behaves differently from
+0.7.0 and what to do about it. For everything OpenRig can do, read the capability map:
 `rig context get onboarding-width/public-what-you-can-do.md`. Each release replaces this file, so
 `rig context get reference/whats-new.md` describes the installed version once the upgraded daemon is running. Without
 a running daemon, read `$OPENRIG_HOME/reference/whats-new.md`. The daemon refreshes that copy when it starts, so right
@@ -9,160 +9,203 @@ after an upgrade it can still hold the previous version's note.
 
 ## After the upgrade
 
-- **Restart the daemon** (`rig daemon stop`, then `rig daemon start`). One migration runs on the first start: `103`
-  adds one column to `sessions`, `intentionally_stopped`, which is 0 for every existing row. There are no migrations
-  `100` or `102`. The bundled openrig-core plugin stays at 0.1.9; two of its files changed.
-- **Two new switches, both off by default:**
-  - `output.compact` (or `OPENRIG_OUTPUT_COMPACT`): the seven queue write commands (`rig queue create`, `claim`,
-    `unclaim`, `update`, `block`, `handoff` and `handoff-and-complete`) print a short receipt instead of the whole
-    row, and `--full` prints the whole row. While it's off their output is unchanged, `--full` is accepted, and
-    `rig config` lists the key.
-  - `provider.usage_windows` (or `OPENRIG_PROVIDER_USAGE_WINDOWS` in the daemon's environment): `rig provider status
-    --refresh` reads a Codex login's usage windows once. While it's off, `--refresh` says how to turn it on and exits 1.
+- **Restart the daemon** (`rig daemon stop`, then `rig daemon start`). Eight migrations run on the first start (124, 125,
+  127, 128, 129, 130, 131 and 135). Nine settings are added: `policies.claude_compaction.preparation_root` (unset),
+  `skills.router_line.enabled` (off), `decisions.enabled` (false), `decisions.consumers`, `decisions.template_dir`,
+  `retention.stream_days` (30), `retention.stream_max_items` (20000), `provider.selected` (empty) and
+  `daemon.db_conflict` (`warn`). None is removed.
+- **Stream retention is on.** Stream items emitted after the upgrade are deleted after 30 days, or beyond the newest
+  20,000, unless a record names them (a classification, duplicate link, attempt or disposition). History from before the
+  upgrade is kept. Raise `retention.stream_days` or `retention.stream_max_items` to keep more.
+- **The bundled openrig-core plugin goes from 0.1.17 to 0.1.18.** Startup replaces the installed plugin's changed files:
+  its Claude hook definitions, three hook scripts and the pre-compaction hook (so hooks start on a seat whose PATH has
+  no Node), and the `openrig-user`, `messaging-the-human` and `forming-an-openrig-mental-model` skills. As in
+  0.7.0, it first copies each file it replaces under `$OPENRIG_HOME/backups/managed-refresh/<id>/`, edited or not, and
+  logs `[plugin-vendor] preserved previous contents of <file> at <copy> before managed refresh`. A copy doesn't mean
+  anyone edited the file; if someone did, reapply the change from the copy.
+- **Claude seats need Claude Code 2.1.280 or newer to see their team skills,** which now arrive as a per-seat plugin
+  through `CLAUDE_CODE_PLUGIN_DIRS` (below). OpenRig doesn't check the version. A running seat gets the new layout at its
+  next launch, restore or handover.
+- **If a worktree's `.claude/settings.local.json` says `"defaultMode": "acceptEdits"` and the person didn't choose it,**
+  an earlier OpenRig wrote it when it added or freshly launched a managed Claude seat. 0.7.1 no longer writes it but
+  doesn't repair it; ask the person which mode they want and set it once.
+
+## New things you can do
+
+- **Choose how much automatic input reaches a seat:** `rig seat set-typing-guard <seat> --mode <mode> --reason "…"`, where
+  `<mode>` adds `openrig-urgent` (OpenRig's own notices and anything urgent) and `urgent-only` between `off` and `hold`.
+  Mark a message urgent with `rig send --urgent`, or create the row at priority `urgent` or `critical`. Held input stays
+  readable (`rig seat held-messages`) and is never replayed.
+- **Choose how far OpenRig and peers may act on a seat:** `rig seat set-terminal-policy <seat> --preset
+  no-peer-interventions|help-within-instructions|full-control --reason "…"`, with `--helper <addresses…>`,
+  `--rig-default` (seats added later), and exceptions such as `--peer-compaction deny` or `--openrig-model allow`.
+  Managed compaction and saved model or effort changes are checked; a denial is `terminal_policy_refused`. Other
+  interventions are guidance only.
+- **Read a seat's planned permissions:** `rig seat status <seat>` shows what its next fresh managed launch will pass and
+  where each part comes from, and its terminal policy. `rig setup --router-line yes|no` decides whether OpenRig adds its
+  one line to shared guidance files.
+- **Let a person choose whether every ask reaches Slack:** `rig gateway human set <id> slack-subscription
+  every-ask|urgent-only|unset`. Every ask is on the TUI's Feed either way. Under `urgent-only`, only an ask
+  created or handed off with `--alert` posts. An ask marked `--alert` stands out in Slack (an interrupt with a mention)
+  under either setting, so use it only for something only they can do, or an approval whose wait costs now.
+- **Give one Claude member its own setup** in the rig spec: `agent_file`, `append_system_prompt_file`, `plugin_dirs` and
+  `advisor` (an Advisor model). They're copied into that seat's storage, never the project.
+- **See a seat's own skills:** `rig skill loadout --seat <session|self>`.
+- **Reach the team from an assistant without a shell:** the MCP server has 34 tools, including `rig_whoami`,
+  `rig_restore_status`, `rig_team`, `rig_telemetry_events`, following a handoff, reading a finished item's artifact and
+  deciding inside a person's decision room. `rig mcp serve --http` serves them over HTTP; `rig mcp token add <name>
+  --seat <session>` gives each caller its own seat.
+- **Hand a row's task to an outside agent:** `rig acp run <row>` for an ACP agent (Hermes, OpenClaw).
+  `docs/reference/a2a-agents.md` covers A2A agents.
+- **Run a community harness that names, reports or reopens its conversations:** preset fields `launch_result`, `resume`,
+  `names_conversation` and `startup_assisted`, with examples for Cursor, Hermes and OpenClaw under
+  `docs/reference/community-harness-examples/`.
+- **Change one edge on a running rig:** `rig edge add <rig> <from> <to> --kind <kind>` and `rig edge remove <rig>
+  <edge-id>` (`--plan`, `--json`). A `delegates_to` change says when it moves who work routes to.
+- **Run one spec as several rigs:** `rig up <spec> --name <rig>`.
+- **Retune a watchdog in place:** `rig watchdog update <jobId> [--interval-seconds n] [--message text] [--spec path]`
+  keeps its id and attachments. The context watch takes `--threshold-tokens` or `--threshold-percent`.
+- **Put restore maps where seats may write:** `rig config set policies.claude_compaction.preparation_root <abs path>`.
+- **Pick a Herdr session:** `rig terminal open <view> --provider herdr --session <name>`.
+- **Close a row with its artifact:** `rig queue update <id> --state done --evidence-ref <path>`.
+- **File and read subscription move reports:** `rig provider moves report` and `rig provider moves`. `--host <id>` and
+  `--codex-home <dir>` on `rig auth status|list|switch` and `rig seat restart` act on another machine's Codex home.
+- **Route stream observations with typed decisions (opt-in, off by default):** once `decisions.enabled` is true,
+  `decisions.consumers` includes `stream` and the intake seat has `OPENROUTER_API_KEY`, `rig project wake --decide`
+  gives each eligible stream observation one bounded typed decision during that seat's wake: create a row for a supplied
+  owner, join supplied work, or record a duplicate or no action. Anything uncertain, refused or failed goes to the
+  intake seat as its own disposition, and the model isn't asked again. `rig project decisions status` shows the state
+  without making a call. Without `--decide`, or with decisions off, nothing changes; turning decisions off no longer
+  strands an accepted create or join whose effect hadn't landed.
+- **Read the stream as a subscriber:** `rig stream subscribe <seat>` (`--tags`, `--type`; re-subscribing keeps the
+  place), then `rig stream read` returns the next bounded page for the calling seat (at most 20 items and 64 KiB, with
+  `more`, `unread` and any `gap`). `rig stream subscriptions` lists readers; `rig stream unsubscribe <seat>` stops one.
+  `rig stream show <id>` says what became of an observation.
+- **Keep the kernel to the harnesses you chose:** `rig setup --providers <list>` is now saved as `provider.selected`, and
+  the kernel starts seats only for those.
+- **Stop a second daemon on a live database:** `rig config set daemon.db_conflict stop` refuses a start whose database a
+  matching live daemon already holds (the default `warn` only warns). `rig daemon start --allow-db-conflict` allows one
+  deliberate start.
+
+## Behaviour that changed
+
+- **Old history-only events can be pruned, if you choose to.** `retention.events_days` (default `0`, which keeps every
+  event) turns on a pass in the retention sweep (at daemon start and daily) that deletes `view.changed`,
+  `snapshot.created`, `watchdog.evaluation_fired` and the `queue.created`, `queue.updated`, `queue.claimed`,
+  `queue.unclaimed` and `queue.handed_off` events older than that many days; 14 is a reasonable value
+  (`rig config set retention.events_days 14`). Every other type is kept at any age, because restore, startup proof and
+  the seat readers fold from them, and the newest event is always kept. What you give up: pruned events no longer
+  replay from `/api/events` (an older cursor or a large `?replay`), no longer appear in `rig telemetry events` (which
+  reports the gap) or in older log and feed entries, and a later change of the setting can't bring them back. A new
+  value is read at the next sweep: the daily one, or the next daemon start. The first sweep after turning it on works
+  through the old history in short steps while the daemon keeps answering. `retention.enabled false` stops every
+  retention pass from the next daemon start.
+- **The database file does not shrink by itself.** Pruned rows free pages that new events reuse, which slows the file's
+  growth; other tables still grow. To give the space back to the disk: find the file with `rig config get db.path`, stop the daemon
+  (`rig daemon stop`), copy the file aside, run `sqlite3 <that file> "VACUUM;"` (it needs free disk about the size of
+  the file and can take a few minutes), then `rig daemon start`. Never vacuum the file of a running daemon.
+- **With pruning on, `rig telemetry events` reports the pruned ranges.** A page that spans pruned events inside the
+  retained window has a `retained_sequence_gap` for each missing seq range and `coverage.status` `partial` (it used to be
+  `retained_window`); events pruned from the start of the log show up as `before_retained_floor`.
+
+- **Team skills live in each seat's own storage** (`$OPENRIG_HOME/state/seats/<rig id>/<logical seat>/<runtime>/`), not
+  in the project's `.claude/skills` or `.agents/skills`. Claude seats get them as a generated plugin (`openrig:<id>`),
+  Codex seats as their own catalog. If a link sits in that path, the seat starts without them and the result names
+  what wasn't delivered.
+- **Urgent wakes are labelled:** an urgent or critical row's wake starts with `Urgent (marked by …):` at every seat. A
+  seat on `hold` gets one held notice per wake instead of re-nudges, and lifecycle work is refused at the middle levels as
+  at `hold`.
+- **A daemon restart picks up a managed compaction where it stopped.** An owed restore step resumes, a `/compact` that
+  may have been sent is never sent again, and `rig compact --state` shows anything stranded or owed.
+- **A Claude seat whose startup turn is refused** (an expired login, say) holds the rest of its startup context as owed.
+  A startup input sent before the refusal is noticed can still be submitted (see Known issues in the
+  [0.7.1 release notes](https://github.com/mvschwarz/openrig/releases/tag/v0.7.1)).
+- **`rig send` refuses with `target_needs_input`** when a Claude seat's hook has just reported it running and its screen
+  shows an MCP enablement menu, a question or a permission prompt.
+- **`rig down` asks before stopping the caller's own rig.** Without a terminal it exits 1, stops nothing and prints the
+  `--yes` command.
+- **`rig up --plan` doesn't start a stopped daemon:** it exits 1 with `daemon_not_running` and names `rig daemon start`
+  and `--no-kernel`.
+- **`rig daemon start`** waits up to 20 seconds for a slow daemon, and starts with a warning when only a secondary
+  listener, such as Tailscale's, can't be verified.
+- **A seat joined with `rig attach` as an outside app** (Claude Desktop) stays attached through `rig down` and restore
+  (`left_attached`). To replace it, `rig unclaim <name>`, then launch.
+- **New seats get the daemon's `OPENRIG_DB` and `TMUX_TMPDIR`.**
+- **A rebuilt Codex seat keeps its observed permissions,** and a read-only Codex profile launches without OpenRig's
+  writable roots.
+- **A seat's own role** goes only to that seat, never into a shared `CLAUDE.md` or `AGENTS.md`, and `rig down` returns
+  guidance files byte for byte.
+- **Workflow actions** (`project`, `route`, `resume`, `abort`) record the calling agent; a request with neither identity
+  nor actor gets the shared `actor_required` error.
+- **`rig provider moves` is back** for subscription move reports. It switches nothing.
+- **`--dangerously-interact` into a seat's input box stops first** when the box already holds typed or pasted text: it
+  shows that text (apart from suggestions) and types nothing. Clear the box and retry, or pass `--type-without-checking`,
+  which clears nothing. Keys for a recognized native menu are sent as before.
+- **A terminal seat gets exactly the text sent to it,** without the From/To lines (the result says `envelopeOmitted`).
+  A queue wake to a terminal seat types nothing and fails `failed:terminal-seat`; the row stays queued.
+- **A daemon restart that can't see the seats' tmux server** no longer detaches seats whose recorded process still
+  runs, so it doesn't relaunch them beside themselves.
+- **Provider credentials and the activity-hook token stay off tmux, shell and `env` command lines** at launch and
+  handover. A launch whose staging fails stops instead of falling back.
+- **An answer retried from Slack or Steering** after an interrupted close reuses the first reply and finishes the
+  request once.
+- **One bad row no longer stops the stuck sweep** from flagging the others; **a malformed unrelated diagnosis row** no
+  longer stops health diagnoses from listing.
 
 ## Output that changed shape
 
-- **`rig queue create --verify` reports `outcome: "claimed"`** for a claimed row whose wake wasn't confirmed, instead
-  of `indeterminate`. A claim is pickup, not proof the body was read.
-- **`rig queue create --verify` to a registered person who is also a seat with a pane reports the Slack side too.**
-  Beside the terminal wake it adds a `gateway` object: `posted` (`connectorAccepted: true`), `transport-failed` or
-  `never-posted` (`connectorAccepted: false`, with the detail), or `still-pending` (`connectorAccepted: null`). The
-  wait is still bounded by the existing 30-second default, and it can use all of it even when Slack isn't set up or the
-  row won't be posted; the Slack side then reads `still-pending`. Posted isn't read, and "This is not a failed handoff"
-  isn't shown when Slack reports a failed delivery. `GET /api/queue/:qitemId` returns `ownerNotificationLevel`, or
-  `null`.
-- **`rig queue whoami --work-candidates` returns up to 50 held and 50 next rows,** with `heldTruncated` and
-  `nextTruncated`. `heldAndNextTruncated` now means either list was cut. With `OPENRIG_REFOCUS_WORK_PACKET` on (off by
-  default, as in 0.6.10), the refocus work packet lists held and next work separately, up to 50 each.
-- **`rig ps --nodes --json` carries `intentionallyStopped`,** and `rig ps --nodes` shows `usage_limit` under REASON for a
-  Codex seat at its usage limit.
-
-## Seats and restore
-
-- **A restore no longer starts a seat fresh when an earlier occupant left a resume token.** If a seat wasn't running
-  when the snapshot was taken, but an earlier session recorded a resume token, `rig up --existing` and `rig launch`
-  stop that seat at `awaiting-decision` and start nothing, because the token doesn't prove that conversation can still
-  resume. `rig launch` of such a seat exits 1 where it used to start it fresh. The message names the command that
-  starts it fresh on purpose. See the known gap below for how this shows in the rig status API.
-- **In a restore of a rig whose seats are in pods, a seat is rolled back as unresumable only when its runtime reports
-  the conversation missing.** When Claude, Codex or Pi reports that, the seat goes back to `awaiting-decision` and
-  nothing starts, instead of a failed launch that left the new pane behind. A rig where every seat ends this way reads
-  `partially_restored` instead of `failed`; the exit code is 1 either way. A Claude that exits to its shell for another
-  reason keeps 0.6.10's result: the seat is reported failed and its pane is kept, so you can read what happened. Restores
-  of rigs without pods keep their earlier handling.
-- **`rig seat launch --fresh --stop` checks before it stops anything.** A seat with a still-live older session is
-  refused before the current agent is stopped; 0.6.10 stopped it first. `--plan` previews a fresh launch without
-  changing anything and exits 0 even when it would be blocked. `--reason` is required only to execute; leaving it out
-  reports `missing_reason`.
-- **A seat you stop on purpose no longer makes its rig read `degraded`.** `rig seat stop` records the stop, and `rig ps`
-  and the TUI leave that seat out of the rig's state; running counts still exclude it. A rig whose seats were all
-  stopped this way reads `stopped`.
-- **Restart one Codex seat in place, on Linux:** `rig seat restart <seat> --keep-conversation --reason "<why>"`
-  restarts it in its own pane on the same conversation, so it starts again on whatever account its Codex home now
-  holds. It doesn't switch accounts itself. Before it stops anything, it checks that the seat is a Codex seat OpenRig
-  launched, in a single pane, with a conversation it can prove, and that relaunching wouldn't change the running
-  settings; any doubt refuses with nothing stopped. `--plan` runs every check and stops nothing.
-  `--verify --expect-account <account>` reports `moved` only when a tool turn has completed in the same conversation
-  since the restart and Codex's status names that account.
-  On macOS, a request that gets as far as reading the running process refuses before stopping the seat, because that
-  reading depends on `/proc`.
-- **A forked Claude seat launches with its own session ID** (`rig fork`, or `session_source: fork`), so strict restore
-  and clear-attention can verify it as its own conversation. Forking a Claude seat needs Claude Code 2.0.73 or later,
-  which OpenRig doesn't check. Forks launched before this keep reading `mismatch` until they're relaunched.
-- **Seats no longer inherit the launching Claude Code or Herdr session's identity variables,** such as `CLAUDECODE`.
-  If removing them fails, the launch goes ahead with a warning.
-- **A member's `cwd` in a rig spec can be `~`, start with `~/`, or use `$VAR` or `${VAR}`,** expanded from the daemon's
-  environment, when the path as written doesn't exist. `rig up` warns on stderr when it chose `/` as the launch folder
-  itself.
-- **A late readiness result no longer overwrites a newer launch attempt.**
-
-## Sends and wakes
-
-- **`rig send --wait-for-idle N` waits before it takes the seat's delivery lease,** so other sends and queue wakes to
-  that seat aren't held behind a long wait. N is now a deadline from the start of the wait, including any time spent
-  waiting for the lease. A timeout names the wait you asked for.
-- **A parked seat whose occupant is known isn't woken again for the same rows after a wake was delivered,** until it
-  updates one of them or one changes state. A failed, refused or unrecorded wake still repeats at the next park, and a
-  new occupant gets its first wake. "Delivered" means the wake was typed into the seat's terminal, not that the agent
-  read it.
-- **`rig send --verify` confirms enveloped multi-line messages that the agent's screen indents,** and queue wakes use
-  the same check.
-- **A Claude footer in auto, bypass or plan mode on the last line reads idle** when no activity hook is reporting.
-- **A failed Pi or OMP turn shows the provider's own reason** when it gives one.
-- **A `handed-off` closure with no visible successor** gets the same custody advisory and stuck-sweep finding as a
-  `done` closure.
-
-## Status
-
-- **A Codex seat at its usage limit stays `unknown` with reason `usage_limit`** while its screen redraws, instead of
-  reading `running`. It clears when a readable screen shows no banner, or when Codex shows it's working again. See the
-  known gap below.
-- **`rig ps` takes a rig's running count and status from the same set of sessions as `rig ps --nodes`.**
-- **`rig whoami --full --json` shows a Codex seat's `runtimeContext.threadId`** when its stored conversation ID was
-  verified resumable.
-- **The TUI says when a queue sample hit its cap or failed to load:** counts read `N+`, a seat missing from the sample
-  shows `?`, and Pulse no longer lists a NEEDS YOU item a second time. The caps count the whole host, so a quiet rig can
-  read `?` while another rig is busy.
-- **The TUI Topology table's Q, WORK and NOW columns fill again** on drilled views and on a seat's page.
-
-## Smaller fixes
-
-- A Slack reply sent with "Also send to channel" in the default channel is recovered after a connection gap.
-- `rig config set daemon.port` refuses a port outside 0–65535, and a port like that from the environment or
-  `config.json` falls back to the file or default with a warning. `rig daemon start --port` refuses one too, with exit 1.
-- Parallel `rig scope slice create` calls get different slice numbers. A number is never reused, and each create leaves
-  a hidden `slices/.nn-NN` claim file.
-- `rig proof show` and `rig proof judge` take `--project <id>` or a `<project>:` scope prefix. Scope readiness for a
-  project selected in the TUI uses that project's own root.
-- The chat send and topic routes return 400 before storing anything for payloads that used to fail with 500;
-  `/api/wake-resolve` answers a fractional or non-numeric generation with its usual "does not exist" reply; watchdog
-  registration refuses a `scan_interval_seconds` that can't be turned into a number (non-numeric text, a boolean, an
-  empty array); and unmanaged-pane discovery matches agent
-  process names exactly, plus `claude.exe` and names cut to 15 or 16 characters.
-- The `rigs` and `openrig-skills` skill descriptions split by who is asking: a person in their own session, or an agent
-  inside a rig.
-- A new reference page covers keeping a watch for a person with today's queue commands, installed at
-  `$OPENRIG_HOME/reference/keeping-a-watch.md`. See the known gap below.
+- **`rig ps --nodes`** separates every cell with one space (the default row is 5 columns wider), adds an `ATTN` column
+  (`yes`, `no` or `?`) before `REASON`, and marks a `running` seat whose tmux couldn't be reached as unconfirmed.
+- **`rig queue show --json`** no longer has `lastNudgeInputBox`, and send results no longer describe the input box.
+- **`rig queue show` and `rig queue whoami`** print their human notices on stderr, so stdout is the JSON.
+- **A claimed row whose owner waits on a person** reads pickup `needs-input`, with the reason.
+- **`rig down --json`** adds `leftRunning`; `rig reconcile-session` says whether resume metadata was recorded.
+- **`rig compact-plan`** labels its thresholds as its own and says whether automatic compaction is on.
+- **A send held for a draft** in the seat's input box reports `inputPhase: "not_reached"`: it was never typed.
+- **A stream body over 16 KiB** is stored truncated, ending `[truncated by OpenRig: kept N of M bytes]`, and reads mark it
+  `bodyTruncated`. `rig stream list --after <sortKey>` from a pruned item returns 410 `stream_cursor_expired`, naming
+  `--since` to resume, instead of an empty list.
 
 ## What to stop doing
 
-- **Stop expecting a restore to start a seat fresh** when an earlier session left a resume token; decide at
-  `awaiting-decision`, or use the command the message names.
-- **Stop reading `indeterminate` as the answer for a claimed row** from `rig queue create --verify`; 0.6.11 says
-  `claimed`.
-- **Stop treating `degraded` as a stopped seat's doing** after `rig seat stop`; the rig leaves that seat out.
-- **Stop counting a long `--wait-for-idle` as extra time after the lease;** N is a deadline from the start of the wait.
+- **Don't read `lastNudgeInputBox`.** It's gone.
+- **Don't parse `rig ps --nodes` by column position.** Use `--json`, with `--fields` to pick fields.
+- **Don't look for a team seat's skills in the project folders.** Use `rig skill loadout --seat`.
+- **Don't stop and re-register a watchdog to change it.** Use `rig watchdog update`.
+- **Don't take a rig down to fix one edge.** Use `rig edge add` or `remove`.
+- **Don't print `OPENRIG_ACTIVITY_*` values** while looking for identity. Use `rig whoami`.
+- **Don't use `--dangerously-interact` to type over a half-written input box.** It stops and shows the text; choose
+  explicitly, or use `rig send --urgent` where the seat's interruption level allows it.
 
-## Known gaps in 0.6.11
+## Known gaps in 0.7.1
 
-- **`rig seat restart --keep-conversation` supports Linux only.** Its automated tests are hermetic: they don't restart a
-  real Codex seat.
-- **The rig status API can call a running rig `blocked` because of one seat that isn't running.** It happens when the
-  latest snapshot recorded no occupant for that seat, an earlier session of the seat left a resume token, and its newest
-  session's restore policy is `resume_if_possible`. A restore from that snapshot would stop at the seat for a decision,
-  and `GET /api/rigs/:id/status` folds that forecast into the rig's status, so it mixes current status with restore
-  readiness: no seat is halted. `rig status` and the TUI's rig list don't show it for a running rig.
-- **A Codex seat can keep reading as at its usage limit** when an old usage-limit banner is followed by a submitted
-  prompt and the agent's reply, with no Codex working line and no input line below. It's recorded again every five
-  minutes, where 0.6.10 let it age out. The case was constructed from the source and hasn't been seen in a real
-  session.
-- **The keeping-a-watch page says a timer fires once; a held-back wake uses up that fire.** When the typing guard holds
-  a one-shot `--wake-after` wake back (it shows as `retained`), that held-back attempt is recorded as the timer's one
-  fire and later wakes aren't, so the timer isn't retired: it can wake the owner again at each interval while the row
-  stays set aside. A row sharing the timer through `--wake-watchdog`, after the original row was handed off or stopped,
-  loses its one wake if that wake is held back. Read the row's transitions after each wake.
-- **After `rig scope slice create` says it couldn't verify membership, the slice was kept.** Check `mission.yaml` before
-  creating it again: creating it again makes a second slice with the same name.
-- **The latest first-install check before this release used 0.6.10 on Linux only.** macOS was last checked with 0.6.8,
-  and native Windows hasn't been checked.
-- **Only one selected lifecycle-help command has been checked in a live Claude session;** source and parser coverage
-  is broader. If a help command still asks, report it.
-- **Codex team seats aren't asked before lifecycle commands yet.**
-- **The send gate trusts the most recently recorded hook.** If hooks are recorded out of order, it can hold a send for
-  a question that's already answered, or miss one that's waiting. `rig capture` shows the real screen.
-- **A Codex seat whose permission request was approved automatically can still read "needs input".**
-- **A launched team still writes into its working folder;** the operator says what changes before you agree.
-- **After a restart, `rig status` shows `Kernel: skipped` whatever the kernel seats' state.** Read them with
-  `rig ps --nodes --rig kernel --full`.
-- **`rig tui --shared` still attaches on the default tmux server,** so it can't find the dashboard when the daemon runs
-  on a non-default tmux socket. Use `rig tui` there instead.
+- **A new Claude seat's startup text can stay in its input box unsent.** If a fresh Claude seat sits idle with text at
+  its prompt, press Enter in its pane, or ask the person to.
+- **Claude seats on a macOS native install can read as needing attention after a restore.** Check the pane before
+  acting on it.
+- **A Slack channel-mapping change needs a daemon restart.** Don't use `rig slack disable` then `enable` for it: enabling
+  marks any alerts waiting to post to Slack as already seen.
+- **Ubuntu 22.04's tmux 3.2a:** the query known to crash its server is gone, but a narrower race remains. Avoid 3.2a
+  (`tmux -V`).
+- **`rig daemon start` can take 20 to 40 seconds** before its listener warning, longer than the TUI's 30-second "restore
+  everything" wait. On a slow host, start the daemon yourself first.
+- **A launch that warns "Scoped tmux environment unavailable; retaining the previous environment"** didn't give that seat
+  the clean environment. Check `env` in the seat before relying on OpenRig's variables.
+- **Going back to 0.7.0 with a Slack subscription set:** 0.7.0 can't read a person file that holds one, and its people
+  registry stops loading. Save the choice first (`rig gateway human show <id> --json > <id>.json`), then run
+  `rig gateway human set <id> slack-subscription unset` (`urgent-only` becomes every-ask, as on 0.7.0); set it again after
+  returning to 0.7.1. A person file still holding a `subscriptions:` entry fails on 0.7.0 too. Don't restore an older
+  gateway folder or database instead: that can lose newer people, bindings and delivery records.
+- **A Herdr tile over SSH** doesn't come back by itself after a Herdr restart. Reopen it with `rig terminal open <view>
+  --provider herdr`.
+- **Delegated decisions:** the ask is created before the decision, so without quiet hours it can post to the person
+  first. Pair a decision room with quiet hours, or decide before asking.
+- **`restore-check` still treats a missing startup file as rig-wide.** Trust `rig up --existing`'s per-seat result.
+- **Managed Claude launch requires `/usr/bin/env` support for `-0` and `-u`** (option support checked on GNU coreutils
+  and macOS 15; BusyBox and older macOS unverified). Without the required option support, launch stops instead of
+  falling back to credential-bearing command-line arguments.
+- **In draft-aware mode, an agent's multi-line message to a Claude seat can remain unsubmitted when the paste changes
+  Claude's footer hint.** OpenRig withholds Enter, leaving the text in the composer and later sends waiting. Observed on
+  Claude 2.1.309 with both 0.7.0 and the 0.7.1 pre-cut build; #14 remains open.
+- **A Claude seat signed in with a long-lived token (`claude setup-token`) gets no usage reading.** The reader accepts
+  only claude.ai subscription logins and reports `not_subscription_login`.

@@ -25,6 +25,10 @@ function mockFs(initialFiles?: Record<string, string>) {
   return {
     readFile: (p: string) => { if (p in store) return store[p]!; throw new Error(`Not found: ${p}`); },
     writeFile: (p: string, c: string) => { store[p] = c; },
+    copyFileExclusive: (src: string, dest: string) => {
+      if (dest in store) throw Error(`Recovery path exists: ${dest}`);
+      store[dest] = store[src]!;
+    },
     exists: (p: string) => p in store || Object.keys(store).some((k) => k.startsWith(p + "/")),
     mkdirp: () => {},
     listFiles: (dir: string) => Object.keys(store).filter((k) => k.startsWith(dir + "/")).map((k) => k.slice(dir.length + 1)),
@@ -133,6 +137,30 @@ describe("PluginVendorService — vendoring (HG-2.3)", () => {
     await svc.ensureVendored("openrig-core");
 
     expect(fs._store[installedSkill]).toBe("# same-version installed authority");
+  });
+
+  it("keeps an old same-version core plugin's relay and manifest without inventing diagnostic delivery", async () => {
+    const asset = (rel: string) => readFileSync(new URL(`../assets/plugins/openrig-core/${rel}`, import.meta.url), "utf8");
+    const currentHooks = asset("hooks/claude.json");
+    const oldManifest = JSON.parse(currentHooks);
+    delete oldManifest.hooks.PermissionRequest;
+    const oldHooks = JSON.stringify(oldManifest);
+    const fs = mockFs({
+      "/asset-root/openrig-core/.claude-plugin/plugin.json": asset(".claude-plugin/plugin.json"),
+      "/asset-root/openrig-core/.codex-plugin/plugin.json": asset(".codex-plugin/plugin.json"),
+      "/asset-root/openrig-core/hooks/claude.json": currentHooks,
+      "/asset-root/openrig-core/hooks/scripts/activity-relay.cjs": asset("hooks/scripts/activity-relay.cjs"),
+      "/asset-root/openrig-core/hooks/scripts/permission-stop-descriptor.cjs": asset("hooks/scripts/permission-stop-descriptor.cjs"),
+      "/fixture/plugins/openrig-core/.claude-plugin/plugin.json": asset(".claude-plugin/plugin.json"),
+      "/fixture/plugins/openrig-core/hooks/claude.json": oldHooks,
+      "/fixture/plugins/openrig-core/hooks/scripts/activity-relay.cjs": "// installed old relay",
+    });
+    const httpClient = vi.fn();
+    await new PluginVendorService({ vendoredAssetsDir: "/asset-root", userPluginsDir: "/fixture/plugins", fs, httpClient }).ensureVendored("openrig-core");
+    expect(fs._store["/fixture/plugins/openrig-core/hooks/claude.json"]).toBe(oldHooks);
+    expect(fs._store["/fixture/plugins/openrig-core/hooks/scripts/activity-relay.cjs"]).toBe("// installed old relay");
+    expect(fs.exists("/fixture/plugins/openrig-core/hooks/scripts/permission-stop-descriptor.cjs")).toBe(false);
+    expect(httpClient).not.toHaveBeenCalled();
   });
 
   it("upgrades an older installed plugin only when the bundled manifest version is newer", async () => {

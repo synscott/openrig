@@ -105,6 +105,18 @@ describe("FR-6 restore-plan token state", () => {
     });
   });
 
+  it.each([false, true])("forecasts a seat joined with rig attach as an external CLI as leave-attached, as restore leaves it, with fresh=%s", (fresh) => {
+    const rig = {
+      rig: { id: "rig-1", name: "test-rig" },
+      nodes: [{ id: "n1", logicalId: "desk", runtime: "claude-code", binding: { attachmentType: "external_cli", externalSessionName: "desk-app@test-rig" } }],
+      edges: [],
+    } as unknown as RigWithRelations;
+    const node = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: null, resumeToken: null })], fresh ? ["desk"] : undefined).nodes[0]!;
+    expect(node).toMatchObject({ intendedAction: "leave-attached", freshRequired: false });
+    expect(node.reason).toContain("rig unclaim desk-app@test-rig");
+    expect(node.runtimePrompt).toBeUndefined();
+  });
+
   it("presents a never-occupied current seat as new, without a history warning", () => {
     const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
     const result = buildRestorePlanPreview(rig, null, []).nodes[0]!;
@@ -136,6 +148,13 @@ describe("FR-6 restore-plan token state", () => {
     const p = buildRestorePlanPreview(rig, null, [row("n1", { resumeLastVerified: null, resumeLastProbeStatus: null })], undefined, NOW);
     expect(p.nodes[0]!.tokenState).toBe("unverified");
     expect(p.nodes[0]!.freshRequired).toBe(false);
+  });
+
+  it("degrades malformed saved verification metadata to unverified without changing valid token rules", () => {
+    const rig = rigWith([{ id: "n1", logicalId: "a", runtime: "codex" }]);
+    const malformed = buildRestorePlanPreview(rig, null, [row("n1", { resumeType: "codex_id",
+      resumeLastProbeStatus: "resumable", resumeLastVerified: 123 as never })]);
+    expect(malformed.nodes[0]).toMatchObject({ intendedAction: "resume-original", tokenState: "unverified" });
   });
 
   it("present: probe resumable + verified within the freshness threshold", () => {

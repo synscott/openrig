@@ -27,6 +27,8 @@ import { describe, it, expect, vi } from "vitest";
 import Database from "better-sqlite3";
 import { SeatDeliveryGuard, type GuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import { MissionControlWriteContract } from "../src/domain/mission-control/mission-control-write-contract.js";
+import { MissionControlActionLog } from "../src/domain/mission-control/mission-control-action-log.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
 
@@ -91,13 +93,23 @@ describe("delivery pause and durable custody", () => {
     expect(outbox.heldForNode("a").total).toBe(0);
     expect(outbox.listPending("id")).toEqual([]); db.close();
   });
+  it("keeps one held reminder per watchdog job: a newer one retires the one held before it (#2430)", () => {
+    const { db, targets, outbox } = fixture();
+    const reminder = (id: string, job: string) => outbox.retain({ outboxId: id, senderSession: "watchdog@system", destinationSession: "a", body: `reminder ${id}`, auditPointer: job }, targets.a!);
+    reminder("r1", "job-1"); reminder("r2", "job-1"); reminder("other", "job-2");
+    outbox.retain({ outboxId: "agent", senderSession: "planner@test", destinationSession: "a", body: "real work", auditPointer: "job-1" }, targets.a!);
+    expect(outbox.heldForNode("a").items.map((entry) => entry.outboxId).sort()).toEqual(["agent", "other", "r2"]);
+    expect(outbox.getById("r1")).toMatchObject({ deliveryState: "retired", body: "reminder r1", retiredBy: "watchdog@system" });
+    db.close();
+  });
   it("rolls back rejected staging but retains committed overflow members with original bodies", () => {
     const { db, targets, outbox } = fixture();
-    for(let i=0;i<100;i++) outbox.retain({ outboxId: `h${i}`, senderSession: "s", destinationSession:"a", body:`body${i}` },targets.a!);
+    // Distinct senders fill the quota: a seat holds one message per sender (#2430).
+    for(let i=0;i<100;i++) outbox.retain({ outboxId: `h${i}`, senderSession: `s${i}`, destinationSession:"a", body:`body${i}` },targets.a!);
     const next={outboxId:"next",senderSession:"s",destinationSession:"a",body:"new"};
     expect(() => db.transaction(() => { outbox.retain(next,targets.a!); })()).toThrow("quota");
     expect(outbox.getById("next")).toBeNull();
-    for(const id of ["committed1","committed2"]) { outbox.record({...next,outboxId:id,body:id});outbox.claimForDelivery(id);outbox.retain({...next,outboxId:id,body:id},targets.a!,true); }
+    for(const id of ["committed1","committed2"]) { outbox.record({...next,outboxId:id,body:id});outbox.claimForDelivery(id);outbox.retain({...next,outboxId:id,body:id},targets.a!,true,{sameSend:["committed1","committed2"]}); }
     expect(outbox.heldForNode("a",100).total).toBe(102);expect(outbox.heldForNode("a",100).truncated).toBe(true);
     expect(outbox.getById("committed2")!.body).toBe("committed2");
     outbox.retire("h0","person","ack");outbox.retire("h1","person","ack");outbox.retire("h2","person","ack");
@@ -130,18 +142,36 @@ function transportFixture() {
 }
 
 describe("real adapter/transport guard boundaries with no external effects", () => {
-  it("retains raw/force/verify/danger sends without even capturing or writing; submit-only refuses", async () => {
+  it("retains ordinary/force/verify/wait sends without capturing or writing; submit-only refuses", async () => {
     const f = transportFixture(); await f.guard.set("a", true, "person", "draft");
-    for (const options of [{}, {force:true}, {verify:true}, {dangerouslyInteract:true,reason:"explicit"}, {waitForIdleMs:10}]) {
+    for (const options of [{}, {force:true}, {verify:true}, {waitForIdleMs:10}]) {
       const result = await f.transport.send("a", "message", options);
       expect(result).toMatchObject({ok:true,outcome:"retained",sent:false,verified:false});
       expect(result.outboxIds).toHaveLength(1);
     }
     expect(await f.transport.send("a", "", {submitOnly:true,expectedStagedText:"message"})).toMatchObject({ok:false,reason:"typing_guard_enabled",sent:false});
     expect(f.commands).toEqual([]);expect(f.files).toEqual([]);expect(f.tmux.listPanes).not.toHaveBeenCalled();
-    expect(f.outbox.heldForNode("a").total).toBe(5);f.db.close();
+    expect(f.outbox.heldForNode("a").total).toBe(4);f.db.close();
   });
-  it("one retained ID stays not-delivered after disable/retirement, and preserves committed coalesced IDs", async () => {
+  it("an explicit override under hold reads the composer and stops on unreadable input without typing or retaining", async () => {
+    // This send reaches session metadata; use the existing migrated fixture, not the hold-only schema.
+    const f = queueFixture(); await f.guard.set("a", true, "person", "draft");
+    f.db.prepare("UPDATE nodes SET runtime = 'terminal' WHERE id = 'a'").run();
+    const observer = { record: vi.fn() };
+    const transport = new SessionTransport({ db: f.db, tmuxAdapter: f.tmux, rigRepo: f.rigRepo, sessionRegistry: f.sessionRegistry,
+      sleep: async () => {}, captureObserver: observer });
+    const capture = vi.spyOn(f.tmux, "captureComposerSnapshot").mockResolvedValue(null);
+    const result = await transport.send("worker@test", "message", { dangerouslyInteract: true, reason: "explicit" });
+    expect(result).toMatchObject({ ok: false, reason: "override_input_unknown", sent: false,
+      existingInput: { classification: "unreadable", reason: expect.any(String) } });
+    expect(capture).toHaveBeenCalledTimes(1);
+    // Preparing the inert buffer precedes inspection; no pane input occurs.
+    expect(f.writes.some(command => /paste-buffer|send-keys/.test(command))).toBe(false);
+    expect(f.outbox.heldForNode("a").total).toBe(0);
+    expect(f.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 0 });
+    expect(observer.record).not.toHaveBeenCalled(); f.db.close();
+  });
+  it("manual hold preserves coalesced bodies; changing preference or retiring history does not type", async () => {
     const f = transportFixture();await f.guard.set("a",true,"person","draft");
     const opts={deliveryId:"exact",actorSession:"sender"};
     await f.transport.send("a","body",opts);await f.transport.send("a","body",opts);
@@ -151,7 +181,7 @@ describe("real adapter/transport guard boundaries with no external effects", () 
     expect(await f.transport.send("a","combined",{committedOutboxIds:["wake1","wake2"]})).toMatchObject({outcome:"retained",outboxIds:["wake1","wake2"]});
     expect(f.outbox.getById("wake2")!.body).toBe("original wake2");
     await f.guard.set("a",false,"person","new sends only");f.outbox.retire("exact","person","acknowledge");
-    expect(await f.transport.send("a","body",opts)).toMatchObject({outcome:"retained",sent:false});
+    expect(f.outbox.getById("exact")!.deliveryState).toBe("retired");
     expect(f.commands).toEqual([]);expect(f.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({n:3});f.db.close();
   });
   it("automatic low-level keys/text/shell and lifecycle creation refuse, human broker path and sibling write", async () => {
@@ -173,6 +203,14 @@ describe("real adapter/transport guard boundaries with no external effects", () 
     vi.mocked(f.tmux.listPanes).mockImplementation(async () => { f.targets.a={...f.targets.a!,occupant:"other"};return [{id:"%1"} as never]; });
     expect(await f.tmux.sendKeys("a",["Enter"])).toMatchObject({ok:false,code:"guard_target_changed"});
     expect(f.commands).toEqual([]);expect(f.files).toEqual([]);f.db.close();
+  });
+  it("allows a sibling pane while writing only to the recorded bound pane", async () => {
+    const f = transportFixture();
+    vi.mocked(f.tmux.listPanes).mockResolvedValue([{ id: "%1" } as never, { id: "%sibling" } as never]);
+    expect(await f.tmux.sendText("a", "bound pane only")).toMatchObject({ ok: true });
+    expect(f.commands.some(command => command.includes("%1"))).toBe(true);
+    expect(f.commands.some(command => command.includes("%sibling"))).toBe(false);
+    f.db.close();
   });
   it("whole multi-node lifecycle keeps activation pending through rebind and final submit", async () => {
     const f=transportFixture();const started=signal(),finish=signal();
@@ -226,7 +264,8 @@ describe("real queue transaction and retained delivery",()=>{
     const f=queueFixture();
     try {
       await f.guard.set("a",true,"person","draft");
-      for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:"sender@test",destinationSession:"worker@test",body:"held"},f.guard.target("a"));
+      // Other senders fill the quota; the creator holds nothing there, so its wake has no room (#2430).
+      for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:`filler-${i}@test`,destinationSession:"worker@test",body:"held"},f.guard.target("a"));
       const row=await f.repo.create({sourceSession:"sender@test",destinationSession:"worker@test",body:"keep this task"});
       expect(f.repo.getById(row.qitemId)!.body).toBe("keep this task");
       expect(row.lastNudgeResult).toMatch(/^failed:.*quota/i);
@@ -244,18 +283,42 @@ describe("real queue transaction and retained delivery",()=>{
     const row=await createWithFullHeldQuota();
     expect(row.lastNudgeResult).toContain("wake not retained");
   });
-  it("precommit quota refusal rolls back closure, successor, transitions and events",async()=>{
+  // #2430 reverses the earlier contract here, which rolled the whole handoff back: a full held quota is about one
+  // seat's pane, and the row is durable, so the work moves and only its wake is recorded as not retained.
+  it("a handoff to a seat whose held quota is full still moves the work, its wake recorded as not retained",async()=>{
     const f=queueFixture();const source=await f.repo.create({sourceSession:"sender@test",destinationSession:"relay@test",body:"work",nudge:false});
     await f.guard.set("a",true,"person","draft");
-    for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:"sender@test",destinationSession:"worker@test",body:"held"},f.guard.target("a"));
-    const before=JSON.stringify(f.db.prepare("SELECT * FROM queue_transitions").all());
-    const events=JSON.stringify(f.db.prepare("SELECT * FROM events").all());
-    await expect(f.repo.handoff({qitemId:source.qitemId,fromSession:"relay@test",toSession:"worker@test"})).rejects.toThrow("quota");
-    expect(f.repo.getById(source.qitemId)!.state).toBe("pending");
-    expect(f.db.prepare("SELECT count(*) n FROM queue_items").get()).toEqual({n:1});
-    expect(JSON.stringify(f.db.prepare("SELECT * FROM queue_transitions").all())).toBe(before);
-    expect(JSON.stringify(f.db.prepare("SELECT * FROM events").all())).toBe(events);
+    for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:`filler-${i}@test`,destinationSession:"worker@test",body:"held"},f.guard.target("a"));
+    const {closed,created}=await f.repo.handoff({qitemId:source.qitemId,fromSession:"relay@test",toSession:"worker@test"});
+    expect(f.repo.getById(closed.qitemId)!.state).toBe("handed-off");
+    expect(f.repo.getById(created.qitemId)).toMatchObject({state:"pending",destinationSession:"worker@test",body:"work",
+      lastNudgeResult:expect.stringMatching(/^failed:wake not retained: Held-message quota is full/)});
+    expect(f.outbox.getById(`wake-intent-${created.qitemId}`)).toBeNull();
+    expect(f.outbox.heldForNode("a").total).toBe(100);
     expect(f.writes).toEqual([]);f.db.close();
+  });
+  it("a mission control handoff to a seat whose held quota is full moves the work too, as a queue handoff does",async()=>{
+    const f=queueFixture();const source=await f.repo.create({sourceSession:"sender@test",destinationSession:"relay@test",body:"work",nudge:false});
+    await f.guard.set("a",true,"person","draft");
+    for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:`filler-${i}@test`,destinationSession:"worker@test",body:"held"},f.guard.target("a"));
+    const contract=new MissionControlWriteContract({db:f.db,eventBus:f.bus,queueRepo:f.repo,actionLog:new MissionControlActionLog(f.db)});
+    const result=await contract.act({verb:"handoff",qitemId:source.qitemId,actorSession:"human@test",destinationSession:"worker@test"});
+    expect(f.repo.getById(source.qitemId)!.state).toBe("handed-off");
+    expect(f.repo.getById(result.createdQitemId!)).toMatchObject({state:"pending",destinationSession:"worker@test",body:"work",
+      lastNudgeResult:expect.stringMatching(/^failed:wake not retained: Held-message quota is full/)});
+    expect(f.outbox.heldForNode("a").total).toBe(100);f.db.close();
+  });
+  it("a queue notification to a seat at a full quota takes the place of its sender's held message there (#2430)",async()=>{
+    const f=queueFixture();await f.guard.set("a",true,"person","draft");
+    f.outbox.retain({outboxId:"older",senderSession:"sender@test",destinationSession:"worker@test",body:"older wake"},f.guard.target("a"));
+    for(let i=1;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:`filler-${i}@test`,destinationSession:"worker@test",body:"held"},f.guard.target("a"));
+    const row=await f.repo.create({sourceSession:"sender@test",destinationSession:"worker@test",body:"new work"});
+    const id=`wake-intent-${row.qitemId}`;
+    expect(f.repo.getById(row.qitemId)!.lastNudgeResult).not.toMatch(/^failed/);
+    expect(f.outbox.getById(id)!.deliveryState).toBe("retained");
+    expect(f.outbox.coalescedInto(id)).toEqual(["older"]);
+    expect(f.outbox.getById("older")).toMatchObject({deliveryState:"retired",retiredBy:"outbox@system",body:"older wake"});
+    expect(f.outbox.heldForNode("a").total).toBe(100);expect(f.writes).toEqual([]);f.db.close();
   });
   it("handoff retains one audited intent without duplicate transport record or delivered label",async()=>{
     const f=queueFixture();const source=await f.repo.create({sourceSession:"sender@test",destinationSession:"relay@test",body:"work",nudge:false});
@@ -274,7 +337,7 @@ describe("real queue transaction and retained delivery",()=>{
   });
   it("postcommit activation retains exact staged intent beyond quota, without fictional rollback",async()=>{
     const f=queueFixture();const source=await f.repo.create({sourceSession:"sender@test",destinationSession:"relay@test",body:"work",nudge:false});
-    for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:"sender@test",destinationSession:"worker@test",body:"held"},f.guard.target("a"));
+    for(let i=0;i<100;i++) f.outbox.retain({outboxId:`full${i}`,senderSession:`filler-${i}@test`,destinationSession:"worker@test",body:"held"},f.guard.target("a"));
     let activation:Promise<unknown>|undefined;
     const off=f.bus.subscribe(event=>{if(event.type==="queue.handed_off") activation=f.guard.set("a",true,"person","postcommit");});
     const {created,closed}=await f.repo.handoff({qitemId:source.qitemId,fromSession:"relay@test",toSession:"worker@test"});

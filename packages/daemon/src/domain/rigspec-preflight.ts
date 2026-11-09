@@ -3,10 +3,16 @@ import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { ExecFn } from "../adapters/tmux.js";
-import { runtimeProbeFailure, runtimeProbeTimeout } from "../adapters/preflight-exec.js";
+import { RIG_LOGIN_PATH_CHECK, runtimeProbeFailure, runtimeProbeTimeout } from "../adapters/preflight-exec.js";
 import { piVersionNotice } from "../adapters/pi-readiness.js";
 import type { LegacyRigSpec as RigSpec, PreflightResult, RigSpec as PodRigSpec, RigSpecPod, RigSpecPodMember } from "./types.js"; // TODO: AS-T08b — migrate to pod-aware RigSpec
-import { deriveSessionName, validateSessionName, validateSessionComponents, VIRTUAL_DOMAIN_TOKENS } from "./session-name.js";
+import { deriveCanonicalSessionName, deriveSessionName, tmuxRenamedSessionError, validateSessionName, validateSessionComponents, VIRTUAL_DOMAIN_TOKENS } from "./session-name.js";
+
+import { shellQuote } from "../adapters/shell-quote.js";
+import { mergeSeatEnv, type SeatEnv } from "./seat-env.js";
+import { withoutRuntimeHomes } from "./seat-runtime-home.js";
+import { isLaunchWrapperRuntime } from "./launch-wrapper.js";
+import { resolveLaunchWrapperArgv } from "./seat-launch-environment.js";
 
 const RUNTIME_COMMANDS: Record<string, string> = {
   "claude-code": "claude --version",
@@ -47,6 +53,9 @@ export class RigSpecPreflight {
       const sessionName = deriveSessionName(spec.name, node.id);
       if (!validateSessionName(sessionName)) {
         errors.push(`Derived session name '${sessionName}' is invalid for node '${node.id}'`);
+      } else {
+        const renamed = tmuxRenamedSessionError(sessionName);
+        if (renamed) errors.push(`${node.id}: ${renamed}`);
       }
     }
 
@@ -68,7 +77,8 @@ export class RigSpecPreflight {
     // tmux session name collision
     for (const node of spec.nodes) {
       const sessionName = deriveSessionName(spec.name, node.id);
-      if (validateSessionName(sessionName)) {
+      // A name tmux would rename is already refused above, and probing it fails ("can't find pane").
+      if (validateSessionName(sessionName) && !tmuxRenamedSessionError(sessionName)) {
         const exists = await this.tmuxAdapter.hasSession(sessionName);
         if (exists) {
           errors.push(`tmux session '${sessionName}' already exists for node '${node.id}'`);
@@ -112,6 +122,10 @@ export class RigSpecPreflight {
       }
     }
 
+    if (errors.length === 0) {
+      await warnRigLoginPath(spec.nodes.filter(node => node.runtime === "codex").map(node => ({ label: node.id, env: {} })), this.exec, warnings);
+    }
+
     // cmux layout hints: warning if cmux unavailable and spec uses hints
     const hasLayoutHints = spec.nodes.some((n) => n.surfaceHint || n.workspace);
     if (hasLayoutHints) {
@@ -134,11 +148,14 @@ export class RigSpecPreflight {
 
 import { RigSpecCodec } from "./rigspec-codec.js";
 import { RigSpecSchema } from "./rigspec-schema.js";
-import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
-import { resolveNodeConfig, type ResolutionContext } from "./profile-resolver.js";
+import { resolveAgentRef, type AgentResolverFsOps, agentSpecAdvisoryWarnings } from "./agent-resolver.js";
+import type { ResolutionContext, ResolutionResult } from "./profile-resolver.js";
+import { withNodeConfigResolver } from "./profile-resolution-worker.js";
+import { releaseScanCache } from "./skill-discovery.js";
+import { randomUUID } from "node:crypto";
 import { getOpenRigInstallCwdError, resolveAuthoredCwd, resolveLaunchCwd } from "./cwd-resolution.js";
 import nodePath from "node:path";
-import { loadAgentAppPreset } from "./agent-app-presets.js";
+import { loadCommunityHarnessPreset } from "./community-harness-presets.js";
 import { BUILT_IN_RUNTIMES } from "./built-in-runtimes.js";
 import { validateClaudeActivityHookDelivery, CLAUDE_ACTIVITY_HOOKS_RESOURCE_TYPE } from "./claude-activity-hooks.js";
 import {
@@ -158,6 +175,8 @@ const DEFAULT_ACTIVITY_RELAY_PATH = nodePath.resolve(import.meta.dirname, "../..
 const DEFAULT_CLAUDE_HOOKS_MANIFEST_PATH = nodePath.resolve(import.meta.dirname, "../../assets/plugins/openrig-core/hooks/claude.json");
 
 export interface RigPreflightInput {
+  /** One-off launch environment, merged after the rig and member declarations. */
+  envOverride?: SeatEnv;
   rigSpecYaml: string;
   rigRoot: string;
   cwdOverride?: string;
@@ -170,6 +189,7 @@ export interface RigPreflightInput {
   externalQualifiedIds?: Iterable<string>;
   claudeActivityAssets?: { relayPath?: string; manifestPath?: string };
   inheritedPermissionPolicy?: PreflightSpecContext["inheritedPermissionPolicy"];
+  materializeOnly?: PreflightSpecContext["materializeOnly"];
 }
 
 /**
@@ -177,6 +197,7 @@ export interface RigPreflightInput {
  * already-parsed+validated spec. (YAML is only the input adapter at the front.)
  */
 export interface PreflightSpecContext {
+  envOverride?: SeatEnv;
   rigRoot: string;
   cwdOverride?: string;
   fsOps: AgentResolverFsOps;
@@ -185,6 +206,9 @@ export interface PreflightSpecContext {
   systemSkills?: string[];
   systemWorldError?: string;
   rigNameOverride?: string;
+  /** True when no session is created after this preflight (materialize-only, `rig adopt`), so
+   *  a session name tmux would rename is not refused: no session is created under it. */
+  materializeOnly?: boolean;
   /** Effective persisted target-rig attachment for structured expansion.
    * Explicit member/fragment refs still win; this is the inherited fallback. */
   inheritedPermissionPolicy?: Pick<
@@ -264,10 +288,12 @@ export async function rigPreflight(input: RigPreflightInput & { exec?: (cmd: str
   return preflightValidatedSpec(rigSpec, {
     rigRoot: input.rigRoot,
     cwdOverride: input.cwdOverride,
+    envOverride: input.envOverride,
     fsOps: input.fsOps,
     skillsRoot: input.skillsRoot,
     rigNameOverride: input.rigNameOverride,
     inheritedPermissionPolicy: input.inheritedPermissionPolicy,
+    materializeOnly: input.materializeOnly,
     exec: input.exec,
     claudeActivityAssets: input.claudeActivityAssets,
   });
@@ -281,7 +307,22 @@ export async function rigPreflight(input: RigPreflightInput & { exec?: (cmd: str
  * with no YAML round-trip; rigPreflight(yaml) is the parse/normalize front over it.
  */
 export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: PreflightSpecContext): Promise<PreflightResult> {
+  // Members share raw skill scans of identical inputs within this preflight only (#1653). The worker's copy ends
+  // with the worker; the release covers the in-process fallback.
+  const scanScope = randomUUID();
+  try {
+    return await withNodeConfigResolver(resolve => preflightMembers(rigSpec, preflightCtx, context => resolve({ ...context, scanScope })));
+  } finally {
+    releaseScanCache(scanScope);
+  }
+}
+
+async function preflightMembers(
+  rigSpec: PodRigSpec, preflightCtx: PreflightSpecContext,
+  resolveNodeConfigAsync: (context: ResolutionContext) => Promise<ResolutionResult>,
+): Promise<PreflightResult> {
   const errors: string[] = [];
+  const loginTargets: Array<{ label: string; env: SeatEnv }> = [];
   // §6 reconciliation (PM ruling 2026-08-05): seed EMPTY so main's already-folded activity-hook /
   // collision warnings (pushed below during the checks) come FIRST; the incoming permission-policy
   // discovery warnings are APPENDED at the return. Rationale + semantic fence at the return site.
@@ -295,6 +336,8 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
       for (const err of nameErrors) {
         errors.push(`${pod.id}.${member.id}: ${err}`);
       }
+      const renamed = nameErrors.length === 0 && !preflightCtx.materializeOnly ? tmuxRenamedSessionError(deriveCanonicalSessionName(pod.id, member.id, effectiveRigName)) : null;
+      if (renamed) errors.push(`${pod.id}.${member.id}: ${renamed}`);
     }
   }
 
@@ -339,6 +382,9 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         }
       }
 
+      // Agent spec advisories (non-blocking): the base spec's and each import's, one warning each.
+      warnings.push(...agentSpecAdvisoryWarnings(`${pod.id}.${member.id}`, resolveResult));
+
       // Resolve profile via resolveNodeConfig
       const ctx: ResolutionContext = {
         baseSpec: resolveResult.resolved,
@@ -354,13 +400,16 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         pod,
         rig: rigSpec,
       };
-      const configResult = resolveNodeConfig(ctx);
+      const configResult = await resolveNodeConfigAsync(ctx);
       if (!configResult.ok) {
         for (const err of configResult.errors) {
           errors.push(`${pod.id}.${member.id}: ${err}`);
         }
         continue;
       }
+
+      if (member.runtime === "codex") loginTargets.push({ label: `${pod.id}.${member.id}`,
+        env: mergeSeatEnv(rigSpec.env, member.env, preflightCtx.envOverride && withoutRuntimeHomes(preflightCtx.envOverride)) });
 
       // Managed Claude activity-hook delivery preflight (NONFATAL): when a claude-code member
       // selects the claude_activity_hooks resource, verify the daemon can actually deliver
@@ -384,9 +433,9 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
         }
       }
 
-      // Check runtime: a built-in, or a community agent app whose preset is installed and usable.
+      // Check runtime: a built-in, or a community harness whose preset is installed and usable.
       if (!SUPPORTED_RUNTIMES.has(member.runtime)) {
-        const app = loadAgentAppPreset(member.runtime);
+        const app = loadCommunityHarnessPreset(member.runtime);
         if (!app.ok) {
           errors.push(`${pod.id}.${member.id}: unsupported runtime "${member.runtime}": ${app.kind === "missing" ? "it isn't built in, and " : ""}${app.message}`);
         }
@@ -400,6 +449,13 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
       if (cwdError) {
         errors.push(`${pod.id}.${member.id}: ${cwdError}`);
       }
+      if (isLaunchWrapperRuntime(member.runtime) && member.launchWrapper && member.launchWrapper.length > 0) {
+        try {
+          resolveLaunchWrapperArgv(member.launchWrapper, process.env.PATH ?? "", process.cwd());
+        } catch (err) {
+          errors.push(`${pod.id}.${member.id}: ${(err as Error).message}`);
+        }
+      }
     }
   }
 
@@ -412,6 +468,7 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
     const piErrors = await verifyPiRuntimeAvailable(rigSpec, preflightCtx.exec, warnings);
     errors.push(...piErrors);
     errors.push(...await verifyOmpRuntimeAvailable(rigSpec, preflightCtx.exec));
+    if (errors.length === 0 && !preflightCtx.materializeOnly) await warnRigLoginPath(loginTargets, preflightCtx.exec, warnings);
   }
 
   // §6 RECONCILIATION — WARNING EMISSION ORDER (PM ruling 2026-08-05): ACTIVITY-HOOK-FIRST,
@@ -427,6 +484,25 @@ export async function preflightValidatedSpec(rigSpec: PodRigSpec, preflightCtx: 
   // higher-priority is a FINDING, not an ordering input — the pin freezes presentation, never semantics.
   warnings.push(...permissionPolicyDiscoveryWarnings(rigSpec, preflightCtx));
   return { ready: errors.length === 0, errors, warnings };
+}
+
+/** A Codex login-shell lookup for each distinct declared seat environment, advisory only.
+ * No profile output or environment values are included in the warning. */
+async function warnRigLoginPath(targets: Array<{ label: string; env: SeatEnv }>, exec: ExecFn, warnings: string[]): Promise<void> {
+  const checks = new Map<string, string[]>();
+  for (const { label, env } of targets) {
+    const shell = env.SHELL || process.env.SHELL || "/bin/sh";
+    const assignments = Object.keys(env).sort().map(key => shellQuote(`${key}=${env[key]}`));
+    const command = `/usr/bin/env ${[...assignments, shellQuote(shell)].join(" ")}${RIG_LOGIN_PATH_CHECK}`;
+    const labels = checks.get(command) ?? [];
+    labels.push(label); checks.set(command, labels);
+  }
+  for (const [command, labels] of checks) {
+    try { await exec(command); }
+    catch {
+      warnings.push(`${labels.join(", ")}: login-shell PATH check could not confirm 'rig'; launch continues. For tarball/manual Node, put its bin directory on PATH in ~/.profile (or the login file your shell reads), then check: bash -lc 'command -v node rig'.`);
+    }
+  }
 }
 
 /**

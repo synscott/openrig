@@ -54,7 +54,7 @@ describe("SuccessorSessionLauncher", () => {
     return new SuccessorSessionLauncher(tmux, discoveryRepo, {
       sessionEnv: { OPENRIG_HOME: "/home", HOME: "/daemon-home", CODEX_HOME: "/daemon-codex" },
       newId: () => "01ABCDEFG",
-      runtimeAdapters: { codex: fakeAdapter("codex") },
+      runtimeAdapters: { codex: fakeAdapter("codex"), "claude-code": fakeAdapter("claude-code") },
       readinessTimeoutMs: 50,
       sleep: async () => {},
       exitPollMs: 1,
@@ -71,6 +71,14 @@ describe("SuccessorSessionLauncher", () => {
     expect(res.ok).toBe(true);
     const opts = respawnPane.mock.calls[0]![2];
     expect(opts.env).toMatchObject({ MODE: "fast", REGION: "eu", OPENRIG_SEAT_ENV_KEYS: "MODE,REGION", OPENRIG_NODE_ID: "node-1" });
+  });
+
+  it.each(["codex", "claude-code"])("a selected %s plugin keeps its interpreter on handover", async runtime => {
+    const res = await launcher().createSuccessor({
+      node: { id: "node-1", runtime, cwd: "/w", seatProjectDir: "/w" }, departingSessionName: "dev-impl@rig",
+    });
+    expect(res.ok).toBe(true);
+    expect(respawnPane.mock.calls[0]![2].env).toMatchObject({ OPENRIG_NODE: process.execPath });
   });
 
   it("a seat that declares no env gets no env keys variable", async () => {
@@ -344,6 +352,22 @@ describe("SuccessorSessionLauncher", () => {
       });
     }
 
+    it("OPR.0.7.0.9 (K2): the seat's launch additions reach the successor's launch, fresh and fork", async () => {
+      checkReady.mockImplementation(async () => ({ ready: true }));
+      const launchAdditions = { agent: "openrig:reviewer", appendSystemPromptFile: "/seat/additions/system-prompt.md", pluginDirs: [],
+        pluginChannels: ["plugin:example-channel@example"] }; // #2044: a seat's plugin channels travel with the rest
+      for (const forkSource of [undefined, { kind: "native_id" as const, value: "parent-1" }]) {
+        launchHarness.mockClear();
+        const res = await timedLauncher().createSuccessor({
+          node: { id: "n", runtime: "codex", cwd: "/w", launchAdditions }, departingSessionName: "a@r", ...(forkSource ? { forkSource } : {}),
+        });
+        expect(res.ok).toBe(true);
+        const [binding, opts] = launchHarness.mock.calls[0]! as [{ launchAdditions?: unknown }, { forkSource?: unknown }];
+        expect(binding.launchAdditions).toEqual(launchAdditions);
+        expect(opts.forkSource).toEqual(forkSource);
+      }
+    });
+
     it("uses the configured window for successor readiness", async () => {
       checkReady.mockImplementation(async () => ({ ready: Date.now() >= 40_000 }));
       const readinessSettings = {
@@ -606,6 +630,35 @@ describe("SuccessorSessionLauncher", () => {
       expect(res.ok).toBe(true);
       const [, command] = respawnPane.mock.calls[0]!;
       expect(command).toBe("/bin/sh");
+    });
+  });
+
+  describe("launch_wrapper forwarding", () => {
+    it.each(["codex", "claude-code"])("forwards %s node.launchWrapper on binding for createSuccessor and stageSuccessor", async runtime => {
+      const created = await launcher().createSuccessor({
+        node: { id: "node-1", runtime, cwd: "/w", launchWrapper: ["rtk", "--succ"] },
+        departingSessionName: "dev-impl@rig",
+      });
+      expect(created.ok).toBe(true);
+      expect(launchHarness.mock.calls[0]?.[0]).toMatchObject({
+        nodeId: "node-1",
+        launchWrapper: ["rtk", "--succ"],
+      });
+
+      launchHarness.mockClear();
+      const staged = await launcher().stageSuccessor({
+        node: { id: "node-1", runtime, cwd: "/w", launchWrapper: ["rtk", "--staged"] },
+        canonicalSession: "dev-impl@rig",
+        stagingSession: "openrig-switch-1",
+        occupantGeneration: "gen-1",
+        onPaneCreated: () => {},
+        staged: { prepare: async () => [] },
+      });
+      expect(staged.ok).toBe(true);
+      expect(launchHarness.mock.calls[0]?.[0]).toMatchObject({
+        nodeId: "node-1",
+        launchWrapper: ["rtk", "--staged"],
+      });
     });
   });
 });

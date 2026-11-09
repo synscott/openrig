@@ -1,8 +1,7 @@
 // release-0.3.2 slice 12 — scope CLI primitive types.
 //
-// Aligned with the substrate convention at
-// `openrig-work/conventions/scope-and-versioning/README.md` (stage:
-// provisional, authored 2026-05-15). The CLI mints stable dot-IDs
+// Aligned with the scope-and-versioning convention (stage: provisional,
+// authored 2026-05-15). The CLI mints stable dot-IDs
 // into created mission/slice frontmatter per §1 of that convention.
 
 /** Scope tiers. v0 ships `mission` + `slice`; `project` and `sub-slice`
@@ -31,7 +30,10 @@ export interface MissionInfo {
   /** Minted dot-ID for this mission (read from frontmatter if present,
    *  otherwise inferred from the folder name pattern). */
   id: string | null;
+  /** Slices in flight (blocked included); delivered in place; and closed (closed/, or an exit in place). Each slice is
+   *  counted once, by the standing `slice ls --state` filters on. */
   activeSliceCount: number;
+  shippedSliceCount: number;
   closedSliceCount: number;
 }
 

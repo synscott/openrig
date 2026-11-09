@@ -14,9 +14,19 @@ import {
 import { basename, join } from "node:path";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import { DaemonClient } from "../client.js";
-import { getDaemonStatus, getDaemonUrl , statusGuardMessage} from "../daemon-lifecycle.js";
+import { getDaemonStatus, getDaemonUrl , statusGuardMessage } from "../daemon-lifecycle.js";
+import { renderCaughtTransportError } from "../cli-error.js";
+import { daemonMayAnswer } from "../daemon-reachability.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
+
+const KNOWN_SPEC_KINDS = ["rig", "agent", "workflow"] as const;
+
+function warnIfUnknownKind(kind?: string): void {
+  if (kind !== undefined && !KNOWN_SPEC_KINDS.includes(kind as (typeof KNOWN_SPEC_KINDS)[number])) {
+    console.error(`Warning: unrecognized --kind '${kind}'. Supported kinds: ${KNOWN_SPEC_KINDS.join(", ")}`);
+  }
+}
 
 interface LibraryEntry {
   id: string;
@@ -145,17 +155,27 @@ function installSpecSource(source: AddSpecSource, userRoot: string): string {
 export async function resolveLibrarySpec(
   client: DaemonClient,
   nameOrId: string,
-  opts?: { kind?: LibraryEntry["kind"] },
+  opts?: { kind?: string },
 ): Promise<LibraryEntry> {
-  const res = await client.get<LibraryEntry[]>(opts?.kind ? `/api/specs/library?kind=${opts.kind}` : "/api/specs/library");
-  const entries = res.data ?? [];
-
-  // Try exact ID match first
+  const url = opts?.kind !== undefined ? `/api/specs/library?kind=${encodeURIComponent(opts.kind)}` : "/api/specs/library";
+  const res = await client.get<LibraryEntry[]>(url);
+  const filterKind = (entries: LibraryEntry[]) =>
+    opts?.kind !== undefined && !KNOWN_SPEC_KINDS.includes(opts.kind as (typeof KNOWN_SPEC_KINDS)[number])
+      ? entries.filter((entry) => entry.kind === opts.kind)
+      : entries;
+  const visibleEntries = filterKind(res.data ?? []);
+  // An exact ID always wins, including when a visible name matches a hidden ID.
+  const visibleId = visibleEntries.find((entry) => entry.id === nameOrId);
+  if (visibleId) return visibleId;
+  const separator = opts?.kind !== undefined ? "&" : "?";
+  const all = await client.get<LibraryEntry[]>(`${url}${separator}include_builtins=true`);
+  const entries = filterKind(all.data ?? []);
   const byId = entries.find((e) => e.id === nameOrId);
   if (byId) return byId;
 
-  // Try name match
-  const byName = entries.filter((e) => e.name === nameOrId);
+  // Visible names take precedence over hidden built-ins with the same name.
+  const visibleNames = visibleEntries.filter((e) => e.name === nameOrId);
+  const byName = visibleNames.length ? visibleNames : entries.filter((e) => e.name === nameOrId);
   if (byName.length === 1) return byName[0]!;
 
   if (byName.length > 1) {
@@ -203,7 +223,7 @@ Examples:
   async function getClient(): Promise<DaemonClient> {
     const deps = getDeps();
     const status = await getDaemonStatus(deps.lifecycleDeps);
-    if (status.state !== "running" || status.healthy === false) {
+    if (!daemonMayAnswer(status)) {
       // B8-1b: epistemic-matched language via the one helper (down ≠ busy).
       const gm = statusGuardMessage(status); throw new Error(`${gm.fact} ${gm.action}`);
     }
@@ -214,14 +234,23 @@ Examples:
   cmd.command("ls")
     .description("List library rigs, agents, and managed apps")
     .option("--kind <kind>", "Filter by kind (rig, agent, or workflow)")
+    .option("--include-builtins", "Include built-ins hidden by the visibility setting")
     .option("--json", "JSON output")
-    .action(async (opts: { kind?: string; json?: boolean }) => {
+    .action(async (opts: { kind?: string; json?: boolean; includeBuiltins?: boolean }) => {
       try {
+        warnIfUnknownKind(opts.kind);
         const client = await getClient();
-        const url = opts.kind ? `/api/specs/library?kind=${opts.kind}` : "/api/specs/library";
+        const params = new URLSearchParams();
+        if (opts.kind !== undefined) params.set("kind", opts.kind);
+        if (opts.includeBuiltins) params.set("include_builtins", "true");
+        const url = `/api/specs/library${params.size ? `?${params}` : ""}`;
         const res = await client.get<LibraryEntry[]>(url);
         if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status}`);
-        const entries = res.data ?? [];
+        const rawEntries = res.data ?? [];
+        const entries =
+          opts.kind !== undefined && !KNOWN_SPEC_KINDS.includes(opts.kind as (typeof KNOWN_SPEC_KINDS)[number])
+            ? rawEntries.filter((e) => e.kind === opts.kind)
+            : rawEntries;
 
         if (opts.json) {
           console.log(JSON.stringify(entries, null, 2));
@@ -229,7 +258,11 @@ Examples:
         }
 
         if (entries.length === 0) {
-          console.log("No specs in library. Add specs with: rig specs add <path>");
+          if (opts.kind !== undefined) {
+            console.log(opts.kind ? `No ${opts.kind} specs found` : "No specs found");
+          } else {
+            console.log("No specs in library. Add specs with: rig specs add <path>");
+          }
           return;
         }
 
@@ -248,10 +281,11 @@ Examples:
     .description("Show spec metadata and path")
     .option("--kind <kind>", "Disambiguate by kind (rig, agent, or workflow)")
     .option("--json", "JSON output")
-    .action(async (nameOrId: string, opts: { kind?: LibraryEntry["kind"]; json?: boolean }) => {
+    .action(async (nameOrId: string, opts: { kind?: string; json?: boolean }) => {
       try {
+        warnIfUnknownKind(opts.kind);
         const client = await getClient();
-        const entry = await resolveLibrarySpec(client, nameOrId, opts.kind ? { kind: opts.kind } : undefined);
+        const entry = await resolveLibrarySpec(client, nameOrId, opts.kind !== undefined ? { kind: opts.kind } : undefined);
 
         if (opts.json) {
           console.log(JSON.stringify(entry, null, 2));
@@ -276,10 +310,11 @@ Examples:
     .description("Show structured spec review, including managed app details")
     .option("--kind <kind>", "Disambiguate by kind (rig, agent, or workflow)")
     .option("--json", "JSON output")
-    .action(async (nameOrId: string, opts: { kind?: LibraryEntry["kind"]; json?: boolean }) => {
+    .action(async (nameOrId: string, opts: { kind?: string; json?: boolean }) => {
       try {
+        warnIfUnknownKind(opts.kind);
         const client = await getClient();
-        const entry = await resolveLibrarySpec(client, nameOrId, opts.kind ? { kind: opts.kind } : undefined);
+        const entry = await resolveLibrarySpec(client, nameOrId, opts.kind !== undefined ? { kind: opts.kind } : undefined);
         const res = await client.get<Record<string, unknown>>(`/api/specs/library/${encodeURIComponent(entry.id)}/review`);
         const review = res.data;
         const teamChoice = entry.sourceType === "builtin" && entry.kind === "rig" && ["starter", "factory"].includes(entry.name)
@@ -356,7 +391,7 @@ Examples:
           console.log(`  ID: ${newEntry.id}`);
         }
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -378,7 +413,7 @@ Examples:
 
         console.log(`Library synced: ${entries.length} spec(s) indexed.`);
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -408,7 +443,7 @@ Examples:
 
         console.log(`Removed ${res.data["name"] ?? entry.name} from the library`);
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });
@@ -442,7 +477,7 @@ Examples:
         const renamed = (res.data["entry"] as Record<string, unknown> | undefined) ?? {};
         console.log(`Renamed ${entry.name} to ${renamed["name"] ?? newName}`);
       } catch (err) {
-        console.error((err as Error).message);
+        if (!renderCaughtTransportError(err)) console.error((err as Error).message);
         process.exitCode = 1;
       }
     });

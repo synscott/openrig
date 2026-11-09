@@ -9,6 +9,7 @@ import { piPinReadings, piSeatPinReadings, readPiEffectiveModel } from "./effect
 import { piSeatPaths } from "../../adapters/pi-runner-protocol.js";
 import { canonicalModelPin, modelsMatch } from "./model-divergence-monitor.js";
 import { isShellForeground } from "../shell-classifier.js";
+import { commandNamesClaude } from "../native-process-lineage.js";
 
 export interface ProcessRow {
   pid: number;
@@ -42,7 +43,7 @@ export interface ClaudeOccupantRecordInput {
     verdict: string;
     sessionName: string | null;
     observedAt: string;
-    evidence: { registeredPane: string | null; observedPid: number | null };
+    evidence: { registeredPane: string | null; observedPid: number | null; observedPanePid?: number | null };
   } | null;
   sidecar: {
     session_id?: string;
@@ -57,9 +58,10 @@ export type ClaudeRecordSelection =
   | { ok: true; id: string; path: string; source: "generation-sidecar" | "verified-pane-argument" }
   | { ok: false; reason: string };
 
-/** Descendants of `parentPid` whose command matches `matches`, breadth-first. (Deliberately local:
- *  the two existing walkers are module-private in the codex adapter and the refresher; a shared
- *  extraction is a cleanup for calmer water.) */
+/** `parentPid` itself and its descendants whose command matches `matches`, breadth-first: a runtime exec'd at launch
+ *  IS the pane's process. A shell at the root isn't one, even when its arguments name the runtime: `bash -c` keeps its
+ *  whole script in argv while a later command runs. (Deliberately local: the two existing walkers are module-private in
+ *  the codex adapter and the refresher; a shared extraction is a cleanup for calmer water.) */
 function findDescendants(processes: ProcessRow[], parentPid: number, matches: (command: string) => boolean): number[] {
   const byParent = new Map<number, ProcessRow[]>();
   for (const p of processes) {
@@ -67,7 +69,9 @@ function findDescendants(processes: ProcessRow[], parentPid: number, matches: (c
     list.push(p);
     byParent.set(p.ppid, list);
   }
-  const out: number[] = [];
+  const root = processes.find((p) => p.pid === parentPid);
+  const rootArgv0 = basename((root?.command.trim().split(/\s+/)[0] ?? "").replace(/^-/, "").replace(/^['"]|['"]$/g, ""));
+  const out: number[] = root && !isShellForeground(rootArgv0) && matches(root.command) ? [root.pid] : [];
   const queue = [parentPid];
   while (queue.length > 0) {
     const pid = queue.shift()!;
@@ -96,7 +100,7 @@ export async function paneClaudeSessionIdArgument(
   const panePid = await deps.getPanePid(sessionTarget);
   if (!panePid) return { ok: false, reason: `no live pane pid for ${sessionTarget}` };
   const processes = await deps.listProcesses();
-  const claudePids = findDescendants(processes, panePid, commandBasenameIs("claude"));
+  const claudePids = findDescendants(processes, panePid, commandNamesClaude);
   if (claudePids.length === 0) return { ok: false, reason: `no claude process under the live pane of ${sessionTarget}` };
   const ids = new Set<string>();
   for (const pid of claudePids) {
@@ -111,7 +115,7 @@ export async function paneClaudeSessionIdArgument(
 
 /**
  * Resolve a Claude record only after the canonical seat's current occupant is joined to its
- * registered pane and the pane's PID still matches the durable identity verdict. The pane's launch
+ * registered pane and the pane's root and matched process still match the durable identity verdict. The pane's launch
  * argument is the legacy identity anchor. A generation-stamped sidecar may supersede it after a
  * provider-internal session rollover; an unstamped sidecar may locate files but cannot override it.
  */
@@ -151,17 +155,22 @@ export async function resolveIdentityVerifiedClaudeRecord(
   }
   const panePid = await deps.getPanePid(binding.tmuxPane);
   if (!panePid) return { ok: false, reason: `registered pane ${binding.tmuxPane} has no live pid` };
-  if (panePid !== identity.evidence.observedPid) {
+  // Legacy verdicts only recorded one PID; retain their old pane-root check until refreshed.
+  const verifiedPanePid = identity.evidence.observedPanePid ?? identity.evidence.observedPid;
+  if (panePid !== verifiedPanePid) {
     return {
       ok: false,
-      reason: `registered pane pid changed since identity verification (${identity.evidence.observedPid} -> ${panePid})`,
+      reason: `registered pane pid changed since identity verification (${verifiedPanePid} -> ${panePid})`,
     };
   }
 
   const processes = await deps.listProcesses();
-  const claudePids = findDescendants(processes, panePid, commandBasenameIs("claude"));
+  const claudePids = findDescendants(processes, panePid, commandNamesClaude);
   if (claudePids.length === 0) {
     return { ok: false, reason: `no claude process under verified pane ${binding.tmuxPane}` };
+  }
+  if (identity.evidence.observedPid !== panePid && !claudePids.includes(identity.evidence.observedPid)) {
+    return { ok: false, reason: `verified claude process ${identity.evidence.observedPid} is no longer under pane ${binding.tmuxPane}` };
   }
   const paneIds = new Set<string>();
   for (const pid of claudePids) {
@@ -254,7 +263,8 @@ export interface PiOccupantRecordInput {
 }
 
 export type PiRecordSelection =
-  | { ok: true; path: string; launchId: string; notBeforeMs: number }
+  /** `pid`, `startedAt` and `command` are the verified runner's own process row. */
+  | { ok: true; path: string; launchId: string; notBeforeMs: number; pid: number; startedAt: string; command: string }
   | { ok: false; reason: string };
 
 /** The value after `flag` in a whitespace-tokenized process command line, or null. */
@@ -360,7 +370,10 @@ export async function resolveIdentityVerifiedPiRecord(
   if (inside === null || inside === "" || inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) {
     return { ok: false, reason: `Pi session file ${sessionFile} is not under the seat's sessions folder` };
   }
-  return { ok: true, path: file!, launchId, notBeforeMs: Math.max(bootAtMs, startedMs) + 999 };
+  return {
+    ok: true, path: file!, launchId, notBeforeMs: Math.max(bootAtMs, startedMs) + 999,
+    pid: runner.pid, startedAt: runner.startedAt!, command,
+  };
 }
 
 /** A Pi seat's effective-model read as the monitor wires it: the pin must resolve to a
