@@ -310,7 +310,7 @@ function agentColumns(): ColumnDef<AgentRow>[] {
  *  selected the row data is the REMOTE host's, so the local affordances
  *  are gated behind an honest read-only marker (FR-7: no cross-host
  *  mutation offered on remote views). */
-function TopologyActionsCell({ row }: { row: AgentRow }) {
+const TopologyActionsCell = memo(function TopologyActionsCell({ row }: { row: AgentRow }) {
   const isRemote = useSelectedHostId() !== LOCAL_HOST_ID;
   if (isRemote) {
     return (
@@ -339,6 +339,12 @@ function TopologyActionsCell({ row }: { row: AgentRow }) {
       ) : null}
     </span>
   );
+});
+
+// Query result wrappers change on local renders; combine structurally shares only
+// the inventory data so filtering/sorting can reuse the derived table rows.
+function combineNodeInventories(results: { data: NodeInventoryEntry[] | undefined }[]) {
+  return results.map((result) => result.data);
 }
 
 export function TopologyTableView({ rigIdScope, podNameScope }: { rigIdScope?: string; podNameScope?: string }) {
@@ -360,21 +366,21 @@ export function TopologyTableView({ rigIdScope, podNameScope }: { rigIdScope?: s
   // P0-1 fix: useQueries replaces the .map(useNodeInventory) loop. Single
   // hook call regardless of scopedRigs length. React's hook order stays
   // stable across renders even when rigs grows from undefined to [N].
-  const inventoryResults = useQueries({
+  const inventories = useQueries({
     queries: scopedRigs.map((r) => ({
       queryKey: ["rig", r.id, "nodes", hostId] as const,
       queryFn: () => fetchNodeInventory(r.id, hostId),
       refetchInterval: 30_000,
     })),
+    combine: combineNodeInventories,
   });
 
   const data: AgentRow[] = useMemo(() => {
     const rows: AgentRow[] = [];
     for (let i = 0; i < scopedRigs.length; i++) {
       const rig = scopedRigs[i];
-      const result = inventoryResults[i];
-      if (!rig || !result) continue;
-      const nodes: NodeInventoryEntry[] = result.data ?? [];
+      if (!rig) continue;
+      const nodes: NodeInventoryEntry[] = inventories[i] ?? [];
       const scopedNodes = podNameScope
         ? nodes.filter((n) => (n.podNamespace ?? n.podId) === podNameScope)
         : nodes;
@@ -398,7 +404,7 @@ export function TopologyTableView({ rigIdScope, podNameScope }: { rigIdScope?: s
       }
     }
     return rows;
-  }, [scopedRigs, inventoryResults, podNameScope]);
+  }, [scopedRigs, inventories, podNameScope]);
 
   const sessionIndex = useMemo(() => buildTopologySessionIndex(data.map((row) => ({
     nodeId: `${row.rigId}::${row.logicalId}`,
