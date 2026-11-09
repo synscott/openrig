@@ -82,6 +82,18 @@ describe("managed Windows launch", () => {
     expect(() => launch.command([])).toThrow(/context changed/);
   });
 
+  it("keeps the selected launch wrapper ahead of the managed native executable", async () => {
+    const f = fixture();
+    const wrapper = path.join(f.home, "launch-wrapper");
+    fs.writeFileSync(wrapper, "inert wrapper", { mode: 0o700 });
+    const launch = await f.managed.prepare({ nodeId: "node", session: "seat", pane: "%1",
+      launchWrapper: [wrapper, "--label", "space arg", "--"],
+    }, "auto");
+    const command = launch.command(["--session-id", "expected"]);
+    expect(command).toContain(`$openrigStart.FileName = '${wrapper}'`);
+    expect(command).toContain(`$openrigStart.Arguments = '${windowsArguments(["--label", "space arg", "--", f.executable, "--session-id", "expected"])}'`);
+  });
+
   it("parses OS command lines including paths with spaces and opaque settings arguments", () => {
     const args = ["C:\\program space\\claude.exe", "--settings", '{"note":"--resume wrong"}', "--session-id", "right", "", "backslash\\", 'quoted"name'];
     expect(parseWindowsCommandLine(windowsArguments(args))).toEqual(args);
