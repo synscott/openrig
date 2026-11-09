@@ -331,3 +331,96 @@ If Project shows a mission discovery warning:
 
 No daemon restart is required for most config reads. Restart when changing
 startup-time roots such as `files.allowlist` or progress scan roots.
+
+## Read the Projects work report
+
+The GUI Projects page and TUI Projects mission view read existing authored work,
+queue history and linked evidence. They do not dispatch agents. Select a catalog
+project before opening a mission. The selected ID and canonical root travel with
+subsequent reads; a changed root requires a new selection.
+
+Done, In flight and Left to do classify evidenced work. A separate unresolved
+inventory coverage gap retains unclassified and closed-unverified units. The three
+classified totals plus unresolved inventory reconcile to known countable units. Authored
+unqueued work is included. Rollup parents and PR references do not add work units.
+Explicit handoff lineage joins attempts; titles never establish identity. Exact
+evidence paths can identify potential work but do not alone prove identity.
+Ambiguous associations stay in coverage instead of creating duplicate units. Duplicate
+or unresolved identities remain visible in source coverage rather than inflating
+unique totals. An authored unstarted status that conflicts with a work stage, declared progress,
+or queue history stays unresolved with a warning. Untouched generated progress
+headings and bracketed instructions, and the scaffold default stage wip, do not
+establish execution. Done reports sourced completion. Acceptance and integration have
+separate evidence and can remain unknown even for a completed item. The mission
+rollup preserves its authored SPEC status, falling back to mission.yaml
+metadata.status when absent. That rollup status does not classify child work.
+
+Open an item to read its owner, stage, sourced progress, next action, blocker and
+timecard. Declared slice progress sources retain their modification time and
+evidence reference; intent is labelled separately. Compact rows and TUI details
+show the latest section or tail; full progress remains in the source evidence. Lifecycle notes and actors stay
+visible even when consecutive states share one residence span. Recorded command wall time is distinct from continuous effort. Blocked
+lifecycle residence is distinct from unmarked waiting. Missing evidence remains
+unknown. Concurrent intervals are unioned, and shared intervals without unique
+task attribution are not allocated to task totals. Refresh reads a new snapshot;
+the report displays its observation time and source hashes/modification times.
+
+### Associate a mission's legacy queue project
+
+A project catalog entry and queue `project:` tag are different authorities. When
+an existing mission deliberately retains an older queue project ID, declare the
+bounded association in that mission's `mission.yaml`:
+
+```yaml
+reporting:
+  queue_association:
+    mission_id: APP.99.0.1
+    legacy_project_ids: [old-project]
+```
+
+The mission ID must match a unique canonical authored mission inside the selected
+project root. A row must match both that mission and one declared project ID.
+Neighboring missions, conflicting tags and rows without project tags are not
+admitted through this field. The report retains original tags and shows the
+association source as a warning. This field changes report membership only; it
+does not retag queue history or change another mission's execution view.
+
+Unavailable sources and unmatched queue records remain browsable with explicit
+coverage. Whole-inventory totals describe known unique units, not a claim that
+unclassified sources have been resolved.
+
+### Declare nonstandard work directories
+
+Direct children of the canonical slices directory remain visible inventory units
+even without SPEC.md or README.md. Other directories require an explicit reporting
+disposition or remain unresolved source candidates:
+
+```yaml
+reporting:
+  work_directories:
+    - ref: repair-work
+      disposition: work
+    - ref: repairs
+      disposition: container
+    - ref: historical-captures
+      disposition: artifacts
+```
+
+References are relative to the selected canonical mission root. Duplicate,
+conflicting, escaping or overlapping work declarations produce local coverage
+errors. Containers and artifact directories do not add work units. Bounded owned
+command records and disposition evidence are read without creating source files.
+The existing portfolio and its Open-mission/steering paths remain available above
+the inventory report. Excluded queue records and open exclusions are shown without
+changing membership policy. Ambiguous work counts and open ambiguous records
+remain visible at report level without adding units. Parent rollups remain reachable as hierarchy context,
+while only countable units contribute to totals.
+
+Optional authored frontmatter strings owner, next_action and blocker are report
+metadata when explicitly present; missing values remain unrecorded. A supported
+owned disposition packet's next_custody is sourced as its next action. Narrative
+progress is displayed without deriving structured owners or blockers from prose.
+Acceptance comes from supported current proof-policy judgments. Owned publication
+packets and their linked receipts remain reported narrative and provenance. Their
+reader-status claims or readable links do not establish acceptance or classify
+work as Done. Explicit authored completion and integration remain separate facts.

@@ -11,6 +11,7 @@ import {
 } from "@tanstack/react-router";
 import { MissionScopePage, WorkspaceScopePage } from "../src/components/project/ScopePages.js";
 import { TopologyOverlayProvider } from "../src/components/topology/topology-overlay-context.js";
+import { projectReportFixture } from "../twin/project-report-fixture.js";
 import type { SliceDetail } from "../src/hooks/useSlices.js";
 
 const mockFetch = vi.fn();
@@ -100,6 +101,10 @@ function installFetchMock(opts: { psEntries?: PsEntry[] } = {}) {
     if (url.includes("/api/hosts")) {
       return new Response(JSON.stringify({ ownName: "localhost", selected: "local", hosts: [] }), { status: 200 });
     }
+    if (url.includes("/api/scopes/projects")) {
+      return Response.json({ projects: [projectReportFixture.project], catalogPath: "workspace.yaml" });
+    }
+    if (url.includes("/api/scopes/report")) return Response.json(projectReportFixture);
     if (url.includes("/api/config")) {
       return new Response(
         JSON.stringify({ settings: { "workspace.root": { value: "/Users/admin/.openrig/workspace" } } }),
@@ -254,28 +259,38 @@ function renderMissionScope(): ReturnType<typeof render> {
 }
 
 describe("WorkspaceScopePage overview", () => {
-  // OPR.0.4.1.24 — the workspace parent altitude now lands on the cross-mission
-  // portfolio (supersedes the prior WorkspaceOverviewPanel mission grid). The
-  // thorough portfolio behavior is covered in workspace-portfolio.test.tsx; these
-  // integration checks assert the landing mounts the portfolio over the real shell.
   it("OPR.0.4.1.24: the workspace overview lands on the cross-mission portfolio, missions derived from the slice index", async () => {
     const { findByTestId } = renderWorkspaceScope();
 
     expect(await findByTestId("workspace-portfolio")).toBeTruthy();
-    // Missions are DERIVED by grouping slices: idea-ledger -> RELEASE-PROOF; the
-    // railItem-less slice -> unsorted. Each is a collapsed row.
     expect(await findByTestId("portfolio-mission-RELEASE-PROOF")).toBeTruthy();
     expect(await findByTestId("portfolio-mission-unsorted")).toBeTruthy();
   });
 
   it("OPR.0.4.1.24: portfolio rows are collapsed by default with an Open-mission jump", async () => {
     const { findByTestId, queryByTestId } = renderWorkspaceScope();
-    // each mission row carries an Open jump to its mission page.
     expect(await findByTestId("portfolio-open-RELEASE-PROOF")).toBeTruthy();
-    // collapsed by default: no steering glance (and so no MISSION_BRIEF fetch) until expand.
     expect(queryByTestId("portfolio-glance-RELEASE-PROOF")).toBeNull();
     expect(queryByTestId("portfolio-glance-loading-RELEASE-PROOF")).toBeNull();
     expect(queryByTestId("portfolio-glance-empty-RELEASE-PROOF")).toBeNull();
+  });
+
+  it("lands on the source-backed work inventory inside the workspace shell", async () => {
+    const { findByRole, findByText } = renderWorkspaceScope();
+    expect(await findByRole("region", { name: "Projects work report" })).toBeTruthy();
+    expect(await findByText("3 known work units")).toBeTruthy();
+    expect(await findByText("Done 1 · In flight 1 · Left to do 1")).toBeTruthy();
+  });
+
+  it("keeps work details collapsed until the user opens a row", async () => {
+    const { findByText } = renderWorkspaceScope();
+    const title = await findByText("Preserve delivery behavior");
+    const details = title.closest("details");
+    expect(details?.open).toBe(false);
+    const summary = title.closest("summary");
+    if (!summary) throw new Error("Work row has no summary");
+    fireEvent.click(summary);
+    expect(details?.open).toBe(true);
   });
 
   it("workspace progress, queue, and topology tabs render aggregate scoped data", async () => {

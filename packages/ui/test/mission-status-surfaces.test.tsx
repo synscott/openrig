@@ -27,6 +27,7 @@ import {
 import { ProjectTreeView } from "../src/components/project/ProjectTreeView.js";
 import { WorkspacePortfolioPanel } from "../src/components/project/WorkspacePortfolioPanel.js";
 import { WorkspaceScopePage } from "../src/components/project/ScopePages.js";
+import { projectReportFixture } from "../twin/project-report-fixture.js";
 import { buildStorytellingFeedItems } from "../src/components/feed/cards/storytelling-cards.js";
 
 const mockFetch = vi.fn();
@@ -99,6 +100,14 @@ function setupFetch(opts: {
     if (url.includes("/api/files/roots")) {
       return new Response(JSON.stringify({ roots: [] }), { status: 200 });
     }
+    if (url.includes("/api/scopes/projects")) {
+      return Response.json({ projects: [projectReportFixture.project], catalogPath: "workspace.yaml" });
+    }
+    if (url.includes("/api/scopes/report")) {
+      const report = structuredClone(projectReportFixture);
+      report.missions = report.missions.map(mission => ({ ...mission, mission: "relx", authoredStatus: opts.missions?.relx?.authoredStatus ?? null }));
+      return Response.json(report);
+    }
     if (url.includes("/api/slices")) {
       return new Response(
         JSON.stringify({
@@ -166,18 +175,14 @@ describe("V1 — authored-when-present wins at the observable (FR-1)", () => {
   });
 
   it("the workspace OVERVIEW tab renders the authored word; FR-4 buckets it under ARCHIVE in the tree", async () => {
-    // GROUNDED (fallback-run finding): WorkspaceOverviewPanel is an ORPHAN —
-    // ScopePages:744 renders WorkspacePortfolioPanel on the overview tab
-    // ("Supersedes the prior WorkspaceOverviewPanel mission grid"). The REAL
-    // overview observable is the portfolio row inside WorkspaceScopePage;
-    // the FR-4 bucket observable is the tree's Current/Archive sections.
     setupFetch({
       slices: [sliceRow({ missionId: "relx", name: "target" })],
       missions: { relx: { authoredStatus: "complete" } },
     });
     const page = mount(<WorkspaceScopePage />);
-    await page.findByTestId("portfolio-open-relx"); // the overview-tab surface exists
-    expect(await page.findByText("complete")).toBeTruthy(); // authored word renders
+    await page.findByTestId("portfolio-open-relx");
+    await page.findByRole("region", { name: "Projects work report" });
+    expect(await page.findByText("relx · authored status complete")).toBeTruthy();
     page.unmount();
 
     setupFetch({

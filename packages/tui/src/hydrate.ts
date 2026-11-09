@@ -438,13 +438,14 @@ export async function hydrateSnapshot(
     const scopes = readable ? await safe<{ missions: FleetSnapshot["scopes"]; sources?: Record<string, string>; readErrors?: string[] }>("scopes", () => client.scopesDetailed(selected)) : null;
     const mission = scopes?.missions?.find(m => m.mission === executionMission);
     const slice = mission?.slices.find(s => s.dirName === sliceDetailName);
-    const [execution, detail, roots] = await Promise.all([
+    const [execution, detail, roots, projectWorkReport] = await Promise.all([
       readable && executionMission && !mission?.error ? safe<{ rows: NonNullable<FleetSnapshot["execution"]>[] }>("execution", () => client.execution(executionMission, selected)) : null,
       readable && executionMission && sliceDetailName && !mission?.error && !slice?.error ? safe<SliceDetailSnap>("slice-detail", () => client.sliceDetail(sliceDetailName, executionMission, selected)) : null,
       safe<Awaited<ReturnType<DaemonClient["fileRoots"]>>>("file-roots", () => client.fileRoots()),
+      readable && selected && projects?.capabilities?.includes("work-report") ? safe<NonNullable<FleetSnapshot["projectWorkReport"]>>("project-work-report", () => client.projectWorkReport(selected, executionMission)) : null,
     ]);
     readErrors.push(...(scopes?.readErrors ?? []));
-    return { ...emptySnapshot(), projects, projectRead: selected, projectSources: scopes?.sources, scopes: scopes?.missions ?? [], execution: execution?.rows[0] ?? null, executionMission, sliceDetail: detail, sliceDetailName, fileRoots: roots?.roots ?? [], readErrors, hydratedAt: new Date().toISOString() };
+    return { ...emptySnapshot(), projects, projectWorkReport, projectRead: selected, projectSources: scopes?.sources, scopes: scopes?.missions ?? [], execution: execution?.rows[0] ?? null, executionMission, sliceDetail: detail, sliceDetailName, fileRoots: roots?.roots ?? [], readErrors, hydratedAt: new Date().toISOString() };
   }
 
   if (viewContext?.section === "terminals") {

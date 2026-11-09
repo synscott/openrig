@@ -1,3 +1,4 @@
+import { projectReportFixture } from "./project-report-fixture.js";
 // Daemon-free fetch seam (complements cache-seed; NOT MSW / no service worker).
 // Cache-seed (seed.ts) gives instant first paint, but several hooks hardcode
 // staleTime:0 + refetchInterval (useNodePreview/useSessionPreview, useSettings,
@@ -42,6 +43,11 @@ function json(body: unknown, status = 200): Response {
 const realFetch: typeof fetch | undefined = globalThis.fetch ? globalThis.fetch.bind(globalThis) : undefined;
 
 function route(pathname: string, search: URLSearchParams): Response {
+  if (pathname === "/api/scopes/projects") {
+    const report = window.__PROJECT_REPORT_FIXTURE__ ?? projectReportFixture;
+    return json({ catalogPath: "workspace.yaml", projects: [{ ...report.project, sourcePath: "SPEC.md", missionsRoot: `${report.project.root}/missions` }] });
+  }
+  if (pathname === "/api/scopes/report") return json(window.__PROJECT_REPORT_FIXTURE__ ?? projectReportFixture);
   if (pathname === "/api/rigs/summary") return json(rigSummary);
   if (pathname === "/api/ps") return json(psEntries);
   // Settings (useSettings, staleTime:0). workspace.root unblocks the /project surface
@@ -157,7 +163,16 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promis
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
   try {
     const u = new URL(url, "http://twin.local");
-    if (u.pathname.startsWith("/api/")) return route(u.pathname, u.searchParams);
+    if (u.pathname.startsWith("/api/")) {
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      const requests = window.__PROJECT_REPORT_REQUESTS__ ?? (window.__PROJECT_REPORT_REQUESTS__ = []);
+      if (requests.length < 256) requests.push({ path: u.pathname, method });
+      if (window.__PROJECT_REPORT_BASE_URL__ && (u.pathname === "/api/scopes/projects" || u.pathname === "/api/scopes/report")) {
+        if (!realFetch) throw new Error("Actual report route requires native fetch");
+        return realFetch(new URL(`${u.pathname}${u.search}`, window.__PROJECT_REPORT_BASE_URL__), init);
+      }
+      return route(u.pathname, u.searchParams);
+    }
   } catch {
     /* fall through to real fetch */
   }

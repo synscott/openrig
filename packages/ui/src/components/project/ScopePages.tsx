@@ -1,3 +1,5 @@
+import { WorkspacePortfolioPanel } from "./WorkspacePortfolioPanel.js";
+import { ProjectWorkReport } from "./ProjectWorkReport.js";
 // V1 attempt-3 Phase 3 — Project scope pages per project-tree.md L46–L49 + SC-24.
 //
 // workspace = overview/progress/artifacts/queue/topology (5 tabs)
@@ -78,7 +80,6 @@ import { SteeringTab } from "./SteeringTab.js";
 import { ArtifactsNavigator } from "./ArtifactsNavigator.js";
 import { SliceReviewTab } from "../review/SliceReviewTab.js";
 import { MissionReviewTab } from "../review/MissionReviewTab.js";
-import { WorkspacePortfolioPanel } from "./WorkspacePortfolioPanel.js";
 
 type SharedTab = "overview" | "story" | "progress" | "artifacts" | "proof" | "queue" | "topology" | "steering" | "review";
 type SliceTab = SharedTab | "story" | "proof";
@@ -739,10 +740,7 @@ export function WorkspaceScopePage() {
       onSelect={(id) => setActive(id as SharedTab)}
     >
       {active === "overview" ? (
-        // OPR.0.4.1.24 — the workspace parent altitude lands on the cross-mission
-        // portfolio (collapsed missions, most-recently-modified, expand→steering glance).
-        // Supersedes the prior WorkspaceOverviewPanel mission grid.
-        <WorkspacePortfolioPanel />
+        <div className="space-y-8"><WorkspacePortfolioPanel /><ProjectWorkReport /></div>
       ) : null}
       {active === "story" ? (
         <ScopeStoryRollup

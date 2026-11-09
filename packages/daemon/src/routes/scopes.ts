@@ -1,3 +1,5 @@
+import { readProjectWorkReport } from "../domain/workspace/project-report.js";
+import { QueueRepository } from "../domain/queue-repository.js";
 import { listProjects, selectedProject, projectReadResponse, projectMission, workSource, insideProject } from "../domain/workspace/project-read.js";
 // SCOPES VIEW (sealed plan d64d2f5c) — the store-direct read routes behind the scopes TUI.
 // GET /api/scopes?mission=X          -> mission slice summaries (cards/counts/locks)
@@ -32,8 +34,16 @@ function rootOf(c: Parameters<typeof selectedProject>[0]): { root: string } | { 
 
 export function scopesRoutes(): Hono {
   const app = new Hono();
-  app.get("/projects", c => { try { return c.json(listProjects(c)); } catch (err) { return projectReadResponse(err); } });
+  app.get("/projects", c => { try { return c.json({ ...listProjects(c), capabilities: ["work-report"] }); } catch (err) { return projectReadResponse(err); } });
   app.onError(err => projectReadResponse(err));
+  app.get("/report", c => {
+    const project = selectedProject(c);
+    if (!project) return c.json({ error: "project_required", message: "Select an exact catalog project" }, 400);
+    const mission = c.req.query("mission");
+    if (mission) projectMission(project, mission);
+    const queue = c.get("queueRepo" as never);
+    return c.json(readProjectWorkReport({ project, queue: queue instanceof QueueRepository ? queue : undefined, mission }));
+  });
 
   app.get("/", (c) => {
     const r = rootOf(c);
