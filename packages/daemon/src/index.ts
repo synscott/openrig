@@ -473,7 +473,7 @@ export async function startServer(port?: number, options: StartServerOptions = {
         if (!monitorsStarted) {
           monitorsStarted = true;
           contextMonitor.start();
-          wakeRecovery.start();
+          if (startupReady) wakeRecovery.start();
           // PL-004 Phase C: start watchdog scheduler. Joins the supervision
           // tree post-bind so the HTTP surface is ready before the first
           // tick (matches contextMonitor pattern).
@@ -537,6 +537,7 @@ export async function startServer(port?: number, options: StartServerOptions = {
     if (stopping) throw new Error("daemon startup cancelled");
     startupComplete = true;
     startupReady = true;
+    if (requiresWindowsControl && monitorsStarted) wakeRecovery.start();
     // Preserve the existing single-server return; signals drain all owned binds.
     return servers[guestPort !== undefined ? 1 : 0]!;
   } catch (error) {

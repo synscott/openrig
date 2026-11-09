@@ -1450,7 +1450,6 @@ export class TmuxAdapter {
         if (options?.beforeKeys) await options.beforeKeys();
       };
       await check();
-      beforeWrite(); beforeInput?.();
       let result = await this.sendKeysUnchecked(pane, keys, () => { beforeWrite(); beforeInput?.(); });
       // A read-only client stops send-keys but not load-buffer/paste-buffer (#2090). A lone submit key goes as its
       // carriage return through the unbracketed paste, once the same checks pass again, so input that changed in

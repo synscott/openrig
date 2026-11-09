@@ -242,7 +242,11 @@ export class NodeLauncher {
       catch { return { ok: false, code: "native_creation_journal_failed", message: "Could not record the creation attempt; no creation was dispatched." }; }
     }
     let tmuxResult: TmuxCreationResult;
-    try { tmuxResult = opts?.keepPane ? await this.takeOverPane(sessionName, opts.keepPane, sessionCwd, openRigEnv, node.id) : await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv, nativeContext); }
+    try {
+      if (opts?.keepPane) tmuxResult = await this.takeOverPane(sessionName, opts.keepPane, sessionCwd, openRigEnv, node.id);
+      else if (nativeContext) tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv, nativeContext);
+      else tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
+    }
     catch (error) {
       if (!nativeContext) throw error;
       tmuxResult = { ok: false, code: "native_create_unknown", message: "Creation completion is unknown; no retry or name cleanup was attempted.", creationOutcome: "unknown" };

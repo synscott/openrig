@@ -419,7 +419,8 @@ export class ClaudeManagedLaunch {
         const forwardedNames = [...inherited, ...seatKeys.filter(key => !inherited.includes(key))]
           .filter(key => !(key in identity) && !(key in publicEnv));
         const terminalNames = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY"];
-        return renderWindowsManagedLaunch(context.executable, args, cwd, { ...context.env, ...publicEnv, ...identity, ...launchEnv }, [...forwardedNames, ...terminalNames, ...(loadsCorePlugin ? [SEAT_PROJECT_DIR_ENV, SEAT_NODE_ENV] : [])]);
+        return renderWindowsManagedLaunch(wrapper[0] ?? context.executable,
+          wrapper.length ? [...wrapper.slice(1), context.executable, ...args] : args, cwd, { ...context.env, ...publicEnv, ...identity, ...launchEnv }, [...forwardedNames, ...terminalNames, ...(loadsCorePlugin ? [SEAT_PROJECT_DIR_ENV, SEAT_NODE_ENV] : [])]);
       }
       if (token?.ref.kind === "api-key") this.seatTokenLaunch(target.nodeId, { ref: token.ref, accountHome: target.accountHome });
       const launch = Object.entries(launchEnv).filter(([key]) => !credentialKeys.includes(key)).map(([key, value]) => `export ${shellQuote(`${key}=${value}`)}`);
