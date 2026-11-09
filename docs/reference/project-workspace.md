@@ -331,3 +331,50 @@ If Project shows a mission discovery warning:
 
 No daemon restart is required for most config reads. Restart when changing
 startup-time roots such as `files.allowlist` or progress scan roots.
+
+## Read the Projects work report
+
+The GUI Projects page and TUI Projects mission view read existing authored work,
+queue history and linked evidence. They do not dispatch agents. Select a catalog
+project before opening a mission. The selected ID and canonical root travel with
+subsequent reads; a changed root requires a new selection.
+
+Done, In flight and Left to do partition the known countable inventory. Authored
+unqueued work is included. Rollup parents and PR references do not add work units.
+Explicit handoff lineage joins attempts; titles never establish identity. Duplicate
+or unresolved identities remain visible in source coverage rather than inflating
+unique totals. Done reports sourced completion. Acceptance and integration have
+separate evidence and can remain unknown even for a completed item. The mission
+rollup preserves its authored SPEC status, falling back to mission.yaml
+metadata.status when absent. That rollup status does not classify child work.
+
+Open an item to read its owner, stage, sourced progress, next action, blocker and
+timecard. Recorded command wall time is distinct from continuous effort. Blocked
+lifecycle residence is distinct from unmarked waiting. Missing evidence remains
+unknown. Concurrent intervals are unioned, and shared intervals without unique
+task attribution are not allocated to task totals. Refresh reads a new snapshot;
+the report displays its observation time and source hashes/modification times.
+
+### Associate a mission's legacy queue project
+
+A project catalog entry and queue `project:` tag are different authorities. When
+an existing mission deliberately retains an older queue project ID, declare the
+bounded association in that mission's `mission.yaml`:
+
+```yaml
+reporting:
+  queue_association:
+    mission_id: APP.99.0.1
+    legacy_project_ids: [old-project]
+```
+
+The mission ID must match a unique canonical authored mission inside the selected
+project root. A row must match both that mission and one declared project ID.
+Neighboring missions, conflicting tags and rows without project tags are not
+admitted through this field. The report retains original tags and shows the
+association source as a warning. This field changes report membership only; it
+does not retag queue history or change another mission's execution view.
+
+Unavailable sources and unmatched queue records remain browsable with explicit
+coverage. Whole-inventory totals describe known unique units, not a claim that
+unclassified sources have been resolved.

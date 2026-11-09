@@ -1,3 +1,4 @@
+import { parseProjectWorkReport } from "@openrig/daemon/project-report";
 import type { PageRead } from "./page-read.js";
 import type { ProjectSelection } from "./types.js";
 // The TUI's ONLY daemon surface — thin typed fetch wrappers over the §4.A
@@ -338,6 +339,9 @@ export class DaemonClient {
   projects() { return this.get("/api/scopes/projects"); }
   private projectQuery(project?: ProjectSelection | null): string {
     return project ? `&project=${encodeURIComponent(project.id)}&projectRoot=${encodeURIComponent(project.root)}` : "";
+  }
+  projectWorkReport(project: ProjectSelection, mission?: string | null) {
+    return this.get(`/api/scopes/report?${this.projectQuery(project).slice(1)}${mission ? `&mission=${encodeURIComponent(mission)}` : ""}`).then(parseProjectWorkReport);
   }
   scopesDetailed(project?: ProjectSelection | null) {
     return this.get(`/api/scopes?detail=1${this.projectQuery(project)}`);

@@ -405,7 +405,7 @@ export interface FleetSnapshot {
    *  seat-effort route. A null report = the read did not answer; never a claim that
    *  no effort exists. */
   seatEffort?: { seatRef: string; report: SeatEffortRead | null } | null;
-  projects?: { catalogPath: string; projects: ProjectEntry[] } | null;
+  projects?: { catalogPath: string; projects: ProjectEntry[]; capabilities?: string[] } | null;
   projectRead?: ProjectSelection | null;
   projectSources?: Record<string, string>;
 
@@ -431,6 +431,7 @@ export interface FleetSnapshot {
   health?: HealthSnapshot;
   /** SCOPES view (d64d2f5c): store-direct mission/slice projections; absent on old daemons (honest-empty). */
   scopes?: MissionScopesSnap[];
+  projectWorkReport?: import("@openrig/daemon/project-report").ProjectWorkReport | null;
   /** EXECUTION view: the daemon's existing derived six-question projection. */
   execution?: ExecutionViewSnap | null;
   /** Mission requested for this execution read. Separate from row presence so

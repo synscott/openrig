@@ -1,3 +1,4 @@
+import { reportContentLines } from "./scopes/report-model.js";
 import { formatRigDisplayName, readRigDisplayLabel } from "@openrig/daemon/rig-display-labels";
 import { helpScreen } from "./commands/help.js";
 import { commandFocusVisible } from "./motion.js";
@@ -1343,6 +1344,16 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
       ? [{ text: `PROJECT ${state.project.id}`, action: { type: "project-source" as const } }, ...wrapDetailLines(errors, contentWidth)]
       : [...identity, listItem("Read current source", { type: "project-source" }), ...wrapDetailLines(errors, contentWidth)] : [];
     if (state.project && (!entry || entry.error)) return [...projectHeader, { text: "Choose a project again or go Back." }];
+    const workReport = snap.projectWorkReport;
+    if (workReport && state.project && !state.scopesMission) return [...projectHeader,
+      { text: `Existing-record work report · as of ${workReport.asOf} · partial source coverage` },
+      ...workReport.missions.map(m => listItem(`${m.mission} · Done ${m.totals.done} / In flight ${m.totals.inFlight} / Left ${m.totals.leftToDo}`, { type: "scopes-mission-open", mission: m.mission })),
+      ...workReport.unmappedQueue.map(row => ({ text: `Unmapped mission: ${row.summary ?? row.qitemId} · ${row.destinationSession} · ${row.state}` })),
+      ...workReport.issues.map(text => ({ text }))];
+    const report = workReport?.missions.find(m => m.mission === state.scopesMission);
+    if (report && !state.scopesSelected && (!state.executionOpen || state.executionOpen.startsWith("report:"))) {
+      return [...projectHeader, ...reportContentLines(report, state.executionOpen?.slice(7) ?? null, state.filter, contentWidth, workReport?.sources ?? [])];
+    }
     if (state.project && !state.scopesMission) return [...projectHeader, { text: "Choose a mission" }, ...(snap.scopes ?? []).map(m => listItem(m.mission + (m.error ? " · source unavailable" : ""), { type: "scopes-mission-open", mission: m.mission })), ...(!snap.scopes?.length && !errors.length ? [{ text: "No missions found in this project." }] : [])];
     // SCOPES owns both levels. Both mission-graph and Explorer slice routes land
     // on the same execution-backed canonical detail; store-direct content is
