@@ -25,6 +25,11 @@ export interface ExecutionViewSnap {
   mission: string;
   derived_at?: string;
   sources: Record<string, unknown>;
+  mission_work?: {
+    state: string; mission: string; basis: string; project_scope: string; derived_at?: string;
+    items: Array<Record<string, unknown>>; terminal_counts: Record<string, number>;
+    unresolved: Array<{ qitem_id: string; basis: string }>;
+  };
   q1_lanes: Array<Record<string, unknown>>;
   q2_sequencing: Array<Record<string, unknown>>;
   q3_care?: Array<Record<string, unknown>>;
@@ -453,6 +458,72 @@ function evidenceDetail(execution: ExecutionViewSnap, slices: SliceFacts[], widt
 
 // ---- overview ----------------------------------------------------------------------
 
+function missionTaskState(item: Record<string, unknown>): string {
+  const state = item["state"];
+  return state === "in-progress" ? "claimed" : state === "pending" || state === "blocked"
+    ? state : `unknown queue state ${str(state)}`;
+}
+
+function missionTaskEvidence(item: Record<string, unknown>): string {
+  const activity = record(item["activity"]);
+  const needs = record(activity["needs_input"]);
+  const status = activity["activity"];
+  const activityText = status === "working" || status === "idle-at-prompt" ? status : "unknown";
+  const inputText = typeof needs["count"] !== "number" ? "unknown"
+    : needs["count"] > 0 ? `${needs["count"]} · ${str(needs["reason"], "reason unknown")}` : "none observed";
+  return `owner activity: ${activityText} · needs input: ${inputText}`;
+}
+
+function missionWorkLines(execution: ExecutionViewSnap, width: number): ContentLine[] {
+  const work = execution.mission_work;
+  if (!work) return wrapDetailLines([{ text: "  MISSION QUEUE · not supplied by this daemon" }], width);
+  if (work.state !== "available") return wrapDetailLines([{ text: `  MISSION QUEUE · unknown: ${work.basis}` }], width);
+  const items = work.items;
+  const counts = ["pending", "in-progress", "blocked"].map(state =>
+    `${items.filter(item => item["state"] === state).length} ${state === "in-progress" ? "claimed" : state}`);
+  const unknown = items.filter(item => !["pending", "in-progress", "blocked"].includes(str(item["state"])));
+  const owners = new Set(items.map(item => item["owner"])).size;
+  const lines = wrapDetailLines([{ text: `  MISSION QUEUE · ${counts.join(" · ")}${unknown.length ? ` · ${unknown.length} unknown state` : ""}` },
+    { text: `  ${items.length} mission tasks · ${owners} distinct owner${owners === 1 ? "" : "s"} · separate from slice outcomes` }], width);
+  if (work.project_scope.startsWith("legacy")) lines.push(...wrapDetailLines([{ text: `  ${work.project_scope}` }], width));
+  for (const item of items.slice(0, 3)) {
+    lines.push(semanticAction([{ text: `  ${missionTaskState(item)} · ${str(item["owner"])} · ${str(item["summary"], "summary not supplied")}`, token: "bright" }],
+      open(`mission-work:${str(item["qitem_id"])}`), width));
+    lines.push(...wrapDetailLines([{ text: `    ${missionTaskEvidence(item)}${item["blocked_on"] ? ` · waits on ${str(item["blocked_on"])}` : ""}` }], width));
+  }
+  if (items.length > 3) lines.push(listItem(`All ${items.length} mission tasks`, open("mission-work:all")));
+  if (!items.length) lines.push(...wrapDetailLines([{ text: work.unresolved.length
+    ? "  No resolved mission-only tasks; binding coverage incomplete."
+    : "  No open mission tasks in this read; this is not delivery/readiness evidence." }], width));
+  const closed = Object.entries(work.terminal_counts).filter(([, count]) => count > 0);
+  if (closed.length) lines.push(...wrapDetailLines([{ text: `  Closed queue rows: ${closed.map(([state, count]) => `${count} ${state}`).join(" · ")} · not outcome proof` }], width));
+  if (work.unresolved.length) lines.push(...wrapDetailLines([listItem(`${work.unresolved.length} unresolved bindings · coverage incomplete`, open("mission-work:all"))], width));
+  return lines;
+}
+
+function missionWorkDetail(execution: ExecutionViewSnap, key: string, width: number): ContentLine[] | null {
+  const work = execution.mission_work;
+  if (!work) return null;
+  if (key === "mission-work:all") return wrapDetailLines([{ text: `${execution.mission} · mission queue evidence` },
+    ...wrapDetailLines([{ text: work.basis }, { text: work.project_scope }], width),
+    ...work.items.map(item => listItem(`${str(item["qitem_id"])} · ${missionTaskState(item)} · ${str(item["owner"])}`, open(`mission-work:${str(item["qitem_id"])}`))),
+    ...work.unresolved.flatMap(item => wrapDetailLines([{ text: `${item.qitem_id}: ${item.basis}` }], width)), back()], width);
+  const item = work.items.find(item => `mission-work:${str(item["qitem_id"])}` === key);
+  if (!item) return null;
+  return wrapDetailLines([...detailPage({ text: `mission task ${str(item["qitem_id"])}` }, [{ title: "queue source", fields: [
+    { label: "qitem", value: str(item["qitem_id"]) }, { label: "mission", value: str(item["mission"]) },
+    { label: "queue state", value: str(item["state"]) }, { label: "owner", value: str(item["owner"]) },
+    { label: "summary", value: str(item["summary"], "not supplied") },
+    { label: "blocked on", value: str(item["blocked_on"], "not recorded") },
+    { label: "claimed", value: str(item["claimed_at"], "not recorded") },
+    { label: "pickup", value: str(record(item["pickup"])["state"], "unknown") },
+    { label: "activity", value: missionTaskEvidence(item) },
+    { label: "binding", value: str(item["binding_basis"]) },
+    { label: "scope", value: work.project_scope },
+    { label: "source", value: `queue item ${str(record(item["source"])["qitem_id"])} · read ${str(work.derived_at)}` },
+  ] }]), back()], width);
+}
+
 function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionScopesSnap[] | undefined, width: number, timeZone = DEFAULT_TIME_ZONE): ContentLine[] {
   const slices = sliceFacts(execution, scopes);
   const live = slices.filter(slice => stateWord(slice) === "working").length;
@@ -485,7 +556,12 @@ function overviewLines(execution: ExecutionViewSnap, scopes: readonly MissionSco
     { text: `${slices.length} slice${slices.length === 1 ? "" : "s"}`, token: "bright" },
   ], width)];
 
-  lines.push(fact("NOW", nowText, active.length ? "ok" : "dim"));
+  const missionItems = execution.mission_work?.state === "available" ? execution.mission_work.items : [];
+  const firstMission = missionItems.find(item => item["state"] === "in-progress")
+    ?? missionItems.find(item => item["state"] === "blocked") ?? missionItems[0];
+  const missionNow = firstMission ? `${missionItems.length} mission task${missionItems.length === 1 ? "" : "s"} · ${missionTaskState(firstMission)} · ${str(firstMission["owner"])}` : null;
+  lines.push(fact("NOW", missionNow ? (active.length ? `${active.length} open slice work · ${missionNow}` : missionNow) : nowText, active.length ? "ok" : "dim"));
+  lines.push(...missionWorkLines(execution, width));
   if (active.length) {
     const first = active[0]!;
     const detail = problemText(first) ?? str(first.work[0]?.["summary"], "Open the slice for queue and activity evidence");
@@ -809,7 +885,9 @@ export function executionContentLines(
   }
   if (opened) {
     const slices = sliceFacts(execution, scopes);
-    const page = opened.startsWith("workflow:") || opened.startsWith("packet:")
+    const page = opened.startsWith("mission-work:")
+      ? missionWorkDetail(execution, opened, width)
+      : opened.startsWith("workflow:") || opened.startsWith("packet:")
       ? workflowDetail(execution, opened, width, timeZone)
       : opened === "sources"
       ? sourcesDetail(execution, timeZone, width)
