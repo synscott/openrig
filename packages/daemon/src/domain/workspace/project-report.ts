@@ -151,7 +151,7 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
           } catch (error) { sourceGap(dir, `Acceptance source unavailable: ${error instanceof Error ? error.message : String(error)}`); }
         }
         const owned = readOwnedWorkSources({ dir: canonicalDir, read: file => read(withinMission(file, missionDir)) });
-        node.progress = owned.progress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
+        node.progress = owned.progress; node.recordedProgress = owned.recordedProgress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
         owned.issues.forEach(reason => sourceGap(canonicalDir, reason));
         ownedSources.set(key, owned); nodeDirectories.set(key, canonicalDir);
         nodes.push(node);
@@ -164,7 +164,7 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
             acceptance: unknownReportFact("Authored source is unreadable"), integration: unknownReportFact("No revision-bound integration evidence") };
           try {
             const owned = readOwnedWorkSources({ dir: canonicalDir, read: file => read(withinMission(file, missionDir)) });
-            node.progress = owned.progress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
+            node.progress = owned.progress; node.recordedProgress = owned.recordedProgress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
             ownedSources.set(key, owned); nodeDirectories.set(key, canonicalDir);
             owned.issues.forEach(reason => sourceGap(canonicalDir, reason));
           } catch (error) { sourceGap(canonicalDir, `Owned evidence unavailable: ${error instanceof Error ? error.message : String(error)}`); }

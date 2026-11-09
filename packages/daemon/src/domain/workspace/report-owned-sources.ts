@@ -1,13 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parse } from "yaml";
+import { isPristineScaffoldSection } from "../scope/scaffold-placeholder.js";
 import type { ReportEvidence } from "./report-projection.js";
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
-export function readOwnedWorkSources(input: { dir: string; read: (file: string) => string }): { refs: string[]; progress: string | undefined; nextAction: string | null; evidence: ReportEvidence[]; issues: string[] } {
+export function readOwnedWorkSources(input: { dir: string; read: (file: string) => string }): { refs: string[]; progress: string | undefined; recordedProgress: boolean; nextAction: string | null; evidence: ReportEvidence[]; issues: string[] } {
   const refs: string[] = [], evidence: ReportEvidence[] = [], issues: string[] = [];
   let progress: string | undefined;
+  let recordedProgress = false;
   let dispositionProgress: string | undefined;
   let dispositionAt = Number.NEGATIVE_INFINITY;
   let nextAction: string | null = null;
@@ -30,11 +32,17 @@ export function readOwnedWorkSources(input: { dir: string; read: (file: string) 
         const canonicalRelative = path.relative(fs.realpathSync(input.dir), fs.realpathSync(source));
         if (canonicalRelative === ".." || canonicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(canonicalRelative)) throw new Error("Declared progress escapes its canonical work directory");
         const text = capture(source, "Declared progress source");
+        let inSections = false;
+        const body = text.split(/\r?\n/).filter(line => {
+          if (/^##\s/.test(line)) inSections = true;
+          return !/^#{1,6}\s/.test(line) && (inSections || !/^>/.test(line));
+        }).join("\n").trim();
+        recordedProgress = !!body && !isPristineScaffoldSection(body);
         progress = `${text}\nSource: ${source} · modified ${fs.statSync(source).mtime.toISOString()}`;
       }
     } catch (error) { issues.push(`${manifestPath}: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  if (!fs.existsSync(input.dir)) return { refs, progress, nextAction, evidence, issues };
+  if (!fs.existsSync(input.dir)) return { refs, progress, recordedProgress, nextAction, evidence, issues };
   const files = fs.readdirSync(input.dir, { withFileTypes: true }).filter(entry => entry.isFile()).sort((a, b) => a.name.localeCompare(b.name));
   if (files.length > 512) issues.push(`${input.dir}: owned source scan limited to first 512 files`);
   for (const file of files.slice(0, 512)) {
@@ -80,5 +88,5 @@ export function readOwnedWorkSources(input: { dir: string; read: (file: string) 
       }
     } catch (error) { issues.push(`${target}: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  return { refs, progress: progress ?? dispositionProgress, nextAction, evidence, issues };
+  return { refs, progress: progress ?? dispositionProgress, recordedProgress, nextAction, evidence, issues };
 }

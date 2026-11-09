@@ -348,7 +348,9 @@ evidence paths can identify potential work but do not alone prove identity.
 Ambiguous associations stay in coverage instead of creating duplicate units. Duplicate
 or unresolved identities remain visible in source coverage rather than inflating
 unique totals. An authored unstarted status that conflicts with a work stage, declared progress,
-or queue history stays unresolved with a warning. Done reports sourced completion. Acceptance and integration have
+or queue history stays unresolved with a warning. Untouched generated progress
+headings and bracketed instructions, and the scaffold default stage wip, do not
+establish execution. Done reports sourced completion. Acceptance and integration have
 separate evidence and can remain unknown even for a completed item. The mission
 rollup preserves its authored SPEC status, falling back to mission.yaml
 metadata.status when absent. That rollup status does not classify child work.

@@ -85,8 +85,8 @@ describe("Projects exact declarations and classification", () => {
     expect(report.items.find(item => item.key === "conflict")?.warnings).toContain("Authored status in-progress conflicts with stage done; status classifies execution");
   });
 
-  it.each(["wip", "recorded-progress"])("keeps placeholder with %s evidence unresolved instead of unstarted", evidence => {
-    const placeholder = { ...node("placeholder", "placeholder"), ...(evidence === "wip" ? { stage: "wip" } : { progress: "Latest recorded work", evidence: [{ source: "PROGRESS.md", label: "Declared progress source", at: asOf }] }) };
+  it.each(["in-progress", "recorded-progress"])("keeps placeholder with %s evidence unresolved instead of unstarted", evidence => {
+    const placeholder = { ...node("placeholder", "placeholder"), ...(evidence === "in-progress" ? { stage: "in-progress" } : { progress: "Latest recorded work", recordedProgress: true, evidence: [{ source: "PROGRESS.md", label: "Declared progress source", at: asOf }] }) };
     const report = projectMissionReport({ ...base, nodes: [placeholder, node("untouched", "planned")], rows: [] });
     expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, unresolved: 1, total: 2 });
     expect(report.items[0]?.warnings).toContain("Authored unstarted status conflicts with recorded progress, work stage or queue history; completion unresolved");

@@ -7,7 +7,7 @@ export type ReportFact = { kind: "unknown"; reason: string } | { kind: "reported
 export interface ReportNode {
   key: string; id: string | null; parent: string | null; title: string; source: string; aliases: readonly string[];
   status: string | null; stage: string | null; intent: string;
-  progress?: string; evidence?: ReportEvidence[];
+  progress?: string; recordedProgress?: boolean; evidence?: ReportEvidence[];
   counting?: "unit" | "rollup";
   owner: string | null; nextAction: string | null; blocker: string | null;
   acceptance: ReportFact; integration: ReportFact;
@@ -39,7 +39,7 @@ export interface MissionWorkReport {
 
 const buckets = new Map<string, ReportBucket>([
   ...["done", "complete", "completed", "delivered", "shipped"].map((status): [string, ReportBucket] => [status, "done"]),
-  ...["wip", "in-progress", "working", "blocked", "implemented", "verified", "review"].map((status): [string, ReportBucket] => [status, "in_flight"]),
+  ...["in-progress", "working", "blocked", "implemented", "verified", "review"].map((status): [string, ReportBucket] => [status, "in_flight"]),
   ...["planned", "placeholder", "pending"].map((status): [string, ReportBucket] => [status, "left_to_do"]),
 ]);
 const open = new Set(["pending", "in-progress", "blocked"]);
@@ -143,7 +143,7 @@ export function projectMissionReport(input: {
     const declaredBucket = buckets.get(status);
     const accepted = node.acceptance.kind === "reported";
     const stageBucket = node.stage ? buckets.get(node.stage.toLowerCase()) : undefined;
-    const recordedProgress = !!node.progress?.trim() && !!node.evidence?.some(evidence => evidence.label === "Declared progress source");
+    const recordedProgress = node.recordedProgress === true;
     const conflictsWithUnstarted = !active.length && declaredBucket === "left_to_do" && (stageBucket === "in_flight" || recordedProgress || rows.length > 0);
     const bucket = active.length ? "in_flight" : accepted ? "done" : conflictsWithUnstarted ? "unresolved" : declaredBucket ?? "unresolved";
     const warnings: string[] = [];

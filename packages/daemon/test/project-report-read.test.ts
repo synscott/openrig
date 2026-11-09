@@ -150,6 +150,23 @@ describe("Projects mission rollup provenance", () => {
 });
 
 describe("Projects canonical owned sources", () => {
+  it("keeps an untouched real CLI scaffold Left, but changed progress and queue history are execution evidence", async () => {
+    const templates = await import("../../cli/src/lib/scope/templates.js");
+    const spec = templates.renderSliceTemplate("placeholder", { id: "APP.99.0.1.2", slice_number: "02", slug: "fresh", mission: "extract", title: "Fresh", created_date: "2026-01-01" });
+    const progress = templates.renderSliceProgressTemplate("Fresh");
+    file("missions/extract/slices/02-fresh/SPEC.md", spec);
+    file("missions/extract/slices/02-fresh/slice.yaml", "kind: slice\ncomposition:\n  slice_markdown:\n    progress: PROGRESS.md\n");
+    file("missions/extract/slices/02-fresh/PROGRESS.md", progress);
+    const item = () => readProjectWorkReport({ project: project(), queue, asOf: at }).missions[0]?.items.find(item => item.key.endsWith("02-fresh"));
+    expect(item()?.authoredStatus).toBe("placeholder"); expect(item()?.stage).toBe("wip");
+    expect(item()?.bucket).toBe("left_to_do");
+    file("missions/extract/slices/02-fresh/PROGRESS.md", progress + "\nA bounded implementation check failed and was repaired.\n");
+    expect(item()?.bucket).toBe("unresolved"); expect(item()?.acceptance.kind).toBe("unknown");
+    file("missions/extract/slices/02-fresh/PROGRESS.md", progress);
+    db.prepare("UPDATE queue_items SET tags = ?, state = 'done' WHERE qitem_id = 'legacy'").run(JSON.stringify(["project:old", "mission:APP.99.0.1", "slice:APP.99.0.1.2"]));
+    expect(item()?.bucket).toBe("unresolved"); expect(item()?.acceptance.kind).toBe("unknown");
+  });
+
   it("includes direct slice locations without a standard document and reads their measured commands", () => {
     file("missions/extract/slices/02-source-only/records.json", JSON.stringify([{ started_at: "2025-12-31T23:00:00Z", ended_at: "2025-12-31T23:00:03Z", label: "actual owner check", exit: 1 }]));
     const report = readProjectWorkReport({ project: project(), queue: undefined, asOf: at });
