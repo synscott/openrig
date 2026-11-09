@@ -1,6 +1,7 @@
 import { parseProjectWorkReport, parseReportProjects } from "../src/domain/workspace/report-contract.js";
 import { describe, expect, it } from "vitest";
 import { parseReportAssociation, reportMembership } from "../src/domain/workspace/report-association.js";
+import { parseReportWorkDirectories } from "../src/domain/workspace/report-work-directories.js";
 
 const source = "/fixture/missions/extract/mission.yaml#reporting.queue_association";
 const manifest = { reporting: { queue_association: { mission_id: "APP.99.0.1", legacy_project_ids: ["old"] } } };
@@ -31,6 +32,15 @@ describe("Projects mission queue association", () => {
     const invalid = { reporting: { queue_association: { mission_id: "APP.99.0.1", legacy_project_ids: ["old,current"] } } };
     expect(parseReportAssociation(invalid, "APP.99.0.1", source).kind).toBe("invalid");
     expect(parseReportAssociation({ reporting: { queue_association: { ...manifest.reporting.queue_association, include_all: true } } }, "APP.99.0.1", source).kind).toBe("invalid");
+  });
+});
+
+describe("Projects explicit work directories", () => {
+  it("keeps typed work/container/artifacts references and rejects ambiguous or escaping entries", () => {
+    expect(parseReportWorkDirectories({ reporting: { work_directories: [{ ref: "delivery", disposition: "work" }, { ref: "repairs", disposition: "container" }, { ref: "history", disposition: "artifacts" }] } })).toEqual({ entries: [{ ref: "delivery", disposition: "work" }, { ref: "repairs", disposition: "container" }, { ref: "history", disposition: "artifacts" }], issues: [] });
+    const invalid = parseReportWorkDirectories({ reporting: { work_directories: [{ ref: "../neighbor", disposition: "work" }, { ref: "same", disposition: "work" }, { ref: "same", disposition: "artifacts" }] } });
+    expect(invalid.entries).toEqual([]);
+    expect(invalid.issues).toHaveLength(2);
   });
 });
 

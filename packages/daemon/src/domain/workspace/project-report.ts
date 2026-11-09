@@ -8,6 +8,8 @@ import { insideProject } from "./project-read.js";
 import { NODE_FILE_PRECEDENCE } from "../scope/node-file.js";
 import { readSliceReadiness } from "../proof/judgments.js";
 import { parseReportAssociation, reportTags } from "./report-association.js";
+import { parseReportWorkDirectories } from "./report-work-directories.js";
+import { readOwnedWorkSources } from "./report-owned-sources.js";
 import { buildReportTimecard, readCommandIntervals, type ReportInterval } from "./report-timecard.js";
 import { projectMissionReport, recordedPrIntegration, unknownReportFact, type MissionWorkReport, type ReportDiagnostic, type ReportNode, type ReportQueueRecord } from "./report-projection.js";
 
@@ -73,6 +75,8 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
   if (!queue) issues.push("Queue source unavailable; authored inventory remains readable");
   if (allQueue.length > 10000) issues.push("Queue snapshot limited to newest 10000 rows; older membership and lineage may be missing");
   const queueRows = allQueue.slice(0, 10000);
+  const queueRevision = createHash("sha256").update(JSON.stringify(queueRows)).digest("hex");
+  const histories = new Map<string, ReturnType<NonNullable<typeof queue>["transitionLog"]["listForQitem"]>>();
   const missionNames = dirs(project.missionsRoot);
   const missionClaims = new Map<string, string[]>();
   const missionHeaders = new Map<string,
@@ -94,6 +98,8 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
     const diagnostics: ReportDiagnostic[] = [];
     const sourceGap = (source: string, reason: string) => diagnostics.push({ kind: "source", key: source, source, reason, queue: null });
     const nodes: ReportNode[] = [];
+    const ownedSources = new Map<string, ReturnType<typeof readOwnedWorkSources>>();
+    const nodeDirectories = new Map<string, string>();
     let missionId: string | null = null;
     let manifest: unknown = {};
     const header = missionHeaders.get(mission);
@@ -135,48 +141,116 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
         const fm = frontmatter(text);
         const acceptance = unknownReportFact("No current attributed acceptance judgment");
         const node: ReportNode = { key, id: string(fm.id), parent, source: source ?? dir, title: string(fm.title) ?? text.match(/^#\s+(.+)$/m)?.[1] ?? path.basename(dir),
-          aliases: [path.basename(dir)], status: string(fm.status), stage: string(fm.stage), intent: string(fm.intent) ?? "", owner: string(fm.owner),
+          aliases: [path.basename(dir), canonicalDir], status: string(fm.status), stage: string(fm.stage), intent: string(fm.intent) ?? "", owner: string(fm.owner),
           nextAction: string(fm.next_action), blocker: string(fm.blocker), acceptance, integration: unknownReportFact("Integration not established by a revision-bound receipt") };
+        let proofConfigured = false;
         if (source && path.basename(path.dirname(dir)) === "slices") {
           try {
             const readiness = readSliceReadiness(dir, undefined, undefined, project.root, file => { if (fs.existsSync(file)) read(file); });
+            proofConfigured = readiness.configured;
             if (readiness.state === "ready") node.acceptance = { kind: "reported", value: "Current proof items accepted", evidence: readiness.items.flatMap(item => item.judgment ? [{ source: `${dir}/proof/judgments/${String(item.judgment.sequence).padStart(8, "0")}.md`, label: item.judgment.reason, at: item.judgment.at }] : []) };
             if (readiness.issues.length) sourceGap(dir, readiness.issues.join("; "));
-          } catch (error) { sourceGap(dir, `Acceptance source unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+          } catch (error) { proofConfigured = true; sourceGap(dir, `Acceptance source unavailable: ${error instanceof Error ? error.message : String(error)}`); }
         }
+        const owned = readOwnedWorkSources({ dir: canonicalDir, read: file => read(withinMission(file, missionDir)) });
+        node.progress = owned.progress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
+        if (!proofConfigured && owned.acceptance) node.acceptance = owned.acceptance;
+        owned.issues.forEach(reason => sourceGap(canonicalDir, reason));
+        ownedSources.set(key, owned); nodeDirectories.set(key, canonicalDir);
         nodes.push(node);
-        if (!source) sourceGap(dir, "Declared work has no authored source; status and details unknown");
+        if (!source) sourceGap(dir, "Canonical work location has no standard authored source; completion unknown");
         for (const child of dirs(path.join(dir, "sub-slices"))) addNode(path.join(dir, "sub-slices", child), key, false);
       } catch (error) {
         sourceGap(source ?? dir, error instanceof Error ? error.message : String(error));
-        if (isDeclared) nodes.push({ key, id: null, parent, title: path.basename(dir), source: source ?? dir, aliases: [path.basename(dir)], status: null, stage: null, intent: "", owner: null, nextAction: null, blocker: null,
-          acceptance: unknownReportFact("Authored source is unreadable"), integration: unknownReportFact("No revision-bound integration evidence") });
+        if (isDeclared) {
+          const node: ReportNode = { key, id: null, parent, title: path.basename(dir), source: source ?? dir, aliases: [path.basename(dir), canonicalDir], status: null, stage: null, intent: "", owner: null, nextAction: null, blocker: null,
+            acceptance: unknownReportFact("Authored source is unreadable"), integration: unknownReportFact("No revision-bound integration evidence") };
+          try {
+            const owned = readOwnedWorkSources({ dir: canonicalDir, read: file => read(withinMission(file, missionDir)) });
+            node.progress = owned.progress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
+            ownedSources.set(key, owned); nodeDirectories.set(key, canonicalDir);
+            owned.issues.forEach(reason => sourceGap(canonicalDir, reason));
+          } catch (error) { sourceGap(canonicalDir, `Owned evidence unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+          nodes.push(node);
+        }
       }
     };
     const sliceRoot = path.join(missionDir, "slices");
     const children = new Set([...dirs(sliceRoot).map(name => path.join(sliceRoot, name)), ...declared]);
-    for (const child of [...children].sort()) addNode(child, null, declared.has(child));
+    for (const child of [...children].sort()) addNode(child, null, true);
+    const directoryConfig = parseReportWorkDirectories(manifest);
+    directoryConfig.issues.forEach(reason => sourceGap(manifestPath, reason));
+    const directories: Array<{ dir: string; ref: string; disposition: "work" | "container" | "artifacts" }> = [];
+    for (const entry of directoryConfig.entries) {
+      try { directories.push({ ...entry, dir: withinMission(path.resolve(missionDir, entry.ref), missionDir) }); }
+      catch (error) { sourceGap(manifestPath, `${entry.ref}: ${error instanceof Error ? error.message : String(error)}`); }
+    }
+    const validDirectories = directories.filter(entry => {
+      if (directories.filter(other => other.dir === entry.dir).length > 1) { sourceGap(manifestPath, `Canonical work directory duplicate/conflict: ${entry.ref}`); return false; }
+      if (entry.disposition === "work" && directories.some(other => other !== entry && other.disposition === "work" && entry.dir.startsWith(`${other.dir}${path.sep}`))) { sourceGap(manifestPath, `Overlapping work directory identity: ${entry.ref}`); return false; }
+      if (entry.disposition !== "work" && [...nodeDirectories.values()].includes(entry.dir)) { sourceGap(manifestPath, `Directory disposition conflicts with canonical work location: ${entry.ref}`); return false; }
+      if (entry.disposition === "work" && directories.some(other => other.disposition === "artifacts" && entry.dir.startsWith(`${other.dir}${path.sep}`))) { sourceGap(manifestPath, `Work conflicts with artifact directory disposition: ${entry.ref}`); return false; }
+      return true;
+    });
+    for (const entry of validDirectories.filter(entry => entry.disposition === "container")) {
+      const key = path.relative(project.root, entry.dir);
+      nodes.push({ key, id: null, parent: null, title: entry.ref, source: `${manifestPath}#reporting.work_directories`, aliases: [entry.ref, entry.dir], counting: "rollup", status: null, stage: null, intent: "Declared source container; not counted", owner: null, nextAction: null, blocker: null, acceptance: unknownReportFact("Container is not a delivered work unit"), integration: unknownReportFact("Container has no integration verdict") });
+      nodeDirectories.set(key, entry.dir);
+    }
+    for (const entry of validDirectories) {
+      if (entry.disposition === "work") {
+        const container = validDirectories.filter(other => other.disposition === "container" && entry.dir.startsWith(`${other.dir}${path.sep}`)).sort((a, b) => b.dir.length - a.dir.length)[0];
+        addNode(entry.dir, container ? path.relative(project.root, container.dir) : null, true);
+        const node = nodes.find(node => node.key === path.relative(project.root, entry.dir));
+        if (node) node.evidence = [...(node.evidence ?? []), { source: `${manifestPath}#reporting.work_directories`, label: `Declared work directory ${entry.ref}`, at: fs.statSync(manifestPath).mtime.toISOString() }];
+      }
+      else sourceGap(entry.dir, `Declared ${entry.disposition}; not a countable work unit (${manifestPath}#reporting.work_directories)`);
+    }
     for (const child of dirs(missionDir).filter(name => !["slices", "proof", "closed"].includes(name))) {
       const dir = path.join(missionDir, child);
       if (children.has(dir)) continue;
+      if (validDirectories.some(entry => entry.dir === fs.realpathSync(dir))) continue;
       if (nodeFile(dir)) addNode(dir, null, false);
-      else sourceGap(dir, "Additional source directory is not declared as an authored work node");
+      else sourceGap(dir, "Unresolved directory candidate: declare work/container/artifacts disposition; not silently counted");
     }
     if (!nodes.length && (missionSource || (object(manifest) && manifest.kind === "mission"))) addNode(missionDir, null, true);
     const aliases = new Set([mission, ...(missionId ? [missionId] : [])]);
     const candidates = queueRows.filter(row => [...reportTags(row.tags)].some(tag => tag.startsWith("mission:") && aliases.has(tag.slice(8))));
+    const selectedIds = new Set(candidates.map(row => row.qitemId));
+    const queueById = new Map(queueRows.map(row => [row.qitemId, row]));
+    for (let index = 0; index < candidates.length && index < 10000; index++) {
+      for (const ref of [candidates[index]?.handedOffFrom, ...(candidates[index]?.chainOfRecord ?? [])]) {
+        if (!ref || selectedIds.has(ref)) continue;
+        let previous = queueById.get(ref);
+        if (!previous && queue) {
+          try { const row = queue.getById(ref); if (row) previous = mapQueue(row); }
+          catch (error) { sourceGap(`queue:${ref}`, `Referenced predecessor unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+        }
+        if (previous) { candidates.push(previous); selectedIds.add(ref); }
+      }
+    }
+    const evidenceCandidates = new Map<string, string[]>();
+    for (const row of candidates) {
+      const refs = [row.evidenceRef, ...[...row.body.matchAll(/\bcanonical[:=]?\s+(\/[^\s;,]+)/gi)].map(match => match[1])].filter((ref): ref is string => !!ref && path.isAbsolute(ref));
+      for (const [key, dir] of nodeDirectories) if (refs.some(ref => ref === dir || ref.startsWith(`${dir}${path.sep}`))) evidenceCandidates.set(row.qitemId, [...(evidenceCandidates.get(row.qitemId) ?? []), key]);
+    }
     const emptyTimecard = buildReportTimecard({ commands: [], transitions: [], asOf });
     const manifestStatus = object(manifest) && object(manifest.metadata) ? string(manifest.metadata.status) : null;
     const missionStatus = (header?.kind === "readable" ? header.status : null) ?? manifestStatus;
-    const report = projectMissionReport({ projectId: project.id, mission, missionId: uniqueMissionId, missionStatus, asOf, association, nodes, rows: candidates, emptyTimecard, diagnostics });
-    const timecardFor = (attempts: readonly ReportQueueRecord[]) => {
+    const report = projectMissionReport({ projectId: project.id, mission, missionId: uniqueMissionId, missionStatus, asOf, association, nodes, rows: candidates, emptyTimecard, diagnostics, evidenceCandidates });
+    const timecardFor = (attempts: readonly ReportQueueRecord[], ownedRefs: readonly string[] = [], context?: string) => {
       const commands: ReportInterval[] = [];
       const timingIssues: string[] = [];
       const integrations: NonNullable<ReturnType<typeof recordedPrIntegration>>[] = [];
-      const primaryEvidence = new Set(attempts.flatMap(row => row.evidenceRef ? [path.resolve(missionDir, row.evidenceRef)] : []));
+      const resolveRef = (ref: string): string | null => {
+        if (path.isAbsolute(ref)) return ref;
+        if (context) return path.resolve(context, ref);
+        timingIssues.push(`${ref}: relative evidence source context unresolved`); return null;
+      };
+      const primaryEvidence = new Set([...ownedRefs, ...attempts.flatMap(row => row.evidenceRef ? [resolveRef(row.evidenceRef)].filter((ref): ref is string => ref !== null) : [])]);
       const refs = attempts.flatMap(row => [row.evidenceRef, ...[...row.body.matchAll(/(?:^|[\s`(])([^\s`<>()[\],;]+\.json)(?=$|[\s`),;])/gm)].map(match => match[1])])
         .filter((ref): ref is string => typeof ref === "string")
-        .map(ref => ({ file: path.isAbsolute(ref) ? ref : path.resolve(missionDir, ref), depth: 0 }));
+        .map(resolveRef).filter((ref): ref is string => ref !== null).concat([...ownedRefs]).map(file => ({ file, depth: 0 }));
       const visited = new Set<string>();
       for (let index = 0; index < refs.length && index < 128; index++) {
         const reference = refs[index];
@@ -213,23 +287,26 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
       }
       if (refs.length > 128) timingIssues.push("Linked source read limited to 128 references; further evidence remains unevaluated");
       const transitions = attempts.flatMap(row => {
-        try { return queue?.transitionLog.listForQitem(row.qitemId) ?? []; }
+        try {
+          const events = histories.get(row.qitemId) ?? queue?.transitionLog.listForQitem(row.qitemId) ?? [];
+          histories.set(row.qitemId, events); return events;
+        }
         catch (error) { timingIssues.push(`queue:${row.qitemId}: lifecycle source unavailable: ${error instanceof Error ? error.message : String(error)}`); return []; }
       });
       integrations.sort((a, b) => (a.evidence[0]?.at ?? "").localeCompare(b.evidence[0]?.at ?? ""));
       return { timecard: buildReportTimecard({ commands, transitions, asOf, issues: timingIssues }), integration: integrations.at(-1) };
     };
     for (const item of report.items) {
-      const evidence = timecardFor(item.attempts); item.timecard = evidence.timecard;
+      const evidence = timecardFor(item.attempts, ownedSources.get(item.key)?.refs, nodeDirectories.get(item.key)); item.timecard = evidence.timecard;
       if (evidence.integration) item.integration = evidence.integration;
     }
     const intervalClaims = new Map<string, Set<string>>();
     for (const item of report.items) for (const command of item.timecard.commands) {
-      const identity = `${command.source}|${command.start}|${command.end}`;
+      const identity = command.identity;
       const owners = intervalClaims.get(identity) ?? new Set<string>(); owners.add(item.key); intervalClaims.set(identity, owners);
     }
     for (const item of report.items) {
-      if (item.timecard.commands.some(command => (intervalClaims.get(`${command.source}|${command.start}|${command.end}`)?.size ?? 0) > 1)) {
+      if (item.timecard.commands.some(command => (intervalClaims.get(command.identity)?.size ?? 0) > 1)) {
         item.timecard.commandTime = { kind: "unknown", reason: "Command evidence is linked to multiple logical work units; unique allocation is not established" };
         item.timecard.byActor = [];
         item.timecard.issues.push("Shared command intervals remain visible but are not allocated to task totals");
@@ -239,9 +316,15 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
     missions.push(report);
   }
   const represented = new Set(missions.flatMap(mission => [...mission.items.flatMap(item => item.attempts.map(row => row.qitemId)), ...mission.diagnostics.flatMap(diagnostic => diagnostic.queue ? [diagnostic.queue.qitemId] : [])]));
-  const unmappedQueue = queueRows.filter(row => reportTags(row.tags).has(`project:${project.id}`) && !represented.has(row.qitemId));
+  const knownMissions = new Set([...missionNames, ...[...missionHeaders.values()].flatMap(header => header.kind === "readable" && header.id ? [header.id] : [])]);
+  const unmappedQueue = queueRows.filter(row => reportTags(row.tags).has(`project:${project.id}`) && !represented.has(row.qitemId) && ![...reportTags(row.tags)].some(tag => tag.startsWith("mission:") && knownMissions.has(tag.slice(8))));
+  for (const mission of missions) {
+    for (const item of mission.items) for (const row of item.attempts) row.body = "";
+    for (const diagnostic of mission.diagnostics) if (diagnostic.queue) diagnostic.queue.body = "";
+  }
+  for (const row of unmappedQueue) row.body = "";
   sources.sort((a, b) => a.path.localeCompare(b.path));
-  const revision = createHash("sha256").update(JSON.stringify({ sources, queue: queueRows.map(row => [row.qitemId, row.tsUpdated, row.state]) })).digest("hex");
+  const revision = createHash("sha256").update(JSON.stringify({ sources, queueRevision, histories: [...histories].sort(([a], [b]) => a.localeCompare(b)) })).digest("hex");
   return { project: { id: project.id, root: project.root, name: project.name }, asOf, revision, missions, sources, issues, unmappedQueue,
     coverage: "partial" };
 }

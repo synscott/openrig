@@ -7,8 +7,8 @@ import { projectReportFixture } from "../twin/project-report-fixture.js";
 
 vi.mock("../src/hooks/useHosts.js", () => ({ useSelectedHostId: () => "local" }));
 afterEach(() => vi.unstubAllGlobals());
-function setup(mode: "normal" | "empty" | "error" = "normal") {
-  let report = structuredClone(projectReportFixture);
+function setup(mode: "normal" | "empty" | "error" = "normal", input = projectReportFixture) {
+  let report = structuredClone(input);
   if (mode === "empty") report.missions = [];
   const calls: Array<{ url: string; method: string }> = [];
   vi.stubGlobal("fetch", vi.fn(async(input: RequestInfo | URL, init?: RequestInit) => {
@@ -51,4 +51,26 @@ describe("Projects work report", () => {
     await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Projects source unavailable (503)"));
     expect(calls.every(call => call.method === "GET")).toBe(true);
   });
+});
+
+
+it("keeps parent context and recorded failure/repair narrative while counting leaves only", async () => {
+  const nested = structuredClone(projectReportFixture);
+  const mission = nested.missions[0]; const first = mission?.items[0]; const second = mission?.items[1];
+  if (!mission || !first || !second) throw new Error("Fixture lacks hierarchy leaves");
+  const parent = { ...first, key: "parent", id: "APP.99.0.P", title: "Parent campaign", parent: null, counting: "rollup" as const, timecard: { ...first.timecard, events: [] } };
+  first.parent = "parent"; second.parent = "parent";
+  first.timecard = { ...first.timecard, events: [{ transitionId: 1, qitemId: "review", at: nested.asOf, state: "in-progress", actor: "reviewer@sample", note: "QA failed" }, { transitionId: 2, qitemId: "review", at: nested.asOf, state: "in-progress", actor: "builder@sample", note: "Repair verified" }] };
+  mission.items = [parent, first, second]; mission.totals = { done: 1, inFlight: 1, leftToDo: 0, unresolved: 0, total: 2 };
+  setup("normal", nested);
+  await screen.findByText("2 known work units");
+  expect(screen.getAllByText("Parent campaign").length).toBe(2);
+  expect(screen.getAllByText("Parent rollup · not counted").length).toBe(2);
+  fireEvent.change(screen.getByLabelText("Filter work"), { target: { value: "Parent campaign" } });
+  expect(screen.getByText("Showing 2 of 2 known work units")).toBeTruthy();
+  const summary = screen.getByText(first.title).closest("summary"); if (!summary) throw new Error("Missing child summary"); fireEvent.click(summary);
+  expect(screen.getAllByText("Within Parent campaign").length).toBe(2);
+  expect(screen.getByText(/reviewer@sample.*QA failed/)).toBeTruthy();
+  expect(screen.getByText(/builder@sample.*Repair verified/)).toBeTruthy();
+  expect(screen.getByText("Done 1 · In flight 1 · Left to do 0")).toBeTruthy();
 });

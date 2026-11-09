@@ -24,11 +24,11 @@ function duration(value: unknown): ReportDuration {
   if (v.kind === "partial" || v.kind === "measured") return { kind: v.kind, reason: text(v.reason), milliseconds: number(v.milliseconds) };
   return invalid();
 }
-function interval(value: unknown): ReportInterval { const v = record(value); return { start: text(v.start), end: text(v.end), actor: nullable(v.actor), source: text(v.source), label: text(v.label), result: text(v.result) }; }
+function interval(value: unknown): ReportInterval { const v = record(value); return { identity: text(v.identity), start: text(v.start), end: text(v.end), actor: nullable(v.actor), source: text(v.source), label: text(v.label), result: text(v.result) }; }
 function timecard(value: unknown): ReportTimecard {
   const v = record(value), effort = record(v.effort);
   if (effort.kind !== "unknown") return invalid();
-  return { commands: list(v.commands, interval), lifecycle: list(v.lifecycle, item => { const row = record(item); return { ...interval(item), state: text(row.state), ongoing: flag(row.ongoing) }; }),
+  return { commands: list(v.commands, interval), events: list(v.events, item => { const row = record(item); return { transitionId: number(row.transitionId), qitemId: text(row.qitemId), at: text(row.at), state: text(row.state), actor: nullable(row.actor), note: nullable(row.note) }; }), lifecycle: list(v.lifecycle, item => { const row = record(item); return { ...interval(item), state: text(row.state), ongoing: flag(row.ongoing) }; }),
     commandTime: duration(v.commandTime), waiting: duration(v.waiting), effort: { kind: "unknown", reason: text(effort.reason) },
     byActor: list(v.byActor, item => { const row = record(item); return { actor: nullable(row.actor), commandMilliseconds: number(row.commandMilliseconds) }; }), issues: list(v.issues, text) };
 }
@@ -39,7 +39,7 @@ function queue(value: unknown): ReportQueueRecord {
 function item(value: unknown): ReportItem {
   const v = record(value);
   if (v.counting !== "unit" && v.counting !== "rollup") return invalid();
-  if (v.bucket !== "done" && v.bucket !== "in_flight" && v.bucket !== "left_to_do") return invalid();
+  if (v.bucket !== "done" && v.bucket !== "in_flight" && v.bucket !== "left_to_do" && v.bucket !== "unresolved") return invalid();
   return { key: text(v.key), id: nullable(v.id), parent: nullable(v.parent), title: text(v.title), source: text(v.source), counting: v.counting, bucket: v.bucket,
     classification: text(v.classification), authoredStatus: nullable(v.authoredStatus), owner: nullable(v.owner), stage: nullable(v.stage), progress: text(v.progress), nextAction: nullable(v.nextAction), blocker: nullable(v.blocker), acceptance: fact(v.acceptance), integration: fact(v.integration), attempts: list(v.attempts, queue), evidence: list(v.evidence, evidence), warnings: list(v.warnings, text), timecard: timecard(v.timecard) };
 }
@@ -50,8 +50,8 @@ function diagnostic(value: unknown): ReportDiagnostic {
   return invalid();
 }
 function totals(value: unknown): ReportTotals {
-  const v = record(value), result = { done: number(v.done), inFlight: number(v.inFlight), leftToDo: number(v.leftToDo), total: number(v.total) };
-  if (result.done + result.inFlight + result.leftToDo !== result.total) return invalid();
+  const v = record(value), result = { done: number(v.done), inFlight: number(v.inFlight), leftToDo: number(v.leftToDo), unresolved: number(v.unresolved), total: number(v.total) };
+  if (result.done + result.inFlight + result.leftToDo + result.unresolved !== result.total) return invalid();
   return result;
 }
 export function parseProjectWorkReport(value: unknown): ProjectWorkReport {

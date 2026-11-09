@@ -180,6 +180,7 @@ describe("V1 — authored-when-present wins at the observable (FR-1)", () => {
       missions: { relx: { authoredStatus: "complete" } },
     });
     const page = mount(<WorkspaceScopePage />);
+    await page.findByTestId("portfolio-open-relx");
     await page.findByRole("region", { name: "Projects work report" });
     expect(await page.findByText("relx · authored status complete")).toBeTruthy();
     page.unmount();

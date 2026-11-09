@@ -11,7 +11,7 @@ const tags = ["mission:APP.99.0.1", "project:current"];
 describe("Projects whole-inventory projection", () => {
   it("counts authored unqueued leaves while excluding rollup parents", () => {
     const report = projectMissionReport({ ...base, nodes: [node("parent", "planned"), node("done", "done", "parent"), node("planned", "planned", "parent")], rows: [] });
-    expect(report.totals).toEqual({ done: 1, inFlight: 0, leftToDo: 1, total: 2 });
+    expect(report.totals).toEqual({ done: 1, inFlight: 0, leftToDo: 1, unresolved: 0, total: 2 });
     expect(report.items.find(item => item.key === "parent")?.counting).toBe("rollup");
     expect(report.items.find(item => item.key === "done")?.acceptance.kind).toBe("unknown");
   });
@@ -21,14 +21,14 @@ describe("Projects whole-inventory projection", () => {
     first.evidenceRef = "https://example.test/pulls/123";
     const next = row("review", "blocked", tags, "source");
     const report = projectMissionReport({ ...base, nodes: [], rows: [first, next] });
-    expect(report.totals).toEqual({ done: 0, inFlight: 1, leftToDo: 0, total: 1 });
+    expect(report.totals).toEqual({ done: 0, inFlight: 1, leftToDo: 0, unresolved: 0, total: 1 });
     expect(report.items[0]?.attempts.map(attempt => attempt.qitemId)).toEqual(["review", "source"]);
     expect(report.items[0]?.integration.kind).toBe("unknown");
   });
 
   it("does not mistake queue closure for accepted or delivered work", () => {
     const report = projectMissionReport({ ...base, nodes: [node("unit", "planned")], rows: [row("terminal", "done", [...tags, "slice:unit"])] });
-    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, total: 1 });
+    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, unresolved: 0, total: 1 });
     expect(report.items[0]?.acceptance).toEqual({ kind: "unknown", reason: "Not judged" });
   });
 
@@ -46,7 +46,7 @@ describe("Projects identity coverage", () => {
     const review = row("review", "done", tags, "origin");
     const publish = row("publish", "done", tags, "origin");
     const report = projectMissionReport({ ...base, nodes: [], rows: [publish, first, review] });
-    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, total: 1 });
+    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 0, unresolved: 1, total: 1 });
     expect(report.items[0]?.attempts.map(attempt => attempt.qitemId)).toEqual(["publish", "review"]);
     expect(report.queueCoverage.excluded).toBe(1);
   });
@@ -56,5 +56,38 @@ describe("Projects identity coverage", () => {
     const report = projectMissionReport({ ...base, nodes: [{ ...node("first-path", "done"), id: "same" }, duplicate], rows: [] });
     expect(report.totals.total).toBe(0);
     expect(report.diagnostics.map(row => row.kind)).toEqual(["source", "source"]);
+  });
+});
+
+
+describe("Projects exact declarations and classification", () => {
+  it("retains tag/body conflicts as ambiguity while accepting aliases of the same identity", () => {
+    const a = { ...node("a", "planned"), aliases: ["alias-a"] };
+    const conflicting = { ...row("conflict", "in-progress", [...tags, "slice:a"]), body: "Slice: b" };
+    const equivalent = { ...row("same", "in-progress", [...tags, "slice:a"]), body: "Slice: alias-a" };
+    const report = projectMissionReport({ ...base, nodes: [a, node("b", "planned")], rows: [conflicting, equivalent] });
+    expect(report.items.find(item => item.key === "a")?.attempts.map(row => row.qitemId)).toEqual(["same"]);
+    expect(report.diagnostics.map(row => [row.key, row.kind])).toEqual([["conflict", "ambiguous_work"]]);
+  });
+
+  it("keeps closed-unverified and unclassified work outside the three primary groups", () => {
+    const report = projectMissionReport({ ...base, nodes: [node("unknown", ""), node("planned", "planned")], rows: [row("closed", "done", tags)] });
+    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, unresolved: 2, total: 3 });
+    expect(report.items.find(item => item.key === "queue:closed")?.classification).toContain("completion unverified");
+  });
+
+  it("classifies attributed accepted proof without inventing integration and warns on conflicting authored stage", () => {
+    const accepted = { ...node("accepted", ""), acceptance: { kind: "reported" as const, value: "Current proof accepted", evidence: [{ source: "proof/judgments/1.md", label: "Judge", at: asOf }] } };
+    const conflict = { ...node("conflict", "in-progress"), stage: "done" };
+    const report = projectMissionReport({ ...base, nodes: [accepted, conflict], rows: [] });
+    expect(report.items.find(item => item.key === "accepted")?.bucket).toBe("done");
+    expect(report.items.find(item => item.key === "accepted")?.integration.kind).toBe("unknown");
+    expect(report.items.find(item => item.key === "conflict")?.warnings).toContain("Authored status in-progress conflicts with stage done; status classifies execution");
+  });
+
+  it("does not add an evidence-linked potential duplicate as a standalone work unit", () => {
+    const report = projectMissionReport({ ...base, nodes: [node("a", "planned")], rows: [row("qa", "done", tags)], evidenceCandidates: new Map([["qa", ["a"]]]) });
+    expect(report.totals.total).toBe(1);
+    expect(report.diagnostics[0]).toMatchObject({ key: "qa", kind: "ambiguous_work" });
   });
 });

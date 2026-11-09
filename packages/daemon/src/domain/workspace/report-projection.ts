@@ -1,12 +1,14 @@
 import { reportMembership, reportTags, type ReportAssociation, type ReportMembership } from "./report-association.js";
 import type { ReportTimecard } from "./report-timecard.js";
 
-export type ReportBucket = "done" | "in_flight" | "left_to_do";
+export type ReportBucket = "done" | "in_flight" | "left_to_do" | "unresolved";
 export interface ReportEvidence { source: string; label: string; at: string | null }
 export type ReportFact = { kind: "unknown"; reason: string } | { kind: "reported"; value: string; evidence: ReportEvidence[] };
 export interface ReportNode {
   key: string; id: string | null; parent: string | null; title: string; source: string; aliases: readonly string[];
   status: string | null; stage: string | null; intent: string;
+  progress?: string; evidence?: ReportEvidence[];
+  counting?: "unit" | "rollup";
   owner: string | null; nextAction: string | null; blocker: string | null;
   acceptance: ReportFact; integration: ReportFact;
 }
@@ -28,7 +30,7 @@ export interface ReportItem {
 export type ReportDiagnostic =
   | { kind: "source"; key: string; reason: string; source: string; queue: null }
   | { kind: "queue_association" | "ambiguous_work"; key: string; reason: string; source: string; queue: ReportQueueRecord; timecard: ReportTimecard };
-export interface ReportTotals { done: number; inFlight: number; leftToDo: number; total: number }
+export interface ReportTotals { done: number; inFlight: number; leftToDo: number; unresolved: number; total: number }
 export interface MissionWorkReport {
   mission: string; missionId: string | null; authoredStatus: string | null; asOf: string; items: ReportItem[];
   totals: ReportTotals; diagnostics: ReportDiagnostic[];
@@ -44,13 +46,14 @@ const open = new Set(["pending", "in-progress", "blocked"]);
 export const unknownReportFact = (reason: string): ReportFact => ({ kind: "unknown", reason });
 
 export function reportTotals(items: readonly ReportItem[]): ReportTotals {
-  const totals: ReportTotals = { done: 0, inFlight: 0, leftToDo: 0, total: 0 };
+  const totals: ReportTotals = { done: 0, inFlight: 0, leftToDo: 0, unresolved: 0, total: 0 };
   for (const item of items) {
     if (item.counting === "rollup") continue;
     totals.total++;
     if (item.bucket === "done") totals.done++;
     else if (item.bucket === "in_flight") totals.inFlight++;
-    else totals.leftToDo++;
+    else if (item.bucket === "left_to_do") totals.leftToDo++;
+    else totals.unresolved++;
   }
   return totals;
 }
@@ -59,6 +62,7 @@ export function projectMissionReport(input: {
   projectId: string; mission: string; missionId: string | null; missionStatus?: string | null; asOf: string;
   association: ReportAssociation; nodes: readonly ReportNode[]; rows: readonly ReportQueueRecord[];
   emptyTimecard: ReportTimecard; diagnostics?: readonly ReportDiagnostic[];
+  evidenceCandidates?: ReadonlyMap<string, readonly string[]>;
 }): MissionWorkReport {
   const diagnostics = [...(input.diagnostics ?? [])];
   const membership = new Map<string, ReportMembership>();
@@ -82,6 +86,8 @@ export function projectMissionReport(input: {
   for (const row of input.rows) {
     for (const previous of [row.handedOffFrom, ...(row.chainOfRecord ?? [])]) {
       if (!previous || !parent.has(previous)) continue;
+      const boundary = [membership.get(row.qitemId), membership.get(previous)];
+      if (boundary.some(match => match?.kind === "excluded" && match.reason !== "project_missing" && match.reason !== "mission_missing")) continue;
       const left = root(row.qitemId), right = root(previous);
       if (left !== right) parent.set(left > right ? left : right, left > right ? right : left);
     }
@@ -108,7 +114,10 @@ export function projectMissionReport(input: {
     const declared = new Set<string>();
     for (const row of rows) {
       const tags = [...reportTags(row.tags)].filter(tag => tag.startsWith("slice:")).map(tag => tag.slice(6));
-      const refs = tags.length ? tags : [...row.body.matchAll(/^Slice:[ \t]+(\S+)[ \t]*$/gm)].map(match => match[1] ?? "");
+      const refs = [...tags, ...[...row.body.matchAll(/^Slice:[ \t]+(\S+)[ \t]*$/gm)].map(match => match[1] ?? "")];
+      if (/\b(?:H|head|candidate)[=:]\s*[a-f0-9]{40,64}\b/i.test(row.body)) {
+        refs.push(...[...row.body.matchAll(/\bcanonical[:=]?\s+(\/[^\s;,]+)/gi)].map(match => match[1] ?? ""));
+      }
       refs.forEach(ref => declared.add(ref));
     }
     const matches = new Set([...declared].flatMap(ref => aliases.get(ref) ?? []));
@@ -118,7 +127,12 @@ export function projectMissionReport(input: {
     }
     const nodeKey = [...matches][0];
     if (nodeKey) { const current = attached.get(nodeKey) ?? []; current.push(...rows); attached.set(nodeKey, current); }
-    else standalone.push({ key: `queue:${key}`, rows });
+    else {
+      const possible = new Set(rows.flatMap(row => input.evidenceCandidates?.get(row.qitemId) ?? []));
+      if (possible.size) {
+        for (const row of rows) diagnostics.push({ kind: "ambiguous_work", key: row.qitemId, reason: `Evidence refers to possible work ${[...possible].join(", ")}; exact work/candidate identity unresolved`, source: `queue:${row.qitemId}`, queue: row, timecard: input.emptyTimecard });
+      } else standalone.push({ key: `queue:${key}`, rows });
+    }
   }
   const makeItem = (node: ReportNode, rows: ReportQueueRecord[], counting: ReportItem["counting"]): ReportItem => {
     const ordered = [...rows].sort((a, b) => a.tsUpdated.localeCompare(b.tsUpdated) || a.qitemId.localeCompare(b.qitemId));
@@ -127,25 +141,29 @@ export function projectMissionReport(input: {
     const current = active.at(-1) ?? latest;
     const status = node.status?.toLowerCase() ?? "";
     const declaredBucket = buckets.get(status);
-    const bucket = active.length ? "in_flight" : declaredBucket ?? "left_to_do";
+    const accepted = node.acceptance.kind === "reported";
+    const bucket = active.length ? "in_flight" : accepted ? "done" : declaredBucket ?? "unresolved";
     const warnings: string[] = [];
-    if (!declaredBucket) warnings.push("Execution status is unknown; included in Left to do until evidenced");
+    if (!declaredBucket && !accepted) warnings.push("Completion is unresolved; excluded from Done, In flight and Left to do until evidenced");
     if (declaredBucket === "done" && active.length) warnings.push("Authored completion conflicts with open queue work");
+    if (accepted && active.length) warnings.push("Current accepted proof coexists with open queue work; acceptance and remaining activity are distinct");
+    const stageBucket = node.stage ? buckets.get(node.stage.toLowerCase()) : undefined;
+    if (declaredBucket && stageBucket && declaredBucket !== stageBucket) warnings.push(`Authored status ${node.status} conflicts with stage ${node.stage}; status classifies execution`);
     for (const row of rows) {
       const match = membership.get(row.qitemId);
       if (match?.kind === "member" && match.basis === "legacy") warnings.push(`Legacy project:${match.originalProject} associated by ${match.source}; original tags retained`);
     }
     return { key: node.key, id: node.id, parent: node.parent, title: node.title, source: node.source, counting, bucket,
-      classification: active.length ? "Open associated queue work" : declaredBucket ? `Authored status: ${status}` : "Unknown completion",
+      classification: active.length ? "Open associated queue work" : accepted ? "Current attributed proof accepted" : declaredBucket ? `Authored status: ${status}` : latest ? `Closed queue disposition ${latest.state}; completion unverified` : "Unclassified source work",
       authoredStatus: node.status, owner: current?.destinationSession ?? node.owner, stage: node.stage ?? current?.state ?? null,
-      progress: latest?.resolution ?? (latest ? `${latest.state}: ${latest.summary ?? latest.qitemId}` : node.intent), nextAction: node.nextAction ?? (active.length ? current?.summary ?? null : null),
+      progress: node.progress ?? latest?.resolution ?? (latest ? `Queue ${latest.state}: ${latest.summary ?? latest.qitemId}` : node.intent ? `Intent: ${node.intent}` : "No sourced progress recorded"), nextAction: node.nextAction,
       blocker: current?.blockedOn ?? node.blocker, acceptance: node.acceptance, integration: node.integration,
       attempts: ordered, warnings: [...new Set(warnings)], timecard: input.emptyTimecard,
-      evidence: [{ source: node.source, label: "Authored source", at: null }, ...ordered.map(row => ({ source: `queue:${row.qitemId}`, label: row.summary ?? row.qitemId, at: row.tsUpdated })),
+      evidence: [{ source: node.source, label: node.source.startsWith("queue:") ? "Queue lineage source" : "Work source", at: null }, ...(node.evidence ?? []), ...ordered.map(row => ({ source: `queue:${row.qitemId}`, label: row.summary ?? row.qitemId, at: row.tsUpdated })),
         ...ordered.flatMap(row => row.evidenceRef ? [{ source: row.evidenceRef, label: "Recorded evidence reference; verdict unverified", at: row.tsUpdated }] : [])] };
   };
   const parents = new Set(validNodes.flatMap(node => node.parent ? [node.parent] : []));
-  const items = validNodes.map(node => makeItem(node, attached.get(node.key) ?? [], parents.has(node.key) ? "rollup" : "unit"));
+  const items = validNodes.map(node => makeItem(node, attached.get(node.key) ?? [], node.counting ?? (parents.has(node.key) ? "rollup" : "unit")));
   for (const group of standalone) {
     const first = [...group.rows].sort((a, b) => a.tsCreated.localeCompare(b.tsCreated) || a.qitemId.localeCompare(b.qitemId))[0];
     if (!first) continue;

@@ -1,3 +1,4 @@
+import { WorkspacePortfolioPanel } from "./WorkspacePortfolioPanel.js";
 import { ProjectWorkReport } from "./ProjectWorkReport.js";
 // V1 attempt-3 Phase 3 — Project scope pages per project-tree.md L46–L49 + SC-24.
 //
@@ -739,7 +740,7 @@ export function WorkspaceScopePage() {
       onSelect={(id) => setActive(id as SharedTab)}
     >
       {active === "overview" ? (
-        <ProjectWorkReport />
+        <div className="space-y-8"><WorkspacePortfolioPanel /><ProjectWorkReport /></div>
       ) : null}
       {active === "story" ? (
         <ScopeStoryRollup

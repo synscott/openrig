@@ -167,6 +167,10 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promis
       const method = init?.method ?? (input instanceof Request ? input.method : "GET");
       const requests = window.__PROJECT_REPORT_REQUESTS__ ?? (window.__PROJECT_REPORT_REQUESTS__ = []);
       if (requests.length < 256) requests.push({ path: u.pathname, method });
+      if (window.__PROJECT_REPORT_BASE_URL__ && (u.pathname === "/api/scopes/projects" || u.pathname === "/api/scopes/report")) {
+        if (!realFetch) throw new Error("Actual report route requires native fetch");
+        return realFetch(new URL(`${u.pathname}${u.search}`, window.__PROJECT_REPORT_BASE_URL__), init);
+      }
       return route(u.pathname, u.searchParams);
     }
   } catch {

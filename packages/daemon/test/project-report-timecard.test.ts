@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildReportTimecard, intervalMilliseconds, readCommandIntervals } from "../src/domain/workspace/report-timecard.js";
 
 const at = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000).toISOString();
-const command = (start: number, end: number, actor: string) => ({ start: at(start), end: at(end), actor, source: "commands.json", label: "check", result: "exit 0" });
+const command = (start: number, end: number, actor: string) => ({ identity: `${actor}-${start}-${end}`, start: at(start), end: at(end), actor, source: "commands.json", label: "check", result: "exit 0" });
 const transition = (id: number, seconds: number, state: string) => ({ transitionId: id, qitemId: "work", ts: at(seconds), state, actorSession: "worker@fixture", transitionNote: "recorded" });
 
 describe("Projects timecard", () => {
@@ -35,4 +35,27 @@ describe("Projects timecard", () => {
     expect(card.commandTime.kind).toBe("unknown");
     expect(card.issues).toEqual(["queue:work#1: invalid lifecycle clock", "Unclosed or future command intervals excluded from measured time"]);
   });
+});
+
+
+it("keeps same-state failure/repair events and actors without restarting residence", () => {
+  const card = buildReportTimecard({ commands: [], transitions: [
+    { ...transition(1, 0, "in-progress"), transitionNote: "claimed" },
+    { ...transition(2, 3, "in-progress"), actorSession: "reviewer@fixture", transitionNote: "QA failed" },
+    { ...transition(3, 8, "in-progress"), transitionNote: "repaired" },
+    { ...transition(4, 10, "blocked"), transitionNote: "waiting" },
+  ], asOf: at(20) });
+  expect(card.events.map(event => [event.transitionId, event.actor, event.note])).toEqual([[1, "worker@fixture", "claimed"], [2, "reviewer@fixture", "QA failed"], [3, "worker@fixture", "repaired"], [4, "worker@fixture", "waiting"]]);
+  expect(card.lifecycle[0]).toMatchObject({ start: at(0), end: at(10), state: "in-progress" });
+  expect(card.waiting).toMatchObject({ milliseconds: 10000 });
+  expect(card.effort.kind).toBe("unknown");
+});
+
+it("deduplicates repeated candidate command records while preserving different candidates", () => {
+  const record = { head: "a".repeat(40), started_at: at(0), ended_at: at(5), argv: ["check"], exit: 0 };
+  const first = readCommandIntervals([record], "a.json");
+  const copy = readCommandIntervals([record, { ...record, head: "b".repeat(40) }], "b.json");
+  const card = buildReportTimecard({ commands: [...first.intervals, ...copy.intervals], transitions: [], asOf: at(30) });
+  expect(card.commands).toHaveLength(2);
+  expect(card.commandTime).toMatchObject({ milliseconds: 5000 });
 });

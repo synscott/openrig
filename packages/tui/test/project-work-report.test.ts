@@ -4,11 +4,12 @@ import { DaemonClient } from "../src/daemon-client.js";
 import { hydrateSnapshot } from "../src/hydrate.js";
 import { createViewState, emptySnapshot } from "../src/state.js";
 import { parseCommand } from "../src/grammar.js";
+import { reportContentLines } from "../src/scopes/report-model.js";
 import { renderScreen } from "../src/render.js";
 
 const asOf = "2026-01-01T00:00:00Z";
-const work: ReportItem = { key: "unit", id: "APP.99.0.1.1", parent: null, title: "Preserve retry behavior", source: "SPEC.md", counting: "unit", bucket: "left_to_do", classification: "Authored planned work", authoredStatus: "planned", owner: null, stage: null, progress: "Planned source", nextAction: null, blocker: null, acceptance: { kind: "unknown", reason: "No judgment" }, integration: { kind: "unknown", reason: "Not integrated" }, attempts: [], evidence: [], warnings: [], timecard: { commands: [], lifecycle: [], commandTime: { kind: "unknown", reason: "No commands" }, waiting: { kind: "unknown", reason: "No history" }, effort: { kind: "unknown", reason: "Unmeasured" }, byActor: [], issues: [] } };
-const report: ProjectWorkReport = { project: { id: "sample", root: "/fixture", name: "Sample" }, asOf, revision: "snapshot", sources: [], issues: [], unmappedQueue: [], coverage: "partial", missions: [{ mission: "extract", missionId: "APP.99.0.1", authoredStatus: null, asOf, items: [work], totals: { done: 0, inFlight: 0, leftToDo: 1, total: 1 }, diagnostics: [], queueCoverage: { candidates: 0, members: 0, legacyMembers: 0, excluded: 0 } }] };
+const work: ReportItem = { key: "unit", id: "APP.99.0.1.1", parent: null, title: "Preserve retry behavior", source: "SPEC.md", counting: "unit", bucket: "left_to_do", classification: "Authored planned work", authoredStatus: "planned", owner: null, stage: null, progress: "Planned source", nextAction: null, blocker: null, acceptance: { kind: "unknown", reason: "No judgment" }, integration: { kind: "unknown", reason: "Not integrated" }, attempts: [], evidence: [], warnings: [], timecard: { commands: [], events: [], lifecycle: [], commandTime: { kind: "unknown", reason: "No commands" }, waiting: { kind: "unknown", reason: "No history" }, effort: { kind: "unknown", reason: "Unmeasured" }, byActor: [], issues: [] } };
+const report: ProjectWorkReport = { project: { id: "sample", root: "/fixture", name: "Sample" }, asOf, revision: "snapshot", sources: [], issues: [], unmappedQueue: [], coverage: "partial", missions: [{ mission: "extract", missionId: "APP.99.0.1", authoredStatus: null, asOf, items: [work], totals: { done: 0, inFlight: 0, leftToDo: 1, unresolved: 0, total: 1 }, diagnostics: [], queueCoverage: { candidates: 0, members: 0, legacyMembers: 0, excluded: 0 } }] };
 
 describe("Projects report TUI path", () => {
   it.each([[160, 55], [80, 24]])("filters and drills through the normal client and grammar at %ix%i", async(cols, rows) => {
@@ -41,4 +42,18 @@ describe("Projects report TUI path", () => {
       expect(request.url.searchParams.get("projectRoot")).toBe("/fixture");
     }
   });
+});
+
+
+it("shows hierarchy and retained event narrative without counting the parent", () => {
+  const mission = structuredClone(report.missions[0]); if (!mission) throw new Error("Fixture mission missing");
+  const parent: ReportItem = { ...work, key: "parent", id: "P", title: "Parent campaign", counting: "rollup", parent: null };
+  const child: ReportItem = { ...structuredClone(work), parent: "parent" };
+  child.timecard.events = [{ transitionId: 1, qitemId: "qa", at: asOf, state: "in-progress", actor: "reviewer@sample", note: "QA failed" }, { transitionId: 2, qitemId: "qa", at: asOf, state: "in-progress", actor: "builder@sample", note: "Repair verified" }];
+  mission.items = [parent, child];
+  const listing = reportContentLines(mission, null, "Parent campaign", 160).map(line => line.text).join("\n");
+  expect(listing).toContain("Parent rollup; not counted"); expect(listing).toContain("within Parent campaign");
+  expect(listing).toContain("Left to do 1");
+  const detail = reportContentLines(mission, child.key, "", 160).map(line => line.text).join("\n");
+  expect(detail).toContain("Within: Parent campaign"); expect(detail).toContain("reviewer@sample · QA failed"); expect(detail).toContain("builder@sample · Repair verified");
 });

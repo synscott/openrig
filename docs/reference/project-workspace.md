@@ -339,9 +339,13 @@ queue history and linked evidence. They do not dispatch agents. Select a catalog
 project before opening a mission. The selected ID and canonical root travel with
 subsequent reads; a changed root requires a new selection.
 
-Done, In flight and Left to do partition the known countable inventory. Authored
+Done, In flight and Left to do classify evidenced work. A separate unresolved
+inventory coverage gap retains unclassified and closed-unverified units. The three
+classified totals plus unresolved inventory reconcile to known countable units. Authored
 unqueued work is included. Rollup parents and PR references do not add work units.
-Explicit handoff lineage joins attempts; titles never establish identity. Duplicate
+Explicit handoff lineage joins attempts; titles never establish identity. Exact
+evidence paths can identify potential work but do not alone prove identity.
+Ambiguous associations stay in coverage instead of creating duplicate units. Duplicate
 or unresolved identities remain visible in source coverage rather than inflating
 unique totals. Done reports sourced completion. Acceptance and integration have
 separate evidence and can remain unknown even for a completed item. The mission
@@ -349,7 +353,9 @@ rollup preserves its authored SPEC status, falling back to mission.yaml
 metadata.status when absent. That rollup status does not classify child work.
 
 Open an item to read its owner, stage, sourced progress, next action, blocker and
-timecard. Recorded command wall time is distinct from continuous effort. Blocked
+timecard. Declared slice progress sources retain their modification time and
+evidence reference; intent is labelled separately. Lifecycle notes and actors stay
+visible even when consecutive states share one residence span. Recorded command wall time is distinct from continuous effort. Blocked
 lifecycle residence is distinct from unmarked waiting. Missing evidence remains
 unknown. Concurrent intervals are unioned, and shared intervals without unique
 task attribution are not allocated to task totals. Refresh reads a new snapshot;
@@ -378,3 +384,38 @@ does not retag queue history or change another mission's execution view.
 Unavailable sources and unmatched queue records remain browsable with explicit
 coverage. Whole-inventory totals describe known unique units, not a claim that
 unclassified sources have been resolved.
+
+### Declare nonstandard work directories
+
+Direct children of the canonical slices directory remain visible inventory units
+even without SPEC.md or README.md. Other directories require an explicit reporting
+disposition or remain unresolved source candidates:
+
+```yaml
+reporting:
+  work_directories:
+    - ref: repair-work
+      disposition: work
+    - ref: repairs
+      disposition: container
+    - ref: historical-captures
+      disposition: artifacts
+```
+
+References are relative to the selected canonical mission root. Duplicate,
+conflicting, escaping or overlapping work declarations produce local coverage
+errors. Containers and artifact directories do not add work units. Bounded owned
+command records and disposition evidence are read without creating source files.
+The existing portfolio and its Open-mission/steering paths remain available above
+the inventory report. Excluded queue records and open exclusions are shown without
+changing membership policy. Parent rollups remain reachable as hierarchy context,
+while only countable units contribute to totals.
+
+Optional authored frontmatter strings owner, next_action and blocker are report
+metadata when explicitly present; missing values remain unrecorded. A supported
+owned disposition packet's next_custody is sourced as its next action. Narrative
+progress is displayed without deriving structured owners or blockers from prose.
+Current proof-policy judgments take precedence over legacy publication packets.
+An owned packet can report bounded QA/review acceptance only with an exact
+candidate head, explicit ACCEPT values and readable linked receipts; this is
+separate from integration and whole-mission acceptance.

@@ -1347,7 +1347,7 @@ function contentLines(state: ViewState, snap: FleetSnapshot, contentWidth: numbe
     const workReport = snap.projectWorkReport;
     if (workReport && state.project && !state.scopesMission) return [...projectHeader,
       { text: `Existing-record work report · as of ${workReport.asOf} · partial source coverage` },
-      ...workReport.missions.map(m => listItem(`${m.mission} · Done ${m.totals.done} / In flight ${m.totals.inFlight} / Left ${m.totals.leftToDo}`, { type: "scopes-mission-open", mission: m.mission })),
+      ...workReport.missions.map(m => listItem(`${m.mission} · Done ${m.totals.done} / In flight ${m.totals.inFlight} / Left ${m.totals.leftToDo} / Unresolved ${m.totals.unresolved} / Excluded ${m.queueCoverage.excluded}`, { type: "scopes-mission-open", mission: m.mission })),
       ...workReport.unmappedQueue.map(row => ({ text: `Unmapped mission: ${row.summary ?? row.qitemId} · ${row.destinationSession} · ${row.state}` })),
       ...workReport.issues.map(text => ({ text }))];
     const report = workReport?.missions.find(m => m.mission === state.scopesMission);
