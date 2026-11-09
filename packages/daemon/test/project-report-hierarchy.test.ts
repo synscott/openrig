@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { reportHierarchy } from "../src/domain/workspace/report-hierarchy.js";
+import { reportHierarchy, latestReportProgress } from "../src/domain/workspace/report-hierarchy.js";
 import { projectMissionReport, unknownReportFact, type ReportNode } from "../src/domain/workspace/report-projection.js";
 import { buildReportTimecard } from "../src/domain/workspace/report-timecard.js";
 
@@ -13,4 +13,10 @@ describe("Projects hierarchy context", () => {
     expect(reportHierarchy(report.items, "P", "done").map(row => row.item.key)).toEqual(["P", "A"]);
     expect(reportHierarchy(report.items, "P", "left_to_do").map(row => row.item.key)).toEqual(["P", "B", "C"]);
   });
+});
+
+it("shows the latest declared section and tail instead of an old preamble", () => {
+  const progress = `# Setup\nOld boilerplate\n## Current\n${"Earlier text ".repeat(80)}Verified final retry\nSource: /fixture/PROGRESS.md · modified yesterday`;
+  expect(latestReportProgress(progress, 80)).toContain("Verified final retry");
+  expect(latestReportProgress(progress, 80)).not.toContain("Old boilerplate");
 });

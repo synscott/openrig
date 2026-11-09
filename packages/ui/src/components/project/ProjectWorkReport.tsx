@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { reportHierarchy, type ReportBucket, type ReportDuration, type ReportFact, type ReportItem } from "@openrig/daemon/project-report";
+import { reportHierarchy, latestReportProgress, type ReportBucket, type ReportDuration, type ReportFact, type ReportItem } from "@openrig/daemon/project-report";
 import { useProjectWorkReport, useReportProjects } from "../../hooks/useProjectWorkReport.js";
 
 const labels = { done: "Done", in_flight: "In flight", left_to_do: "Left to do", unresolved: "Unresolved inventory" };
@@ -51,7 +51,8 @@ export function ProjectWorkReport() {
   const totals = missions.reduce((sum, entry) => ({ done: sum.done + entry.totals.done, inFlight: sum.inFlight + entry.totals.inFlight, left: sum.left + entry.totals.leftToDo, unresolved: sum.unresolved + entry.totals.unresolved }), { done: 0, inFlight: 0, left: 0, unresolved: 0 });
   const stale = report.data ? now - Date.parse(report.data.asOf) > 60000 : false;
   const excluded = missions.flatMap(entry => entry.diagnostics).filter(diagnostic => diagnostic.kind === "queue_association");
-  const openExcluded = excluded.filter(diagnostic => diagnostic.queue && ["pending", "in-progress", "blocked"].includes(diagnostic.queue.state));
+  const ambiguous = missions.flatMap(entry => entry.diagnostics).filter(diagnostic => diagnostic.kind === "ambiguous_work");
+  const openExcluded = [...excluded, ...ambiguous].filter(diagnostic => diagnostic.queue && ["pending", "in-progress", "blocked"].includes(diagnostic.queue.state));
   return <section className="space-y-5" aria-label="Projects work report">
     <div className="flex flex-wrap items-end gap-3">
       <label className="space-y-1 text-xs text-on-surface-variant">Project<select aria-label="Project" className="block max-w-full rounded border border-outline-variant bg-surface p-2 text-on-surface" value={project ? `${project.id}\n${project.root}` : ""} onChange={event => { setSelected(event.target.value); setMission(""); }}><option value="">Choose a project</option>{catalog.data?.projects.map(entry => <option key={`${entry.id}-${entry.root}`} value={`${entry.id}\n${entry.root}`}>{entry.name} · {entry.id}</option>)}</select></label>
@@ -61,7 +62,7 @@ export function ProjectWorkReport() {
     {(catalog.error || report.error || project?.error) && <p role="alert" className="break-words text-sm text-on-surface-variant">{project?.error ?? catalog.error?.message ?? report.error?.message}. {report.data ? "Showing the previous snapshot; refresh to retry." : "Select another project or refresh to retry."}</p>}
     {catalog.isLoading && <p role="status">Reading project catalog…</p>}
     {report.data && <>
-      <aside aria-label="Excluded queue work" className="space-y-2 border border-outline-variant p-3 text-sm"><h3>{excluded.length} excluded queue records · {openExcluded.length} open</h3><p className="text-xs text-on-surface-variant">These records do not satisfy the selected association policy and add no selected work units. Original tags remain available in source coverage.</p>{openExcluded.map(diagnostic => <details key={diagnostic.key}><summary className="cursor-pointer">{diagnostic.queue?.summary ?? diagnostic.key} · {diagnostic.queue?.state} · {diagnostic.queue?.destinationSession}</summary><p>{diagnostic.reason} · Blocker: {diagnostic.queue?.blockedOn ?? "Unrecorded"}</p><p>{diagnostic.source}</p></details>)}</aside>
+      <aside aria-label="Excluded queue work" className="space-y-2 border border-outline-variant p-3 text-sm"><h3>{excluded.length} excluded queue records · {ambiguous.length} ambiguous work records · {openExcluded.length} open</h3><p className="text-xs text-on-surface-variant">Excluded records do not satisfy the selected association policy. Ambiguous records lack an exact work identity. Neither adds selected work units. Original tags remain available in source coverage.</p>{openExcluded.map(diagnostic => <details key={diagnostic.key}><summary className="cursor-pointer">{diagnostic.kind === "ambiguous_work" ? "Ambiguous work: " : "Excluded work: "}{diagnostic.queue?.summary ?? diagnostic.key} · {diagnostic.queue?.state} · {diagnostic.queue?.destinationSession}</summary><p>{diagnostic.reason} · Blocker: {diagnostic.queue?.blockedOn ?? "Unrecorded"}</p><p>{diagnostic.source}</p></details>)}</aside>
       {!!report.data.unmappedQueue.length && <details><summary className="cursor-pointer">Project queue records without a resolved mission ({report.data.unmappedQueue.length})</summary>{report.data.unmappedQueue.map(row => <p key={row.qitemId} className="break-words text-xs">{row.summary ?? row.qitemId} · {row.destinationSession} · {row.state} · {(row.tags ?? []).join(" ")}</p>)}</details>}
       <div className="border-y border-outline-variant/40 py-4"><h2 className="text-xl font-semibold">{items.length} known work units</h2><p className="mt-1 text-sm">Done {totals.done} · In flight {totals.inFlight} · Left to do {totals.left}</p><p className="mt-1 text-sm">{totals.done + totals.inFlight + totals.left} classified + {totals.unresolved} unresolved = {items.length} known inventory units</p><div className="mt-2 text-xs text-on-surface-variant">{missions.map(entry => <p key={entry.mission}>{entry.mission} · authored status {entry.authoredStatus ?? "unrecorded"}</p>)}</div><p className="mt-2 text-xs text-on-surface-variant">Reported completion, attributed acceptance, and integration are separate. Rollup parents and PRs are excluded from work totals. Source coverage is partial. Unresolved completion and closed-unverified work appear in a separate coverage gap, outside the three primary groups.</p></div>
       <div className="flex flex-wrap gap-3">
@@ -78,7 +79,7 @@ export function ProjectWorkReport() {
             {!!ancestors.length && <p className="px-4 text-xs text-on-surface-variant">Within {ancestors.map(parent => parent.title).join(" / ")}</p>}
             <WorkDetail item={item} />
           </details>
-          <p className="pb-3 pl-3 text-xs text-on-surface-variant">{item.progress.replace(/^#+ /gm, "").replace(/\s+/g, " ").slice(0, 180)} · Next: {item.nextAction ?? "Unrecorded"} · Blocker: {item.blocker ?? "Unrecorded"}</p>
+          <p className="pb-3 pl-3 text-xs text-on-surface-variant">{latestReportProgress(item.progress, 180).replace(/\s+/g, " ")} · Next: {item.nextAction ?? "Unrecorded"} · Blocker: {item.blocker ?? "Unrecorded"}</p>
         </li>)}</ul>
       </section>)}</div>
       {!visible.length && <p role="status">No work units match these filters. Source gaps remain below.</p>}

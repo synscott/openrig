@@ -92,7 +92,8 @@ describe("Projects recorded integration", () => {
     const report = readProjectWorkReport({ project: project(), queue, asOf: at });
     const item = report.missions[0]?.items[0];
     expect(item?.integration).toMatchObject({ kind: "reported", value: expect.stringContaining("not merged into parent-branch") });
-    expect(item?.bucket).toBe("left_to_do");
+    expect(item?.bucket).toBe("unresolved");
+    expect(item?.warnings).toContain("Authored unstarted status conflicts with recorded progress, work stage or queue history; completion unresolved");
     expect(item?.acceptance.kind).toBe("unknown");
   });
 });
@@ -200,15 +201,32 @@ describe("Projects canonical owned sources", () => {
     expect(report.missions[0]?.diagnostics.some(row => row.reason.includes("escapes the canonical mission root"))).toBe(true);
   });
 
-  it("reports bounded candidate acceptance from an owned packet with readable QA/review receipts", () => {
-    file("missions/extract/slices/02-packet/publication-handoff.json", JSON.stringify({ head: "a".repeat(40), reader_status: { qa: "ACCEPT", review: "ACCEPT" }, receipts: ["qa.md", "review.md"], next_custody: "Read final integration evidence" }));
-    file("missions/extract/slices/02-packet/qa.md", "Recorded QA acceptance for the packet candidate");
-    file("missions/extract/slices/02-packet/review.md", "Recorded source review acceptance for the packet candidate");
+  it.each([
+    { name: "readable unbound receipts", qa: "Recorded QA acceptance", review: "Recorded source review acceptance", receipts: ["qa.md", "review.md"] },
+    { name: "rejected candidate receipt", qa: `REJECT candidate ${"a".repeat(40)}`, review: `ACCEPT candidate ${"a".repeat(40)}`, receipts: ["qa.md", "review.md"] },
+    { name: "different accepted candidate", qa: `ACCEPT candidate ${"a".repeat(40)}`, review: `ACCEPT candidate ${"b".repeat(40)}`, receipts: ["qa.md", "review.md"] },
+    { name: "duplicate receipt path", qa: "Arbitrary readable file", review: "Unused", receipts: ["qa.md", "qa.md"] },
+  ])("keeps $name as disposition provenance without acceptance-derived Done", ({ qa, review, receipts }) => {
+    file("missions/extract/slices/02-packet/publication-handoff.json", JSON.stringify({ head: "a".repeat(40), reader_status: { qa: "ACCEPT", review: "ACCEPT" }, receipts, next_custody: "Read final integration evidence" }));
+    file("missions/extract/slices/02-packet/qa.md", qa);
+    file("missions/extract/slices/02-packet/review.md", review);
     const report = readProjectWorkReport({ project: project(), queue: undefined, asOf: at });
     const packet = report.missions[0]?.items.find(item => item.key.endsWith("02-packet"));
-    expect(packet?.bucket).toBe("done"); expect(packet?.acceptance.kind).toBe("reported"); expect(packet?.integration.kind).toBe("unknown");
+    expect(packet?.bucket).toBe("unresolved");
+    expect(packet?.acceptance.kind).toBe("unknown");
+    expect(packet?.integration.kind).toBe("unknown");
+    expect(packet?.progress).toContain('reader_status: {"qa":"ACCEPT","review":"ACCEPT"}');
     expect(packet?.nextAction).toBe("Read final integration evidence");
-    fs.unlinkSync(path.join(root, "missions/extract/slices/02-packet/review.md"));
-    expect(readProjectWorkReport({ project: project(), queue: undefined, asOf: at }).missions[0]?.items.find(item => item.key.endsWith("02-packet"))?.bucket).toBe("unresolved");
+    expect(packet?.evidence.filter(row => row.label === "Disposition-linked receipt; subject and verdict unverified").map(row => path.basename(row.source))).toEqual([...new Set(receipts)]);
+  });
+
+  it("preserves sourced authored completion without treating a disposition as acceptance", () => {
+    file("missions/extract/slices/02-packet/SPEC.md", "---\nstatus: completed\n---\n# Completed authored work\n");
+    file("missions/extract/slices/02-packet/publication-handoff.json", JSON.stringify({ head: "a".repeat(40), reader_status: { qa: "ACCEPT", review: "ACCEPT" }, receipts: ["qa.md", "qa.md"] }));
+    file("missions/extract/slices/02-packet/qa.md", "REJECT candidate");
+    const packet = readProjectWorkReport({ project: project(), queue: undefined, asOf: at }).missions[0]?.items.find(item => item.key.endsWith("02-packet"));
+    expect(packet?.bucket).toBe("done");
+    expect(packet?.classification).toBe("Authored status: completed");
+    expect(packet?.acceptance.kind).toBe("unknown");
   });
 });

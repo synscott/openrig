@@ -1,4 +1,4 @@
-import { reportHierarchy, type MissionWorkReport, type ReportDuration, type ReportFact } from "@openrig/daemon/project-report";
+import { reportHierarchy, latestReportProgress, type MissionWorkReport, type ReportDuration, type ReportFact } from "@openrig/daemon/project-report";
 import { listItem, wrapDetailLines, type ContentLine } from "../detail.js";
 
 const duration = (value: ReportDuration): string => value.kind === "unknown" ? "unknown" : `${(value.milliseconds / 60000).toFixed(1)} min recorded`;
@@ -11,9 +11,9 @@ export function reportContentLines(report: MissionWorkReport, selected: string |
     { text: "Reported completion, acceptance and integration are separate. Rollup parents and PRs do not add units." },
     { text: "Unresolved inventory is outside the three primary groups; closure, acceptance and integration remain separate." },
   ];
-  lines.push({ text: `${report.queueCoverage.excluded} excluded queue records; original association policy retained.` });
-  for (const diagnostic of report.diagnostics) if (diagnostic.kind === "queue_association" && ["pending", "in-progress", "blocked"].includes(diagnostic.queue.state)) {
-    lines.push(listItem(`Excluded open: ${diagnostic.queue.summary ?? diagnostic.key} · ${diagnostic.queue.state} · ${diagnostic.queue.destinationSession}`, { type: "execution-open", key: "report:coverage" }), { text: `  ${diagnostic.reason} · blocker ${diagnostic.queue.blockedOn ?? "unrecorded"}` });
+  lines.push({ text: `${report.queueCoverage.excluded} excluded queue records; ${report.diagnostics.filter(row => row.kind === "ambiguous_work").length} ambiguous work records; original association policy retained.` });
+  for (const diagnostic of report.diagnostics) if (diagnostic.kind !== "source" && ["pending", "in-progress", "blocked"].includes(diagnostic.queue.state)) {
+    lines.push(listItem(`${diagnostic.kind === "ambiguous_work" ? "Ambiguous open" : "Excluded open"}: ${diagnostic.queue.summary ?? diagnostic.key} · ${diagnostic.queue.state} · ${diagnostic.queue.destinationSession}`, { type: "execution-open", key: "report:coverage" }), { text: `  ${diagnostic.reason} · blocker ${diagnostic.queue.blockedOn ?? "unrecorded"}` });
   }
   if (selected === "coverage") {
     lines.push({ text: `${report.queueCoverage.members} associated, ${report.queueCoverage.legacyMembers} declared legacy, ${report.queueCoverage.excluded} excluded of ${report.queueCoverage.candidates} mission queue candidates.` });
@@ -35,7 +35,7 @@ export function reportContentLines(report: MissionWorkReport, selected: string |
     const ancestors = reportHierarchy(report.items).find(row => row.item.key === item.key)?.ancestors ?? [];
     lines.push({ text: `Within: ${ancestors.map(parent => parent.title).join(" / ") || report.mission}` }, { text: item.counting === "rollup" ? "Parent rollup; not counted in unit totals" : "Countable work unit" });
     lines.push({ text: item.title }, { text: `${labels[item.bucket]} · ${item.owner ?? "Owner unrecorded"} · ${item.stage ?? "Stage unknown"}` },
-      { text: `Progress: ${item.progress ? `${item.progress.slice(0, 640)}${item.progress.length > 640 ? " [continued in source evidence]" : ""}` : "No sourced progress recorded"}` }, { text: `Next: ${item.nextAction ?? "Not recorded"}` },
+      { text: `Progress: ${item.progress ? `${latestReportProgress(item.progress, 640)}${item.progress.length > 640 ? " [full progress in source evidence]" : ""}` : "No sourced progress recorded"}` }, { text: `Next: ${item.nextAction ?? "Not recorded"}` },
       { text: `Blocker: ${item.blocker ?? "No explicit blocker recorded"}` }, { text: `Acceptance: ${fact(item.acceptance)}` }, { text: `Integration: ${fact(item.integration)}` },
       { text: "TIMECARD" }, { text: `Command wall time ${duration(item.timecard.commandTime)} · blocked residence ${duration(item.timecard.waiting)} · continuous effort unknown` }, { text: item.timecard.effort.reason });
     for (const command of item.timecard.commands) lines.push({ text: `${command.label} · ${command.actor ?? "Actor unrecorded"} · ${command.result}` }, { text: `${command.start} to ${command.end}` }, { text: command.source });
@@ -53,7 +53,7 @@ export function reportContentLines(report: MissionWorkReport, selected: string |
       const context = item.counting === "rollup" ? "Parent rollup; not counted" : labels[item.bucket];
       lines.push(listItem(`${"  ".repeat(Math.min(depth, 8))}${item.title} · ${context} · ${item.owner ?? "Owner unrecorded"} · ${item.stage ?? "Stage unknown"}`, { type: "execution-open", key: `report:${item.key}` }),
         { text: `  ${item.id ?? item.key}${ancestors.length ? ` · within ${ancestors.map(parent => parent.title).join(" / ")}` : ""}` },
-        { text: `  ${item.progress.replace(/^#+ /gm, "").replace(/\s+/g, " ").slice(0, 160)} · next ${item.nextAction ?? "unrecorded"} · blocker ${item.blocker ?? "unrecorded"}` });
+        { text: `  ${latestReportProgress(item.progress, 160).replace(/\s+/g, " ")} · next ${item.nextAction ?? "unrecorded"} · blocker ${item.blocker ?? "unrecorded"}` });
     }
   }
   if (!rows.length) lines.push({ text: "No work units match this filter; source gaps remain available below." });

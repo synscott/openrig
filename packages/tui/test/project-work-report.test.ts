@@ -57,3 +57,15 @@ it("shows hierarchy and retained event narrative without counting the parent", (
   const detail = reportContentLines(mission, child.key, "", 160).map(line => line.text).join("\n");
   expect(detail).toContain("Within: Parent campaign"); expect(detail).toContain("reviewer@sample · QA failed"); expect(detail).toContain("builder@sample · Repair verified");
 });
+
+it("shows open ambiguous work and latest progress in list and detail", () => {
+  const mission = structuredClone(report.missions[0]); if (!mission) throw new Error("Missing mission");
+  const item = mission.items[0]; if (!item) throw new Error("Missing work");
+  item.progress = `# Setup\nOld preamble\n## Latest\n${"Earlier detail ".repeat(80)}Final retry verified`;
+  mission.diagnostics.push({ kind: "ambiguous_work", key: "open-qa", reason: "Exact work identity unresolved", source: "queue:open-qa", queue: { qitemId: "open-qa", tags: [], body: "", summary: "Unbound current QA", state: "blocked", destinationSession: "reviewer@sample", sourceSession: "lead@sample", blockedOn: "identity decision", handedOffFrom: null, chainOfRecord: null, evidenceRef: null, tsCreated: asOf, tsUpdated: asOf, resolution: null }, timecard: item.timecard });
+  const listing = reportContentLines(mission, null, "", 160).map(row => row.text).join("\n");
+  const detail = reportContentLines(mission, item.key, "", 160).map(row => row.text).join("\n");
+  expect(listing).toContain("1 ambiguous work records"); expect(listing).toContain("Ambiguous open: Unbound current QA");
+  expect(listing.replace(/\s+/g, " ")).toContain("Final retry verified"); expect(detail.replace(/\s+/g, " ")).toContain("Final retry verified");
+  expect(listing).toContain("Left to do 1");
+});

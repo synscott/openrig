@@ -1,14 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parse } from "yaml";
-import type { ReportEvidence, ReportFact } from "./report-projection.js";
+import type { ReportEvidence } from "./report-projection.js";
 
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 
-export function readOwnedWorkSources(input: { dir: string; read: (file: string) => string }): { refs: string[]; progress: string | undefined; acceptance: ReportFact | null; nextAction: string | null; evidence: ReportEvidence[]; issues: string[] } {
+export function readOwnedWorkSources(input: { dir: string; read: (file: string) => string }): { refs: string[]; progress: string | undefined; nextAction: string | null; evidence: ReportEvidence[]; issues: string[] } {
   const refs: string[] = [], evidence: ReportEvidence[] = [], issues: string[] = [];
   let progress: string | undefined;
-  let acceptance: ReportFact | null = null;
+  let dispositionProgress: string | undefined;
+  let dispositionAt = Number.NEGATIVE_INFINITY;
   let nextAction: string | null = null;
   const capture = (file: string, label: string): string => {
     const text = input.read(file);
@@ -29,11 +30,11 @@ export function readOwnedWorkSources(input: { dir: string; read: (file: string) 
         const canonicalRelative = path.relative(fs.realpathSync(input.dir), fs.realpathSync(source));
         if (canonicalRelative === ".." || canonicalRelative.startsWith(`..${path.sep}`) || path.isAbsolute(canonicalRelative)) throw new Error("Declared progress escapes its canonical work directory");
         const text = capture(source, "Declared progress source");
-        progress = `${text.slice(0, 16000)}\nSource: ${source} · modified ${fs.statSync(source).mtime.toISOString()}`;
+        progress = `${text}\nSource: ${source} · modified ${fs.statSync(source).mtime.toISOString()}`;
       }
     } catch (error) { issues.push(`${manifestPath}: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  if (!fs.existsSync(input.dir)) return { refs, progress, acceptance, nextAction, evidence, issues };
+  if (!fs.existsSync(input.dir)) return { refs, progress, nextAction, evidence, issues };
   const files = fs.readdirSync(input.dir, { withFileTypes: true }).filter(entry => entry.isFile()).sort((a, b) => a.name.localeCompare(b.name));
   if (files.length > 512) issues.push(`${input.dir}: owned source scan limited to first 512 files`);
   for (const file of files.slice(0, 512)) {
@@ -50,21 +51,34 @@ export function readOwnedWorkSources(input: { dir: string; read: (file: string) 
           if (Array.isArray(value) && value.some(row => object(row) && "started_at" in row)) refs.push(target);
         } else if (/^(?:final-disposition|publication-handoff|publication-readback|closeout)\.json$/.test(file.name)) {
           const text = capture(target, "Owned disposition record; verdict retained separately"); refs.push(target);
-          if (!progress) progress = `Recorded disposition from ${target}:\n${text.slice(0, 8000)}`;
           const record: unknown = JSON.parse(text);
+          const modified = fs.statSync(target).mtimeMs;
+          if (modified >= dispositionAt) {
+            dispositionAt = modified;
+            const fields = object(record) ? ["summary", "status", "stage", "outcome", "result", "checks", "reader_status", "next_custody", "custody"].flatMap(key => record[key] === undefined ? [] : [`${key}: ${typeof record[key] === "string" ? record[key] : JSON.stringify(record[key])}`]) : [];
+            dispositionProgress = `Recorded disposition (${file.name}; reported fields)\n${fields.length ? fields.join("\n") : "No named progress fields recorded; inspect linked source evidence."}`;
+          }
           if (object(record) && typeof record.next_custody === "string" && record.next_custody.trim()) nextAction = record.next_custody;
-          if (object(record) && typeof record.head === "string" && /^[a-f0-9]{40,64}$/i.test(record.head) && object(record.reader_status) && record.reader_status.qa === "ACCEPT" && record.reader_status.review === "ACCEPT" && Array.isArray(record.receipts) && record.receipts.length >= 2 && record.receipts.every((ref): ref is string => typeof ref === "string" && !!ref && !/^https?:/.test(ref))) {
-            const receipts = record.receipts.map(ref => ({ source: path.resolve(input.dir, ref), label: "Linked recorded acceptance receipt", at: null }));
-            for (const receipt of receipts) input.read(receipt.source);
-            const at = typeof record.recorded_at === "string" ? record.recorded_at : typeof record.at === "string" ? record.at : null;
-            acceptance = { kind: "reported", value: `Recorded QA and review ACCEPT for candidate ${record.head}; bounded source acceptance, not integration or whole-mission acceptance`, evidence: [{ source: target, label: "Recorded candidate-bound reader acceptance", at }, ...receipts] };
+          if (object(record) && Array.isArray(record.receipts)) {
+            for (const ref of new Set(record.receipts.filter((ref): ref is string => typeof ref === "string" && !!ref))) {
+              const source = /^https?:/.test(ref) ? ref : path.resolve(input.dir, ref);
+              evidence.push({ source, label: "Disposition-linked receipt; subject and verdict unverified", at: null });
+              if (!/^https?:/.test(ref)) {
+                try { input.read(source); }
+                catch (error) { issues.push(`${source}: ${error instanceof Error ? error.message : String(error)}`); }
+              }
+            }
           }
         }
       } else if (/^(?:terminal-return|publication-return|publication-handoff|closeout)\.md$/.test(file.name)) {
         const text = capture(target, "Owned narrative disposition; not a structured acceptance judgment");
-        if (!progress) progress = `Recorded disposition from ${target}:\n${text.slice(0, 8000)}`;
+        const modified = fs.statSync(target).mtimeMs;
+        if (modified >= dispositionAt) {
+          dispositionAt = modified;
+          dispositionProgress = `Recorded disposition (${file.name}; narrative)\n${text}`;
+        }
       }
     } catch (error) { issues.push(`${target}: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  return { refs, progress, acceptance, nextAction, evidence, issues };
+  return { refs, progress: progress ?? dispositionProgress, nextAction, evidence, issues };
 }

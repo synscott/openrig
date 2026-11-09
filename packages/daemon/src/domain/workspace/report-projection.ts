@@ -39,7 +39,7 @@ export interface MissionWorkReport {
 
 const buckets = new Map<string, ReportBucket>([
   ...["done", "complete", "completed", "delivered", "shipped"].map((status): [string, ReportBucket] => [status, "done"]),
-  ...["in-progress", "working", "blocked", "implemented", "verified", "review"].map((status): [string, ReportBucket] => [status, "in_flight"]),
+  ...["wip", "in-progress", "working", "blocked", "implemented", "verified", "review"].map((status): [string, ReportBucket] => [status, "in_flight"]),
   ...["planned", "placeholder", "pending"].map((status): [string, ReportBucket] => [status, "left_to_do"]),
 ]);
 const open = new Set(["pending", "in-progress", "blocked"]);
@@ -142,19 +142,22 @@ export function projectMissionReport(input: {
     const status = node.status?.toLowerCase() ?? "";
     const declaredBucket = buckets.get(status);
     const accepted = node.acceptance.kind === "reported";
-    const bucket = active.length ? "in_flight" : accepted ? "done" : declaredBucket ?? "unresolved";
+    const stageBucket = node.stage ? buckets.get(node.stage.toLowerCase()) : undefined;
+    const recordedProgress = !!node.progress?.trim() && !!node.evidence?.some(evidence => evidence.label === "Declared progress source");
+    const conflictsWithUnstarted = !active.length && declaredBucket === "left_to_do" && (stageBucket === "in_flight" || recordedProgress || rows.length > 0);
+    const bucket = active.length ? "in_flight" : accepted ? "done" : conflictsWithUnstarted ? "unresolved" : declaredBucket ?? "unresolved";
     const warnings: string[] = [];
     if (!declaredBucket && !accepted) warnings.push("Completion is unresolved; excluded from Done, In flight and Left to do until evidenced");
     if (declaredBucket === "done" && active.length) warnings.push("Authored completion conflicts with open queue work");
     if (accepted && active.length) warnings.push("Current accepted proof coexists with open queue work; acceptance and remaining activity are distinct");
-    const stageBucket = node.stage ? buckets.get(node.stage.toLowerCase()) : undefined;
-    if (declaredBucket && stageBucket && declaredBucket !== stageBucket) warnings.push(`Authored status ${node.status} conflicts with stage ${node.stage}; status classifies execution`);
+    if (conflictsWithUnstarted) warnings.push("Authored unstarted status conflicts with recorded progress, work stage or queue history; completion unresolved");
+    if (declaredBucket && stageBucket && declaredBucket !== stageBucket) warnings.push(`Authored status ${node.status} conflicts with stage ${node.stage}; ${conflictsWithUnstarted ? "completion remains unresolved" : "status classifies execution"}`);
     for (const row of rows) {
       const match = membership.get(row.qitemId);
       if (match?.kind === "member" && match.basis === "legacy") warnings.push(`Legacy project:${match.originalProject} associated by ${match.source}; original tags retained`);
     }
     return { key: node.key, id: node.id, parent: node.parent, title: node.title, source: node.source, counting, bucket,
-      classification: active.length ? "Open associated queue work" : accepted ? "Current attributed proof accepted" : declaredBucket ? `Authored status: ${status}` : latest ? `Closed queue disposition ${latest.state}; completion unverified` : "Unclassified source work",
+      classification: active.length ? "Open associated queue work" : accepted ? "Current attributed proof accepted" : conflictsWithUnstarted ? "Authored unstarted status conflicts with execution evidence" : declaredBucket ? `Authored status: ${status}` : latest ? `Closed queue disposition ${latest.state}; completion unverified` : "Unclassified source work",
       authoredStatus: node.status, owner: current?.destinationSession ?? node.owner, stage: node.stage ?? current?.state ?? null,
       progress: node.progress ?? latest?.resolution ?? (latest ? `Queue ${latest.state}: ${latest.summary ?? latest.qitemId}` : node.intent ? `Intent: ${node.intent}` : "No sourced progress recorded"), nextAction: node.nextAction,
       blocker: current?.blockedOn ?? node.blocker, acceptance: node.acceptance, integration: node.integration,

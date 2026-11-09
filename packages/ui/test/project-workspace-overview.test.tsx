@@ -263,17 +263,13 @@ describe("WorkspaceScopePage overview", () => {
     const { findByTestId } = renderWorkspaceScope();
 
     expect(await findByTestId("workspace-portfolio")).toBeTruthy();
-    // Missions are DERIVED by grouping slices: idea-ledger -> RELEASE-PROOF; the
-    // railItem-less slice -> unsorted. Each is a collapsed row.
     expect(await findByTestId("portfolio-mission-RELEASE-PROOF")).toBeTruthy();
     expect(await findByTestId("portfolio-mission-unsorted")).toBeTruthy();
   });
 
   it("OPR.0.4.1.24: portfolio rows are collapsed by default with an Open-mission jump", async () => {
     const { findByTestId, queryByTestId } = renderWorkspaceScope();
-    // each mission row carries an Open jump to its mission page.
     expect(await findByTestId("portfolio-open-RELEASE-PROOF")).toBeTruthy();
-    // collapsed by default: no steering glance (and so no MISSION_BRIEF fetch) until expand.
     expect(queryByTestId("portfolio-glance-RELEASE-PROOF")).toBeNull();
     expect(queryByTestId("portfolio-glance-loading-RELEASE-PROOF")).toBeNull();
     expect(queryByTestId("portfolio-glance-empty-RELEASE-PROOF")).toBeNull();

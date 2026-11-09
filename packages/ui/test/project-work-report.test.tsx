@@ -74,3 +74,15 @@ it("keeps parent context and recorded failure/repair narrative while counting le
   expect(screen.getByText(/builder@sample.*Repair verified/)).toBeTruthy();
   expect(screen.getByText("Done 1 · In flight 1 · Left to do 0")).toBeTruthy();
 });
+
+ it("surfaces open ambiguous records and the latest progress without adding units", async () => {
+  const input = structuredClone(projectReportFixture); const mission = input.missions[0]; const first = mission?.items[0];
+  if (!mission || !first) throw new Error("Missing fixture work");
+  first.progress = `# Setup\nOld preamble\n## Latest\n${"Earlier detail ".repeat(80)}Final retry verified`;
+  mission.diagnostics.push({ kind: "ambiguous_work", key: "open-qa", reason: "Exact work identity unresolved", source: "queue:open-qa", queue: { qitemId: "open-qa", tags: [], body: "", summary: "Unbound current QA", state: "blocked", destinationSession: "reviewer@sample", sourceSession: "lead@sample", blockedOn: "identity decision", handedOffFrom: null, chainOfRecord: null, evidenceRef: null, tsCreated: input.asOf, tsUpdated: input.asOf, resolution: null }, timecard: first.timecard });
+  setup("normal", input);
+  await screen.findByText("3 known work units");
+  expect(screen.getByText("0 excluded queue records · 1 ambiguous work records · 1 open")).toBeTruthy();
+  expect(screen.getByText(/Ambiguous work: Unbound current QA/)).toBeTruthy();
+  expect(screen.getAllByText(/Final retry verified/).length).toBeGreaterThan(0);
+ });

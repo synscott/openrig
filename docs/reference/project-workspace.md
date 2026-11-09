@@ -347,14 +347,16 @@ Explicit handoff lineage joins attempts; titles never establish identity. Exact
 evidence paths can identify potential work but do not alone prove identity.
 Ambiguous associations stay in coverage instead of creating duplicate units. Duplicate
 or unresolved identities remain visible in source coverage rather than inflating
-unique totals. Done reports sourced completion. Acceptance and integration have
+unique totals. An authored unstarted status that conflicts with a work stage, declared progress,
+or queue history stays unresolved with a warning. Done reports sourced completion. Acceptance and integration have
 separate evidence and can remain unknown even for a completed item. The mission
 rollup preserves its authored SPEC status, falling back to mission.yaml
 metadata.status when absent. That rollup status does not classify child work.
 
 Open an item to read its owner, stage, sourced progress, next action, blocker and
 timecard. Declared slice progress sources retain their modification time and
-evidence reference; intent is labelled separately. Lifecycle notes and actors stay
+evidence reference; intent is labelled separately. Compact rows and TUI details
+show the latest section or tail; full progress remains in the source evidence. Lifecycle notes and actors stay
 visible even when consecutive states share one residence span. Recorded command wall time is distinct from continuous effort. Blocked
 lifecycle residence is distinct from unmarked waiting. Missing evidence remains
 unknown. Concurrent intervals are unioned, and shared intervals without unique
@@ -408,14 +410,15 @@ errors. Containers and artifact directories do not add work units. Bounded owned
 command records and disposition evidence are read without creating source files.
 The existing portfolio and its Open-mission/steering paths remain available above
 the inventory report. Excluded queue records and open exclusions are shown without
-changing membership policy. Parent rollups remain reachable as hierarchy context,
+changing membership policy. Ambiguous work counts and open ambiguous records
+remain visible at report level without adding units. Parent rollups remain reachable as hierarchy context,
 while only countable units contribute to totals.
 
 Optional authored frontmatter strings owner, next_action and blocker are report
 metadata when explicitly present; missing values remain unrecorded. A supported
 owned disposition packet's next_custody is sourced as its next action. Narrative
 progress is displayed without deriving structured owners or blockers from prose.
-Current proof-policy judgments take precedence over legacy publication packets.
-An owned packet can report bounded QA/review acceptance only with an exact
-candidate head, explicit ACCEPT values and readable linked receipts; this is
-separate from integration and whole-mission acceptance.
+Acceptance comes from supported current proof-policy judgments. Owned publication
+packets and their linked receipts remain reported narrative and provenance. Their
+reader-status claims or readable links do not establish acceptance or classify
+work as Done. Explicit authored completion and integration remain separate facts.

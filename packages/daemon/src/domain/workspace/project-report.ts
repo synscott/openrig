@@ -143,18 +143,15 @@ export function readProjectWorkReport(input: { project: ProjectRead; queue: Queu
         const node: ReportNode = { key, id: string(fm.id), parent, source: source ?? dir, title: string(fm.title) ?? text.match(/^#\s+(.+)$/m)?.[1] ?? path.basename(dir),
           aliases: [path.basename(dir), canonicalDir], status: string(fm.status), stage: string(fm.stage), intent: string(fm.intent) ?? "", owner: string(fm.owner),
           nextAction: string(fm.next_action), blocker: string(fm.blocker), acceptance, integration: unknownReportFact("Integration not established by a revision-bound receipt") };
-        let proofConfigured = false;
         if (source && path.basename(path.dirname(dir)) === "slices") {
           try {
             const readiness = readSliceReadiness(dir, undefined, undefined, project.root, file => { if (fs.existsSync(file)) read(file); });
-            proofConfigured = readiness.configured;
             if (readiness.state === "ready") node.acceptance = { kind: "reported", value: "Current proof items accepted", evidence: readiness.items.flatMap(item => item.judgment ? [{ source: `${dir}/proof/judgments/${String(item.judgment.sequence).padStart(8, "0")}.md`, label: item.judgment.reason, at: item.judgment.at }] : []) };
             if (readiness.issues.length) sourceGap(dir, readiness.issues.join("; "));
-          } catch (error) { proofConfigured = true; sourceGap(dir, `Acceptance source unavailable: ${error instanceof Error ? error.message : String(error)}`); }
+          } catch (error) { sourceGap(dir, `Acceptance source unavailable: ${error instanceof Error ? error.message : String(error)}`); }
         }
         const owned = readOwnedWorkSources({ dir: canonicalDir, read: file => read(withinMission(file, missionDir)) });
         node.progress = owned.progress; node.evidence = owned.evidence; node.nextAction ??= owned.nextAction;
-        if (!proofConfigured && owned.acceptance) node.acceptance = owned.acceptance;
         owned.issues.forEach(reason => sourceGap(canonicalDir, reason));
         ownedSources.set(key, owned); nodeDirectories.set(key, canonicalDir);
         nodes.push(node);

@@ -44,3 +44,12 @@ export function reportHierarchy(items: readonly ReportItem[], filter = "", bucke
   items.filter(item => selected.has(item.key)).forEach(item => append(item, []));
   return rows;
 }
+
+export function latestReportProgress(progress: string, limit: number): string {
+  const content = progress.replace(/\nSource: [^\n]+$/, "").trim();
+  const section = content.split(/(?=^#{1,6}\s)/m).filter(part => part.trim()).at(-1)?.trim() ?? content;
+  const label = content.startsWith("Recorded disposition") ? `${content.split("\n")[0]}\n` : "";
+  const body = label && section.startsWith(label.trimEnd()) ? section.slice(label.length).trim() : section;
+  const room = Math.max(1, limit - label.length);
+  return label + (body.length > room ? `…${body.slice(-(room - 1))}` : body);
+}

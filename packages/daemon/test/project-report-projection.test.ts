@@ -3,7 +3,7 @@ import { projectMissionReport, unknownReportFact, type ReportNode, type ReportQu
 import { buildReportTimecard } from "../src/domain/workspace/report-timecard.js";
 
 const asOf = "2026-01-01T01:00:00.000Z";
-const node = (key: string, status: string, parent: string | null = null): ReportNode => ({ key, id: key, parent, title: key, source: `${key}/SPEC.md`, aliases: [key], status, stage: "wip", intent: "A sourced intent", owner: null, nextAction: null, blocker: null, acceptance: unknownReportFact("Not judged"), integration: unknownReportFact("Not integrated") });
+const node = (key: string, status: string, parent: string | null = null): ReportNode => ({ key, id: key, parent, title: key, source: `${key}/SPEC.md`, aliases: [key], status, stage: null, intent: "A sourced intent", owner: null, nextAction: null, blocker: null, acceptance: unknownReportFact("Not judged"), integration: unknownReportFact("Not integrated") });
 const row = (id: string, state: string, tags: string[], previous: string | null = null): ReportQueueRecord => ({ qitemId: id, state, tags, body: "", summary: id, destinationSession: "worker@fixture", sourceSession: "lead@fixture", blockedOn: null, handedOffFrom: previous, chainOfRecord: null, evidenceRef: null, tsCreated: asOf, tsUpdated: asOf, resolution: null });
 const base = { projectId: "current", mission: "extract", missionId: "APP.99.0.1", asOf, association: { kind: "none" as const }, emptyTimecard: buildReportTimecard({ commands: [], transitions: [], asOf }) };
 const tags = ["mission:APP.99.0.1", "project:current"];
@@ -28,7 +28,7 @@ describe("Projects whole-inventory projection", () => {
 
   it("does not mistake queue closure for accepted or delivered work", () => {
     const report = projectMissionReport({ ...base, nodes: [node("unit", "planned")], rows: [row("terminal", "done", [...tags, "slice:unit"])] });
-    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, unresolved: 0, total: 1 });
+    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 0, unresolved: 1, total: 1 });
     expect(report.items[0]?.acceptance).toEqual({ kind: "unknown", reason: "Not judged" });
   });
 
@@ -83,6 +83,14 @@ describe("Projects exact declarations and classification", () => {
     expect(report.items.find(item => item.key === "accepted")?.bucket).toBe("done");
     expect(report.items.find(item => item.key === "accepted")?.integration.kind).toBe("unknown");
     expect(report.items.find(item => item.key === "conflict")?.warnings).toContain("Authored status in-progress conflicts with stage done; status classifies execution");
+  });
+
+  it.each(["wip", "recorded-progress"])("keeps placeholder with %s evidence unresolved instead of unstarted", evidence => {
+    const placeholder = { ...node("placeholder", "placeholder"), ...(evidence === "wip" ? { stage: "wip" } : { progress: "Latest recorded work", evidence: [{ source: "PROGRESS.md", label: "Declared progress source", at: asOf }] }) };
+    const report = projectMissionReport({ ...base, nodes: [placeholder, node("untouched", "planned")], rows: [] });
+    expect(report.totals).toEqual({ done: 0, inFlight: 0, leftToDo: 1, unresolved: 1, total: 2 });
+    expect(report.items[0]?.warnings).toContain("Authored unstarted status conflicts with recorded progress, work stage or queue history; completion unresolved");
+    expect(report.items[0]?.acceptance.kind).toBe("unknown");
   });
 
   it("does not add an evidence-linked potential duplicate as a standalone work unit", () => {
